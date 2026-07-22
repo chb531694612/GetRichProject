@@ -8,9 +8,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
-from .domain import MarketType, MatchResult, PlanStatus, Recommendation, ResultStatus, Settlement
+from .domain import (
+    Match,
+    MarketType,
+    MatchResult,
+    PlanStatus,
+    Recommendation,
+    ResultStatus,
+    ScoreOption,
+    Settlement,
+)
 from .strategy import calculate_prize
 
 
@@ -41,6 +50,17 @@ class StoredLeg:
     result_home: int | None
     result_away: int | None
     official_status: str
+    options: tuple[ScoreOption, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAISuggestion:
+    match_id: str
+    option_code: str
+    option_label: str
+    odds: Decimal
+    probability: Decimal
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +88,7 @@ class StoredPlan:
     legs: tuple[StoredLeg, ...]
     market: MarketType = MarketType.CRS
     ai_summary: str = ""
+    ai_suggestions: tuple[StoredAISuggestion, ...] = ()
 
 
 class Database:
@@ -156,6 +177,28 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_plan_legs_match_id ON plan_legs(match_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_legs_unique_match ON plan_legs(plan_id, match_id);
+
+                CREATE TABLE IF NOT EXISTS plan_leg_options (
+                    plan_id TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                    match_id TEXT NOT NULL,
+                    option_code TEXT NOT NULL,
+                    option_label TEXT NOT NULL,
+                    odds TEXT NOT NULL,
+                    probability TEXT NOT NULL,
+                    is_other INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (plan_id, match_id, option_code)
+                );
+
+                CREATE TABLE IF NOT EXISTS plan_ai_suggestions (
+                    plan_id TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                    match_id TEXT NOT NULL,
+                    option_code TEXT NOT NULL,
+                    option_label TEXT NOT NULL,
+                    odds TEXT NOT NULL,
+                    probability TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (plan_id, match_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS email_outbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,6 +323,17 @@ class Database:
         leg_columns = {row["name"] for row in connection.execute("PRAGMA table_info(plan_legs)")}
         if "snapshot_fetched_at" not in leg_columns:
             connection.execute("ALTER TABLE plan_legs ADD COLUMN snapshot_fetched_at TEXT")
+        # Existing plans did not keep the full option snapshot. Preserve at
+        # least their selected option; a later manual AI run can refresh the
+        # remaining choices from the configured provider.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO plan_leg_options
+                (plan_id, match_id, option_code, option_label, odds, probability, is_other)
+            SELECT plan_id, match_id, score_code, score_label, odds, probability, 0
+            FROM plan_legs
+            """
+        )
 
         connection.execute("DROP INDEX IF EXISTS idx_plans_one_per_business_date")
         connection.execute("DROP INDEX IF EXISTS idx_plans_one_per_recommendation_date")
@@ -396,7 +450,7 @@ class Database:
               )
             """
         )
-        connection.execute("PRAGMA user_version = 7")
+        connection.execute("PRAGMA user_version = 8")
 
     def count_plans_for_business_date(self, business_date: str) -> int:
         with self.connect() as connection:
@@ -698,6 +752,31 @@ class Database:
                         str(leg.score.probability),
                     ),
                 )
+                market_options = (
+                    leg.match.score_options
+                    if recommendation.market is MarketType.CRS
+                    else leg.match.had_options
+                )
+                options_by_code = {option.code: option for option in market_options}
+                options_by_code.setdefault(leg.score.code, leg.score)
+                for option in options_by_code.values():
+                    connection.execute(
+                        """
+                        INSERT INTO plan_leg_options
+                            (plan_id, match_id, option_code, option_label, odds,
+                             probability, is_other)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            recommendation.plan_id,
+                            leg.match.match_id,
+                            option.code,
+                            option.label,
+                            str(option.odds),
+                            str(option.probability),
+                            int(option.is_other),
+                        ),
+                    )
             self._insert_outbox(
                 connection,
                 dedupe_key=f"recommendation:{recommendation.plan_id}",
@@ -766,6 +845,24 @@ class Database:
         leg_rows = connection.execute(
             "SELECT * FROM plan_legs WHERE plan_id = ? ORDER BY position", (row["plan_id"],)
         ).fetchall()
+        option_rows = connection.execute(
+            """
+            SELECT * FROM plan_leg_options
+            WHERE plan_id = ? ORDER BY match_id, rowid
+            """,
+            (row["plan_id"],),
+        ).fetchall()
+        options_by_match: dict[str, list[ScoreOption]] = {}
+        for option in option_rows:
+            options_by_match.setdefault(str(option["match_id"]), []).append(
+                ScoreOption(
+                    code=str(option["option_code"]),
+                    label=str(option["option_label"]),
+                    odds=Decimal(option["odds"]),
+                    probability=Decimal(option["probability"]),
+                    is_other=bool(option["is_other"]),
+                )
+            )
         legs = tuple(
             StoredLeg(
                 position=int(leg["position"]),
@@ -789,8 +886,27 @@ class Database:
                 result_home=leg["result_home"],
                 result_away=leg["result_away"],
                 official_status=leg["official_status"],
+                options=tuple(options_by_match.get(str(leg["match_id"]), ())),
             )
             for leg in leg_rows
+        )
+        suggestion_rows = connection.execute(
+            """
+            SELECT * FROM plan_ai_suggestions
+            WHERE plan_id = ? ORDER BY rowid
+            """,
+            (row["plan_id"],),
+        ).fetchall()
+        ai_suggestions = tuple(
+            StoredAISuggestion(
+                match_id=str(item["match_id"]),
+                option_code=str(item["option_code"]),
+                option_label=str(item["option_label"]),
+                odds=Decimal(item["odds"]),
+                probability=Decimal(item["probability"]),
+                reason=str(item["reason"]),
+            )
+            for item in suggestion_rows
         )
         return StoredPlan(
             plan_id=row["plan_id"],
@@ -828,14 +944,147 @@ class Database:
             legs=legs,
             market=MarketType(row["market"] if "market" in row.keys() and row["market"] else "crs"),
             ai_summary=str(row["ai_summary"]) if "ai_summary" in row.keys() and row["ai_summary"] else "",
+            ai_suggestions=ai_suggestions,
         )
 
     def update_ai_summary(self, plan_id: str, ai_summary: str) -> bool:
         """Update the AI analysis summary for a plan."""
         with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM plan_ai_suggestions WHERE plan_id = ?", (plan_id,)
+            )
             cursor = connection.execute(
                 "UPDATE plans SET ai_summary = ? WHERE plan_id = ?",
                 (ai_summary, plan_id),
+            )
+            return cursor.rowcount > 0
+
+    def replace_plan_leg_options(self, plan_id: str, matches: Sequence[Match]) -> int:
+        """Refresh editable choices for plan legs from trusted provider data."""
+        with self.connect() as connection:
+            plan = connection.execute(
+                "SELECT market FROM plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+            if plan is None:
+                return 0
+            market = MarketType(plan["market"])
+            leg_rows = connection.execute(
+                """
+                SELECT match_id, score_code, score_label, odds, probability
+                FROM plan_legs WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchall()
+            legs = {str(item["match_id"]): item for item in leg_rows}
+            refreshed = 0
+            for match in matches:
+                match_id = str(match.match_id)
+                selected = legs.get(match_id)
+                if selected is None:
+                    continue
+                market_options = (
+                    match.score_options if market is MarketType.CRS else match.had_options
+                )
+                options_by_code = {option.code: option for option in market_options}
+                if not options_by_code:
+                    continue
+                options_by_code.setdefault(
+                    str(selected["score_code"]),
+                    ScoreOption(
+                        code=str(selected["score_code"]),
+                        label=str(selected["score_label"]),
+                        odds=Decimal(selected["odds"]),
+                        probability=Decimal(selected["probability"]),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM plan_leg_options WHERE plan_id = ? AND match_id = ?",
+                    (plan_id, match_id),
+                )
+                for option in options_by_code.values():
+                    connection.execute(
+                        """
+                        INSERT INTO plan_leg_options
+                            (plan_id, match_id, option_code, option_label, odds,
+                             probability, is_other)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            plan_id,
+                            match_id,
+                            option.code,
+                            option.label,
+                            str(option.odds),
+                            str(option.probability),
+                            int(option.is_other),
+                        ),
+                    )
+                refreshed += 1
+            return refreshed
+
+    def update_ai_analysis(
+        self,
+        plan_id: str,
+        ai_summary: str,
+        suggestions: Sequence[tuple[str, str, str]],
+    ) -> bool:
+        """Persist a validated suggestion for every leg using trusted option data."""
+        with self.connect() as connection:
+            leg_ids = {
+                str(item["match_id"])
+                for item in connection.execute(
+                    "SELECT match_id FROM plan_legs WHERE plan_id = ?", (plan_id,)
+                )
+            }
+            if not leg_ids:
+                return False
+            suggestion_map: dict[str, tuple[str, str]] = {}
+            for match_id, option_code, reason in suggestions:
+                match_key = str(match_id)
+                if match_key in suggestion_map:
+                    raise ValueError(f"duplicate AI suggestion for match {match_key}")
+                suggestion_map[match_key] = (str(option_code), str(reason)[:500])
+            if set(suggestion_map) != leg_ids:
+                raise ValueError("AI suggestions must cover every plan leg")
+
+            trusted: list[tuple[str, sqlite3.Row, str]] = []
+            for match_id, (option_code, reason) in suggestion_map.items():
+                option = connection.execute(
+                    """
+                    SELECT option_code, option_label, odds, probability
+                    FROM plan_leg_options
+                    WHERE plan_id = ? AND match_id = ? AND option_code = ?
+                    """,
+                    (plan_id, match_id, option_code),
+                ).fetchone()
+                if option is None:
+                    raise ValueError(f"unavailable AI option for match {match_id}")
+                trusted.append((match_id, option, reason))
+
+            connection.execute(
+                "DELETE FROM plan_ai_suggestions WHERE plan_id = ?", (plan_id,)
+            )
+            for match_id, option, reason in trusted:
+                connection.execute(
+                    """
+                    INSERT INTO plan_ai_suggestions
+                        (plan_id, match_id, option_code, option_label, odds,
+                         probability, reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plan_id,
+                        match_id,
+                        option["option_code"],
+                        option["option_label"],
+                        option["odds"],
+                        option["probability"],
+                        reason,
+                    ),
+                )
+            cursor = connection.execute(
+                "UPDATE plans SET ai_summary = ? WHERE plan_id = ?",
+                (str(ai_summary)[:4000], plan_id),
             )
             return cursor.rowcount > 0
 
@@ -857,9 +1106,57 @@ class Database:
                 "DELETE FROM plan_legs WHERE plan_id = ? AND match_id = ?",
                 (plan_id, match_id),
             )
+            if cursor.rowcount:
+                connection.execute(
+                    "DELETE FROM plan_leg_options WHERE plan_id = ? AND match_id = ?",
+                    (plan_id, match_id),
+                )
+                connection.execute(
+                    "DELETE FROM plan_ai_suggestions WHERE plan_id = ? AND match_id = ?",
+                    (plan_id, match_id),
+                )
             return cursor.rowcount > 0
 
-    def update_plan_after_leg_delete(self, plan_id: str) -> bool:
+    def update_plan_leg_option(self, plan_id: str, match_id: str, option_code: str) -> bool:
+        """Replace a stored leg pick with one trusted option and recalculate the plan."""
+        with self.connect() as connection:
+            option = connection.execute(
+                """
+                SELECT option_label, odds, probability
+                FROM plan_leg_options
+                WHERE plan_id = ? AND match_id = ? AND option_code = ?
+                """,
+                (plan_id, match_id, option_code),
+            ).fetchone()
+            if option is None:
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE plan_legs
+                SET score_code = ?, score_label = ?, odds = ?, probability = ?
+                WHERE plan_id = ? AND match_id = ?
+                """,
+                (
+                    option_code,
+                    option["option_label"],
+                    option["odds"],
+                    option["probability"],
+                    plan_id,
+                    match_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return False
+        if not self.update_plan_after_leg_delete(plan_id, clear_ai=False):
+            return False
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM plan_ai_suggestions WHERE plan_id = ? AND match_id = ?",
+                (plan_id, match_id),
+            )
+        return True
+
+    def update_plan_after_leg_delete(self, plan_id: str, *, clear_ai: bool = True) -> bool:
         """Recalculate plan combined odds, probability, and prize after a leg is deleted."""
         with self.connect() as connection:
             plan_row = connection.execute(
@@ -867,6 +1164,10 @@ class Database:
             ).fetchone()
             if plan_row is None:
                 return False
+            if clear_ai:
+                connection.execute(
+                    "DELETE FROM plan_ai_suggestions WHERE plan_id = ?", (plan_id,)
+                )
             leg_rows = connection.execute(
                 """
                 SELECT odds, probability, score_code, score_label, result_status,
@@ -949,7 +1250,7 @@ class Database:
                 UPDATE plans
                 SET pass_size = ?, combined_odds = ?, joint_probability = ?,
                     gross_prize_cents = ?, tax_cents = ?, net_prize_cents = ?,
-                    ai_summary = ''
+                    ai_summary = CASE WHEN ? THEN '' ELSE ai_summary END
                 WHERE plan_id = ?
                 """,
                 (
@@ -959,6 +1260,7 @@ class Database:
                     _cents(gross),
                     _cents(tax),
                     _cents(net),
+                    int(clear_ai),
                     plan_id,
                 ),
             )

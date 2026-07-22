@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import __version__
 from .auth import hash_password
-from .ai_analyzer import probe_deepseek
+from .ai_analyzer import probe_qwen
 from .config import Settings, load_dotenv
 from .database import Database
 from .mail import Mailer
@@ -176,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = subparsers.add_parser("probe-data", help="只读探测赔率和最近赛果接口")
     probe.add_argument("--now", help="测试用时间")
-    subparsers.add_parser("probe-ai", help="用最小请求检查DeepSeek配置和连通性")
+    subparsers.add_parser("probe-ai", help="用最小请求检查千问配置、连通性和联网搜索")
 
     recommend = subparsers.add_parser("recommend", help="立即尝试生成一张推荐计划")
     recommend.add_argument("--now", help="测试用时间，例如 2026-07-14T12:00:00+08:00")
@@ -241,9 +241,9 @@ def _safe_settings(settings: Settings) -> dict[str, object]:
         "web_trust_proxy_headers": settings.web_trust_proxy_headers,
         "web_session_hours": settings.web_session_hours,
         "ai_analysis_enabled": settings.ai_analysis_enabled,
-        "deepseek_api_key_configured": bool(settings.deepseek_api_key),
-        "deepseek_api_url": settings.deepseek_api_url,
-        "deepseek_model": settings.deepseek_model,
+                "qwen_api_key_configured": bool(settings.qwen_api_key),
+                "qwen_api_url": settings.qwen_api_url,
+                "qwen_model": settings.qwen_model,
     }
 
 
@@ -350,7 +350,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         elif args.command == "probe-ai":
-            print(json.dumps({"ok": True, "response": probe_deepseek(settings)}, ensure_ascii=False))
+            print(json.dumps({"ok": True, "response": probe_qwen(settings)}, ensure_ascii=False))
         elif args.command == "daemon":
             stop_event = threading.Event()
             wake_event = threading.Event()
@@ -369,6 +369,7 @@ def main(argv: list[str] | None = None) -> None:
                         settings,
                         service.database,
                         _build_manual_trigger(service, wake_event),
+                        provider=service.provider,
                     )
                     dashboard_server = DashboardServer(settings, application)
                     dashboard_server.start()

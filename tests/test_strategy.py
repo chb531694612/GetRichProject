@@ -90,19 +90,19 @@ class StrategyTests(unittest.TestCase):
         settings = make_settings(
             self.tmp_path,
             ai_analysis_enabled=True,
-            deepseek_api_key="secret",
+            qwen_api_key="secret",
         )
         matches = [make_match(i, self.now) for i in range(1, 5)]
         with patch(
             "score_fourfold.strategy.analyze_matches",
-            return_value="赔率结构正常，仍需注意临场变化。",
+            return_value="球队近期状态正常，仍需注意临场变化。",
         ) as mocked:
             recommendation = select_fourfold(matches, self.now, settings).recommendation
 
         assert recommendation is not None
         mocked.assert_called_once()
-        self.assertEqual(recommendation.ai_summary, "赔率结构正常，仍需注意临场变化。")
-        self.assertFalse(any("DeepSeek AI 分析摘要" in note for note in recommendation.notes))
+        self.assertEqual(recommendation.ai_summary, "球队近期状态正常，仍需注意临场变化。")
+        self.assertFalse(any("AI 分析摘要" in note for note in recommendation.notes))
 
     def test_tax_threshold_and_cap(self):
         gross, tax, net = calculate_prize(Decimal("4999"))

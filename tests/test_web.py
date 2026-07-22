@@ -9,10 +9,12 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from score_fourfold.cli import _build_manual_trigger
+from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
 from score_fourfold.database import Database
 from score_fourfold.domain import MatchResult, ResultStatus
 from score_fourfold.mail import Mailer, flush_outbox, render_recommendation, render_settlement
@@ -166,7 +168,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", page)
         self.assertIn('class="flash warn"', page)
 
-    def test_ai_summary_is_rendered_once_with_rowspan(self):
+    def test_ai_summary_is_rendered_in_modal_with_per_match_ai_cells(self):
         recommendation = self._create_plan()
         self._mark_recommendation_sent()
         self.assertTrue(
@@ -179,8 +181,94 @@ class DashboardTests(unittest.TestCase):
         page = self.application.render(csrf_token="csrf-test-token")
 
         self.assertIn("这是一段已持久化的AI分析内容。", page)
-        self.assertEqual(page.count('class="ai-cell"'), 1)
-        self.assertIn('class="ai-cell" rowspan="4"', page)
+        self.assertEqual(page.count('class="ai-cell"'), 4)
+        self.assertNotIn("rowspan=", page)
+        self.assertIn("查看总体分析", page)
+
+    def test_dashboard_renders_ai_replacements_and_manual_pick_editor(self):
+        recommendation = self._create_plan()
+        self._mark_recommendation_sent()
+        plan = self.database.get_plan(recommendation.plan_id)
+        assert plan is not None
+        suggestions = [
+            (
+                leg.match_id,
+                "s01s01" if index == 0 else leg.score_code,
+                "这是逐场AI推荐理由",
+            )
+            for index, leg in enumerate(plan.legs)
+        ]
+        self.assertTrue(
+            self.database.update_ai_analysis(
+                plan.plan_id, "总体AI分析", suggestions
+            )
+        )
+
+        page = self.application.render(csrf_token="csrf-test-token")
+
+        self.assertIn("AI逐场推荐", page)
+        self.assertEqual(page.count("AI建议："), 4)
+        self.assertEqual(page.count("替换为此推荐"), 1)
+        self.assertEqual(page.count("与当前推荐一致"), 3)
+        self.assertEqual(page.count("手动修改推荐"), 4)
+        self.assertIn("width:min(96vw,1680px)", page)
+
+        first = plan.legs[0]
+        level, _ = self.application.trigger_update_leg(
+            plan.plan_id, first.match_id, "s01s01"
+        )
+        self.assertEqual(level, "ok")
+        updated = self.database.get_plan(plan.plan_id)
+        assert updated is not None
+        self.assertEqual(updated.legs[0].score_label, "1:1")
+        self.assertEqual(updated.combined_odds, Decimal("60"))
+
+    def test_manual_ai_refreshes_options_and_stores_every_match_suggestion(self):
+        recommendation = self._create_plan()
+        matches = [
+            make_match(i, self.now, business_date="2026-07-15", odds="2.00")
+            for i in range(1, 5)
+        ]
+        provider = FakeProvider(matches)
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            mail_preview_dir=self.preview,
+            web_port=0,
+            ai_analysis_enabled=True,
+            qwen_api_key="secret",
+        )
+        application = DashboardApplication(
+            settings,
+            self.database,
+            self._trigger,
+            provider=provider,
+        )
+        result = AIPlanAnalysis(
+            summary="总体建议",
+            suggestions=tuple(
+                AIOptionSuggestion(
+                    leg.match.match_id, "s01s01", "1:1", "双方近期状态接近"
+                )
+                for leg in recommendation.legs
+            ),
+        )
+        with patch(
+            "score_fourfold.web.analyze_plan_from_leg_data", return_value=result
+        ) as mocked:
+            level, detail = application.trigger_ai_analysis(recommendation.plan_id)
+
+        self.assertEqual(level, "ok")
+        self.assertIn("逐场推荐", detail)
+        self.assertEqual(provider.match_calls, 1)
+        mocked.assert_called_once()
+        stored = self.database.get_plan(recommendation.plan_id)
+        assert stored is not None
+        self.assertEqual(stored.ai_summary, "总体建议")
+        self.assertEqual(len(stored.ai_suggestions), 4)
+        self.assertTrue(
+            all("AI预测：1:1" in item.reason for item in stored.ai_suggestions)
+        )
 
     def test_dashboard_distinguishes_quoted_and_actual_settlement_values(self):
         recommendation = self._create_plan()
@@ -288,6 +376,41 @@ class DashboardTests(unittest.TestCase):
             status, _, _ = self._request(server, "GET", "/actions/recommend")
             self.assertEqual(status, 404)
             self.assertEqual(self.triggered, [])
+        finally:
+            server.stop()
+
+    def test_update_leg_route_is_post_only_and_recalculates_plan(self):
+        recommendation = self._create_plan()
+        self._mark_recommendation_sent()
+        first = recommendation.legs[0]
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            status, _, _ = self._request(server, "GET", "/actions/update-leg")
+            self.assertEqual(status, 404)
+            body = urlencode(
+                {
+                    "plan_id": recommendation.plan_id,
+                    "match_id": first.match.match_id,
+                    "option_code": "s01s01",
+                    "csrf_token": "",
+                }
+            ).encode()
+            status, _, _ = self._request(
+                server,
+                "POST",
+                "/actions/update-leg",
+                body=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Host": f"127.0.0.1:{server.address[1]}",
+                },
+            )
+            self.assertEqual(status, 303)
+            updated = self.database.get_plan(recommendation.plan_id)
+            assert updated is not None
+            self.assertEqual(updated.legs[0].score_code, "s01s01")
+            self.assertEqual(updated.combined_odds, Decimal("60"))
         finally:
             server.stop()
 

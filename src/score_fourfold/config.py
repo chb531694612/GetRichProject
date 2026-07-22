@@ -156,9 +156,9 @@ class Settings:
     mail_from: str
     mail_dry_run: bool
     mail_preview_dir: Path
-    deepseek_api_key: str
-    deepseek_api_url: str
-    deepseek_model: str
+    qwen_api_key: str
+    qwen_api_url: str
+    qwen_model: str
     ai_analysis_enabled: bool
 
     @property
@@ -231,12 +231,12 @@ class Settings:
             mail_from=os.getenv("MAIL_FROM", "").strip(),
             mail_dry_run=_bool("MAIL_DRY_RUN", True),
             mail_preview_dir=_path(os.getenv("MAIL_PREVIEW_DIR", "data/mail-preview")),
-            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
-            deepseek_api_url=os.getenv(
-                "DEEPSEEK_API_URL",
-                "https://api.deepseek.com/v1/chat/completions",
+            qwen_api_key=os.getenv("QWEN_API_KEY", "").strip(),
+            qwen_api_url=os.getenv(
+                "QWEN_API_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
             ).strip(),
-            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip(),
+            qwen_model=os.getenv("QWEN_MODEL", "qwen3.7-max").strip(),
             ai_analysis_enabled=_bool("AI_ANALYSIS_ENABLED", False),
         )
         # Construct once so an invalid timezone fails at startup.
@@ -262,13 +262,15 @@ class Settings:
         if settings.poisson_model_weight > 1:
             raise ValueError("POISSON_MODEL_WEIGHT must be <= 1")
         if settings.ai_analysis_enabled:
-            if not settings.deepseek_api_key:
-                raise ValueError("AI_ANALYSIS_ENABLED=true requires DEEPSEEK_API_KEY")
-            ai_url = urlsplit(settings.deepseek_api_url)
+            if not settings.qwen_api_key:
+                raise ValueError("AI_ANALYSIS_ENABLED=true requires QWEN_API_KEY")
+            ai_url = urlsplit(settings.qwen_api_url)
             if ai_url.scheme != "https" or not ai_url.netloc:
-                raise ValueError("DEEPSEEK_API_URL must be an https URL")
-            if not settings.deepseek_model:
-                raise ValueError("DEEPSEEK_MODEL must not be empty")
+                raise ValueError("QWEN_API_URL must be an https URL")
+            if not ai_url.path.rstrip("/").endswith("/responses"):
+                raise ValueError("QWEN_API_URL must end with /responses")
+            if not settings.qwen_model:
+                raise ValueError("QWEN_MODEL must not be empty")
         if settings.web_port > 65535:
             raise ValueError("WEB_PORT must be <= 65535")
         if not settings.web_host:

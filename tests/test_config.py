@@ -106,14 +106,14 @@ class WebSettingsTests(unittest.TestCase):
 
     def test_ai_enabled_requires_key_and_https_endpoint(self):
         with patch.dict(os.environ, {"AI_ANALYSIS_ENABLED": "true"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
+            with self.assertRaisesRegex(ValueError, "QWEN_API_KEY"):
                 Settings.from_env()
         with patch.dict(
             os.environ,
             {
                 "AI_ANALYSIS_ENABLED": "true",
-                "DEEPSEEK_API_KEY": "secret",
-                "DEEPSEEK_API_URL": "http://api.example.test/chat",
+                "QWEN_API_KEY": "secret",
+                "QWEN_API_URL": "http://api.example.test/responses",
             },
             clear=True,
         ):

@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from score_fourfold.database import Database
-from score_fourfold.domain import MatchResult, ResultStatus
+from score_fourfold.domain import MarketType, MatchResult, ResultStatus
 from score_fourfold.mail import render_recommendation, render_settlement
 from score_fourfold.service import ScoreFourfoldService
 
@@ -137,6 +137,84 @@ class DatabaseSafetyTests(unittest.TestCase):
         assert recreated is not None
         self.assertEqual(recreated.delivery_status, "queued")
         self.assertEqual(len(self.database.claim_due_emails(self.now, limit=1)), 1)
+
+    def test_plan_options_ai_suggestions_and_manual_replacement_are_persisted(self):
+        recommendation = self._create_plan()
+        stored = self.database.get_plan(recommendation.plan_id)
+        assert stored is not None
+        self.assertTrue(all(len(leg.options) == 3 for leg in stored.legs))
+
+        suggestions = [
+            (
+                leg.match_id,
+                "s01s01" if index == 0 else "s01s00",
+                f"第{index + 1}场理由",
+            )
+            for index, leg in enumerate(stored.legs)
+        ]
+        self.assertTrue(
+            self.database.update_ai_analysis(
+                recommendation.plan_id, "结构化总体分析", suggestions
+            )
+        )
+        analyzed = self.database.get_plan(recommendation.plan_id)
+        assert analyzed is not None
+        self.assertEqual(len(analyzed.ai_suggestions), 4)
+        first = analyzed.legs[0]
+
+        self.assertTrue(
+            self.database.update_plan_leg_option(
+                recommendation.plan_id, first.match_id, "s01s01"
+            )
+        )
+        updated = self.database.get_plan(recommendation.plan_id)
+        assert updated is not None
+        self.assertEqual(updated.legs[0].score_label, "1:1")
+        self.assertEqual(updated.legs[0].odds, Decimal("7.50"))
+        self.assertEqual(updated.combined_odds, Decimal("60"))
+        self.assertEqual(updated.gross_prize, Decimal("120.00"))
+        self.assertEqual(updated.ai_summary, "结构化总体分析")
+        self.assertEqual(len(updated.ai_suggestions), 3)
+        self.assertNotIn(first.match_id, {item.match_id for item in updated.ai_suggestions})
+        self.assertFalse(
+            self.database.update_plan_leg_option(
+                recommendation.plan_id, first.match_id, "invented-option"
+            )
+        )
+
+    def test_had_pick_can_be_manually_changed_to_another_real_outcome(self):
+        matches = [make_match(index, self.now) for index in range(1, 7)]
+        recommendation = make_recommendation(
+            self.now, matches, market=MarketType.HAD
+        )
+        subject, text_body, html_body = render_recommendation(recommendation)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                recommendation,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=self.now + timedelta(hours=5),
+            )
+        )
+        stored = self.database.get_plan(recommendation.plan_id)
+        assert stored is not None
+        self.assertTrue(all(len(leg.options) == 3 for leg in stored.legs))
+        first = stored.legs[0]
+
+        self.assertTrue(
+            self.database.update_plan_leg_option(
+                recommendation.plan_id, first.match_id, "a"
+            )
+        )
+        updated = self.database.get_plan(recommendation.plan_id)
+        assert updated is not None
+        self.assertEqual(updated.legs[0].score_label, "客胜")
+        self.assertEqual(updated.legs[0].odds, Decimal("4.50"))
+        self.assertEqual(
+            updated.combined_odds,
+            Decimal("4.50") * (Decimal("1.80") ** 5),
+        )
 
     def test_fifth_mail_failure_becomes_dead_letter(self):
         self.database.enqueue_mail(
@@ -287,6 +365,7 @@ class DatabaseSafetyTests(unittest.TestCase):
             self.assertEqual(plan.pass_size, 4)
             self.assertEqual(plan.delivery_status, "sent")
             self.assertEqual(plan.settled_net_prize, Decimal("32.00"))
+            self.assertTrue(all(len(leg.options) == 1 for leg in plan.legs))
             dead_plan = legacy.get_plan("BF4-LEGACY-DEAD")
             assert dead_plan is not None
             self.assertEqual(dead_plan.delivery_status, "failed")
@@ -294,6 +373,7 @@ class DatabaseSafetyTests(unittest.TestCase):
             self.assertEqual(legacy.summary()["baseline_return"], "32.00")
             self.assertEqual(legacy.summary()["baseline_profit"], "30.00")
             with legacy.connect() as migrated:
+                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 8)
                 stale = migrated.execute(
                     "SELECT status FROM email_outbox WHERE dedupe_key = 'recommendation:STALE'"
                 ).fetchone()

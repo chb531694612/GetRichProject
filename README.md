@@ -103,14 +103,16 @@ OKOOO_BASE_URL=https://www.okooo.com
 
 首次上线建议先保留 `MAIL_DRY_RUN=true` 跑一轮，确认数据和邮件内容后再改为 `false`。
 
-可选的 DeepSeek AI 分析使用 OpenAI 兼容的聊天接口。启用前必须配置 Key，并先执行只产生极少 token 的连通性检查：
+可选的千问 AI 分析使用阿里云百炼 OpenAI 兼容 Responses API。系统强制启用联网搜索，只向模型发送比赛编号、日期、开赛时间、联赛和球队，不发送赔率、概率、候选项或当前推荐。启用前必须配置 Key，并先执行小额连通性与联网搜索检查：
 
 ```dotenv
 AI_ANALYSIS_ENABLED=true
-DEEPSEEK_API_KEY=只写在服务器.env中的密钥
-DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
-DEEPSEEK_MODEL=deepseek-chat
+QWEN_API_KEY=只写在服务器.env中的百炼密钥
+QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/responses
+QWEN_MODEL=qwen3.7-max
 ```
+
+接口参数以[阿里云百炼联网搜索官方文档](https://help.aliyun.com/zh/model-studio/web-search/)为准。`QWEN_API_URL` 必须使用以 `/responses` 结尾的 Responses API 地址；如果百炼控制台为业务空间提供了专属 Base URL，请在其后追加 `/responses`。
 
 ```bash
 score-fourfold --env-file .env probe-ai
@@ -259,7 +261,7 @@ score-fourfold --env-file .env check-config
 PYTHONPATH=src python -m unittest discover -s tests -t . -v
 ```
 
-v0.7.0 本地验收时全套测试通过。测试覆盖比分 2/3/4 串 1、胜平负 4/5/6 串 1、同日多计划并发门禁、数据库迁移、结算、邮件、网页操作安全边界和 DeepSeek 分析存储。
+v0.7.0 本地验收时全套测试通过。测试覆盖比分 2/3/4 串 1、胜平负 4/5/6 串 1、同日多计划并发门禁、数据库迁移、结算、邮件、网页操作安全边界和千问联网分析存储。
 
 服务器上还须额外执行 `docker compose config`、`caddy validate`、以及 `scripts/check_v040.sh`；本机 Windows 开发环境若没有 Docker，这些检查放到腾讯云服务器完成。
 

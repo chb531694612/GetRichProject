@@ -56,9 +56,9 @@ def make_settings(tmp_path, **overrides) -> Settings:
         mail_from="",
         mail_dry_run=True,
         mail_preview_dir=tmp_path / "mail",
-        deepseek_api_key="",
-        deepseek_api_url="https://api.deepseek.com/v1/chat/completions",
-        deepseek_model="deepseek-chat",
+        qwen_api_key="",
+        qwen_api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+        qwen_model="qwen3.7-max",
         ai_analysis_enabled=False,
     )
     values.update(overrides)

@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .auth import verify_password
 from .config import Settings
-from .ai_analyzer import analyze_from_leg_data
+from .ai_analyzer import AIAnalysisError, analyze_plan_from_leg_data
 from .database import Database, StoredLeg, StoredPlan
 from .domain import MarketType, PlanStatus, ResultStatus
 
@@ -40,7 +40,7 @@ STYLE = """
 :root{color-scheme:light;--bg:#f4f7fb;--card:#fff;--ink:#172033;--muted:#667085;--line:#e5eaf1;
 --blue:#2563eb;--green:#047857;--red:#b42318;--amber:#b54708;--shadow:0 8px 28px rgba(23,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,
-"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.55}.wrap{max-width:1180px;margin:auto;padding:28px 18px 60px}
+"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.55}.wrap{width:min(96vw,1680px);max-width:none;margin:auto;padding:28px 18px 60px}
 .top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.top h1{margin:0;font-size:28px}
 .muted{color:var(--muted)}.small{font-size:13px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
 .metric,.panel,.plan{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}
@@ -54,14 +54,13 @@ button:disabled{background:#98a2b3;cursor:not-allowed}.flash{padding:13px 16px;b
 .plan-title{font-size:18px;font-weight:750}.badges{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.badge{border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700;background:#eef2f6;color:#344054}
 .badge.green{background:#ecfdf3;color:#067647}.badge.red{background:#fef3f2;color:#b42318}.badge.amber{background:#fffaeb;color:#93370d}
 .plan-money{display:flex;gap:24px;flex-wrap:wrap;padding:13px 20px;background:#fafbfc;border-bottom:1px solid var(--line)}
-.plan-money strong{display:block;font-size:17px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:850px}th,td{padding:11px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px}th{color:var(--muted);font-size:12px;background:#fcfcfd}
+.plan-money strong{display:block;font-size:17px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:1250px}th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px}th{color:var(--muted);font-size:12px;background:#fcfcfd}
 tr:last-child td{border-bottom:0}.empty{text-align:center;padding:50px 20px;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:12px;margin-top:30px}
-.ai-cell{max-width:280px;font-size:13px;line-height:1.5}.ai-cell summary{cursor:pointer;color:var(--blue);font-weight:600}.ai-cell p{margin:6px 0 0;color:var(--muted);white-space:pre-wrap}
+.pick-cell{min-width:220px}.ai-cell{min-width:290px;max-width:360px;font-size:13px;line-height:1.5}.ai-choice{padding:8px 10px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe}.ai-choice .reason{margin-top:4px;color:var(--muted)}.ai-choice button{margin-top:7px;padding:6px 10px;border-radius:7px;font-size:12px}.inline-edit{margin-top:7px}.inline-edit summary{cursor:pointer;color:var(--blue);font-size:12px}.inline-edit-controls{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap}.inline-edit-controls button{padding:5px 9px;border-radius:6px;font-size:12px}.edit-score-select{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:5px 7px;max-width:165px;background:#fff}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;justify-content:center;align-items:center;padding:20px}.modal-overlay:target,.modal-overlay.open{display:flex}
 .modal-box{background:var(--card);border-radius:16px;max-width:700px;max-height:80vh;overflow-y:auto;padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.18)}.modal-box h3{margin:0 0 12px}.modal-box .close{float:right;font-size:22px;text-decoration:none;color:var(--muted);line-height:1}.modal-box .close:hover{color:var(--ink)}
 .plan-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}.plan-actions button,.plan-actions .btn-sm{border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}.plan-actions button.danger,.plan-actions .btn-sm.danger{color:var(--red);border-color:#fecdca;background:#fef3f2}.plan-actions button.danger:hover,.plan-actions .btn-sm.danger:hover{background:#fecdca}.plan-actions button.warn,.plan-actions .btn-sm.warn{color:var(--amber);border-color:#fedf89;background:#fffaeb}
 .leg-del-btn{background:none;border:0;color:var(--red);cursor:pointer;font-size:12px;padding:2px 6px;border-radius:4px}.leg-del-btn:hover{background:#fef3f2}
-.edit-score-select{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:3px 6px;max-width:120px}
 .login-wrap{max-width:430px;margin:9vh auto 0;padding:18px}.login-card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:var(--shadow)}
 .login-card h1{margin:0 0 6px}.field{margin-top:18px}.field label{display:block;font-weight:700;margin-bottom:6px}.field input{width:100%;border:1px solid #cfd6e1;border-radius:10px;padding:11px 12px;font:inherit}.login-card button{width:100%;margin-top:22px}
 .logout{display:inline;margin-left:12px}.logout button{padding:7px 11px;background:#475467;font-size:12px}
@@ -183,10 +182,12 @@ class DashboardApplication:
         database: Database,
         trigger_recommendation: Callable[[str], tuple[str, str]],
         secret: bytes | None = None,
+        provider: object | None = None,
     ):
         self.settings = settings
         self.database = database
         self.trigger_recommendation = trigger_recommendation
+        self.provider = provider
         self._secret = secret or secrets.token_bytes(32)
         self.access_mode = getattr(settings, "web_access_mode", "ssh")
         self.public_origin = getattr(settings, "web_public_origin", "").rstrip("/")
@@ -252,24 +253,77 @@ class DashboardApplication:
         return ("ok", f"已从计划 {plan_id} 中删除比赛 {match_id}，统计数据已更新")
 
     def trigger_ai_analysis(self, plan_id: str) -> tuple[str, str]:
-        """Run AI analysis on an existing plan and store the result."""
+        """Run AI analysis and persist one validated suggestion per plan leg."""
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
         if not self.settings.ai_analysis_enabled:
-            return ("warn", "AI分析未启用，请设置 DEEPSEEK_API_KEY 并开启 AI_ANALYSIS_ENABLED")
-        if not self.settings.deepseek_api_key:
-            return ("warn", "未配置 DEEPSEEK_API_KEY")
+            return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
+        if not self.settings.qwen_api_key:
+            return ("warn", "未配置 QWEN_API_KEY")
+        if self.provider is not None:
+            get_matches = getattr(self.provider, "get_matches", None)
+            if callable(get_matches):
+                try:
+                    matches = list(get_matches())
+                    self.database.replace_plan_leg_options(plan_id, matches)
+                    refreshed_plan = self.database.get_plan(plan_id)
+                    if refreshed_plan is not None:
+                        plan = refreshed_plan
+                except Exception as exc:
+                    LOGGER.warning("Could not refresh options for AI plan %s: %s", plan_id, exc)
+        unavailable = [leg.match_num for leg in plan.legs if len(leg.options) < 2]
+        if unavailable:
+            return (
+                "warn",
+                "以下比赛没有足够的真实可选项，暂时无法生成可替换建议："
+                + "、".join(unavailable),
+            )
         try:
-            ai_summary = analyze_from_leg_data(plan.legs, plan.market, self.settings)
+            analysis = analyze_plan_from_leg_data(plan.legs, plan.market, self.settings)
+            stored = self.database.update_ai_analysis(
+                plan_id,
+                analysis.summary,
+                [
+                    (
+                        suggestion.match_id,
+                        suggestion.option_code,
+                        "AI预测："
+                        + suggestion.pick_label
+                        + (f"。{suggestion.reason}" if suggestion.reason else ""),
+                    )
+                    for suggestion in analysis.suggestions
+                ],
+            )
+        except AIAnalysisError as exc:
+            LOGGER.warning("AI recommendation of plan %s failed: %s", plan_id, exc)
+            return ("error", f"AI推荐失败：{exc}")
         except Exception as exc:
             LOGGER.exception("AI analysis of plan %s failed", plan_id)
             return ("error", f"AI分析失败：{exc}")
-        if not ai_summary:
-            return ("warn", "AI返回空结果，请检查网络或API配置")
-        # Store the result in the database
-        self.database.update_ai_summary(plan_id, ai_summary)
-        return ("ok", f"AI分析已完成，已更新计划 {plan_id}")
+        if not stored:
+            return ("warn", f"计划 {plan_id} 已不存在，AI结果未保存")
+        return ("ok", f"AI分析和逐场推荐已完成，请选择是否替换计划 {plan_id}")
+
+    def trigger_update_leg(
+        self, plan_id: str, match_id: str, option_code: str
+    ) -> tuple[str, str]:
+        """Apply a manual or AI-proposed option to one plan leg."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        leg = next((item for item in plan.legs if item.match_id == match_id), None)
+        if leg is None:
+            return ("warn", f"未找到比赛 {match_id}")
+        option = next((item for item in leg.options if item.code == option_code), None)
+        if option is None:
+            return ("warn", "该推荐选项不存在或已经失效，请重新运行AI分析刷新选项")
+        if not self.database.update_plan_leg_option(plan_id, match_id, option_code):
+            return ("error", f"修改比赛 {match_id} 的推荐失败")
+        return (
+            "ok",
+            f"已将比赛 {leg.match_num} 的推荐修改为 {option.label}，赔率和奖金已重新计算",
+        )
 
     def new_login_token(self) -> str:
         issued_at = int(self.now().timestamp())
@@ -421,6 +475,11 @@ class DashboardApplication:
     def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "") -> str:
         now = datetime.now(self.settings.timezone)
         script_nonce = secrets.token_urlsafe(18)
+        # SSH mode is already restricted to loopback requests and has no login
+        # session. A non-empty marker keeps its management controls available;
+        # public mode still requires the real session CSRF token.
+        if not self.public_mode and not csrf_token:
+            csrf_token = "ssh-loopback"
         summary = self.database.summary()
         plans = self.database.recent_plans(100)
         settled_stake = Decimal(str(summary["settled_stake"]))
@@ -505,7 +564,8 @@ function postAction(path,data){{var f=document.createElement('form');f.method='P
 function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
 function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
 function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})}}
-document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target.dataset.planId);else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
+document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target.dataset.planId);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
 </script>
 </body></html>"""
 
@@ -517,24 +577,10 @@ document.addEventListener('click',function(event){{var target=event.target.close
         pick_header = "推荐比分" if plan.market is MarketType.CRS else "推荐结果"
         pid = plan.plan_id
 
-        # AI analysis section
-        ai_html = ""
-        if plan.ai_summary:
-            safe_summary = _e(plan.ai_summary)
-            short = safe_summary[:50] + "..." if len(safe_summary) > 50 else safe_summary
-            modal_id = f"ai-modal-{pid[:12]}"
-            ai_html = (
-                f'<td class="ai-cell" rowspan="{len(plan.legs)}"><details open><summary>AI分析</summary>'
-                f'<p>{short}</p></details>'
-                f'<button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
-                f'class="btn-sm" style="margin-top:4px">展开全文</button>'
-                f'</td>'
-            )
-        else:
-            ai_html = (
-                f'<td class="ai-cell" rowspan="{len(plan.legs)}">'
-                '<span class="muted small">—</span></td>'
-            )
+        suggestion_by_match = {
+            suggestion.match_id: suggestion for suggestion in plan.ai_suggestions
+        }
+        modal_id = f"ai-modal-{pid[:12]}"
 
         # Build plan action buttons (delete whole plan)
         del_btn = ""
@@ -546,8 +592,13 @@ document.addEventListener('click',function(event){{var target=event.target.close
             )
             ai_btn = (
                 f'<button type="button" data-action="analyze-plan" data-plan-id="{_e(pid)}" '
-                f'class="btn-sm" style="background:var(--blue);color:#fff;border-color:var(--blue)">AI分析</button>'
+                f'class="btn-sm" style="background:var(--blue);color:#fff;border-color:var(--blue)">AI分析并推荐</button>'
             )
+            if plan.ai_summary:
+                ai_btn += (
+                    f' <button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
+                    'class="btn-sm">查看总体分析</button>'
+                )
             ai_btn += " <span class='muted small'>（AI分析可能需要10-30秒，完成后自动刷新）</span>"
 
         if plan.delivery_status != "sent":
@@ -568,20 +619,61 @@ document.addEventListener('click',function(event){{var target=event.target.close
                     f' <button type="button" data-action="delete-leg" data-plan-id="{_e(pid)}" '
                     f'data-match-id="{_e(leg.match_id)}" class="leg-del-btn" title="删除此场">x</button>'
                 )
+            select_id = f"edit-{pid[:12]}-{leg_index}"
+            option_items = "".join(
+                f'<option value="{_e(option.code)}"'
+                f'{" selected" if option.code == leg.score_code else ""}>'
+                f'{_e(option.label)}（SP {_e(option.odds)}）</option>'
+                for option in leg.options
+            )
+            edit_html = ""
+            if csrf_token and len(leg.options) > 1:
+                edit_html = (
+                    '<details class="inline-edit"><summary>手动修改推荐</summary>'
+                    '<div class="inline-edit-controls">'
+                    f'<select class="edit-score-select" id="{_e(select_id)}">{option_items}</select>'
+                    f'<button type="button" data-action="save-leg" data-plan-id="{_e(pid)}" '
+                    f'data-match-id="{_e(leg.match_id)}" data-select-id="{_e(select_id)}" '
+                    'data-option-label="">保存修改</button></div></details>'
+                )
+            elif csrf_token:
+                edit_html = '<div class="muted small">运行AI分析可刷新本场可选项</div>'
+
+            suggestion = suggestion_by_match.get(leg.match_id)
+            if suggestion is None:
+                ai_cell = '<span class="muted">点击下方“AI分析并推荐”生成本场建议</span>'
+            else:
+                same_pick = suggestion.option_code == leg.score_code
+                replace_control = (
+                    '<span class="badge green">与当前推荐一致</span>'
+                    if same_pick
+                    else (
+                        f'<button type="button" data-action="replace-ai" data-plan-id="{_e(pid)}" '
+                        f'data-match-id="{_e(leg.match_id)}" '
+                        f'data-option-code="{_e(suggestion.option_code)}" '
+                        f'data-option-label="{_e(suggestion.option_label)}">替换为此推荐</button>'
+                    )
+                )
+                ai_cell = (
+                    '<div class="ai-choice">'
+                    f'<strong>AI建议：{_e(suggestion.option_label)}</strong> '
+                    f'<span class="muted">SP {_e(suggestion.odds)}</span>'
+                    f'<div class="reason">{_e(suggestion.reason or "基于当前赔率结构综合判断")}</div>'
+                    f'{replace_control}</div>'
+                )
             rows.append(
                 "<tr>"
                 f"<td>{_e(leg.match_num)}<br><span class='muted small'>{_e(leg.league)}</span></td>"
                 f"<td>{_e(leg.start_at.strftime('%Y-%m-%d %H:%M'))}</td>"
                 f"<td>{_e(leg.home)} vs {_e(leg.away)}</td>"
-                f"<td><strong>{_e(leg.score_label)}</strong><br><span class='muted small'>SP {_e(leg.odds)}</span>{del_leg_btn}</td>"
+                f"<td class='pick-cell'><strong>{_e(leg.score_label)}</strong><br><span class='muted small'>SP {_e(leg.odds)}</span>{del_leg_btn}{edit_html}</td>"
                 f"<td>{_e(actual)}</td><td><span class='badge {verdict_class}'>{_e(verdict)}</span></td>"
-                f"{ai_html if leg_index == 0 else ''}"
+                f'<td class="ai-cell">{ai_cell}</td>'
                 "</tr>"
             )
         # Build AI modal if exists
         ai_modal = ""
         if plan.ai_summary:
-            modal_id = f"ai-modal-{pid[:12]}"
             ai_modal = (
                 f'<div class="modal-overlay" id="{modal_id}"><div class="modal-box">'
                 f'<button type="button" data-action="close-modal" data-modal-id="{modal_id}" class="close">&times;</button>'
@@ -598,7 +690,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
 <div class="plan-money"><div><span class="muted small">2元理论税前返还</span><strong>{_money(plan.gross_prize)}</strong></div>
 <div><span class="muted small">实际税后返还</span><strong>{actual_return}</strong></div>
 <div><span class="muted small">本期净盈亏</span><strong>{profit}</strong></div></div>
-<div class="table-wrap"><table><thead><tr><th>编号/联赛</th><th>开赛时间</th><th>对阵</th><th>{_e(pick_header)}</th><th>赛果</th><th>结果</th><th>AI分析</th></tr></thead>
+<div class="table-wrap"><table><thead><tr><th>编号/联赛</th><th>开赛时间</th><th>对阵</th><th>{_e(pick_header)}</th><th>赛果</th><th>结果</th><th>AI逐场推荐</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
 <div class="plan-actions" style="padding:8px 20px">{ai_btn} {del_btn}</div>{ai_modal}</article>"""
 
@@ -920,7 +1012,7 @@ def build_handler(application: DashboardApplication):
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
-            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan"}:
+            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg"}:
                 self._discard_request_body()
                 self._send(404, "<h1>404</h1>", close=True)
                 return
@@ -937,7 +1029,7 @@ def build_handler(application: DashboardApplication):
             session: WebSession | None = None
             if application.public_mode:
                 authenticated = self._session()
-                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan"}:
+                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg"}:
                     if authenticated is None:
                         self._discard_request_body()
                         self._redirect_to("/login")
@@ -992,6 +1084,26 @@ def build_handler(application: DashboardApplication):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
                 level, detail = application.trigger_delete_leg(values["plan_id"], values["match_id"])
+                self._redirect(detail, level)
+                return
+            # ---- handles /actions/update-leg ----
+            if path == "/actions/update-leg":
+                form = self._read_form()
+                if form is None:
+                    return
+                values = self._form_values(
+                    form, {"plan_id", "match_id", "option_code", "csrf_token"}
+                )
+                if values is None:
+                    return
+                if session is not None:
+                    csrf = values.get("csrf_token", "")
+                    if not application.verify_session_csrf(session, csrf):
+                        self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
+                        return
+                level, detail = application.trigger_update_leg(
+                    values["plan_id"], values["match_id"], values["option_code"]
+                )
                 self._redirect(detail, level)
                 return
             if path == "/login" and not application.public_mode:
