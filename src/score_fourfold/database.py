@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -844,8 +845,18 @@ class Database:
     def update_plan_after_leg_delete(self, plan_id: str) -> bool:
         """Recalculate plan combined odds, probability, and prize after a leg is deleted."""
         with self.connect() as connection:
+            plan_row = connection.execute(
+                "SELECT market, status, stake_cents FROM plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+            if plan_row is None:
+                return False
             leg_rows = connection.execute(
-                "SELECT odds, probability FROM plan_legs WHERE plan_id = ?", (plan_id,)
+                """
+                SELECT odds, probability, score_code, score_label, result_status,
+                       result_home, result_away
+                FROM plan_legs WHERE plan_id = ? ORDER BY position
+                """,
+                (plan_id,),
             ).fetchall()
             if not leg_rows:
                 connection.execute("DELETE FROM recommendation_days WHERE plan_id = ?", (plan_id,))
@@ -858,11 +869,70 @@ class Database:
                 joint_probability *= Decimal(leg["probability"])
             pass_size = len(leg_rows)
             gross, tax, net = calculate_prize(combined_odds, active_legs=pass_size)
+            settlement_values: tuple[object, ...]
+            if plan_row["status"] == PlanStatus.PENDING.value:
+                settlement_values = (
+                    PlanStatus.PENDING.value, None, None, None, None, None
+                )
+            elif any(row["result_status"] == ResultStatus.PENDING.value for row in leg_rows):
+                settlement_values = (
+                    PlanStatus.PENDING.value, None, None, None, None, None
+                )
+            else:
+                market = MarketType(plan_row["market"])
+
+                def leg_hit(row: sqlite3.Row) -> bool:
+                    if row["result_home"] is None or row["result_away"] is None:
+                        return False
+                    home = int(row["result_home"])
+                    away = int(row["result_away"])
+                    if market is MarketType.HAD:
+                        actual = "h" if home > away else ("a" if home < away else "d")
+                        return str(row["score_code"]).lower() == actual
+                    code_match = re.fullmatch(r"s(\d{2})s(\d{2})", str(row["score_code"]))
+                    if code_match:
+                        return (int(code_match.group(1)), int(code_match.group(2))) == (home, away)
+                    label_match = re.fullmatch(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*", str(row["score_label"]))
+                    return bool(
+                        label_match
+                        and (int(label_match.group(1)), int(label_match.group(2))) == (home, away)
+                    )
+
+                final_rows = [
+                    row for row in leg_rows if row["result_status"] == ResultStatus.FINAL.value
+                ]
+                lost = any(not leg_hit(row) for row in final_rows)
+                if lost:
+                    settled_status = PlanStatus.LOST
+                    settled_gross = settled_tax = settled_net = Decimal("0.00")
+                elif not final_rows:
+                    settled_status = PlanStatus.VOID
+                    settled_gross = settled_net = _money(int(plan_row["stake_cents"]))
+                    settled_tax = Decimal("0.00")
+                else:
+                    settled_status = PlanStatus.WON
+                    settled_odds = Decimal("1")
+                    for row in final_rows:
+                        settled_odds *= Decimal(row["odds"])
+                    settled_gross, settled_tax, settled_net = calculate_prize(
+                        settled_odds, active_legs=len(final_rows)
+                    )
+                stake = _money(int(plan_row["stake_cents"]))
+                settlement_values = (
+                    settled_status.value,
+                    _cents(settled_gross),
+                    _cents(settled_tax),
+                    _cents(settled_net),
+                    _cents((settled_net - stake).quantize(Decimal("0.00"))),
+                    plan_id,
+                )
+
             connection.execute(
                 """
                 UPDATE plans
                 SET pass_size = ?, combined_odds = ?, joint_probability = ?,
-                    gross_prize_cents = ?, tax_cents = ?, net_prize_cents = ?
+                    gross_prize_cents = ?, tax_cents = ?, net_prize_cents = ?,
+                    ai_summary = ''
                 WHERE plan_id = ?
                 """,
                 (
@@ -875,6 +945,25 @@ class Database:
                     plan_id,
                 ),
             )
+            if settlement_values[0] == PlanStatus.PENDING.value:
+                connection.execute(
+                    """
+                    UPDATE plans SET status = ?, settled_at = NULL,
+                        settled_gross_prize_cents = ?, settled_tax_cents = ?,
+                        settled_net_prize_cents = ?, net_profit_cents = ?
+                    WHERE plan_id = ?
+                    """,
+                    (*settlement_values[:5], plan_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE plans SET status = ?, settled_gross_prize_cents = ?,
+                        settled_tax_cents = ?, settled_net_prize_cents = ?, net_profit_cents = ?
+                    WHERE plan_id = ?
+                    """,
+                    settlement_values,
+                )
             return True
 
     def update_leg_results(self, plan_id: str, results: dict[str, MatchResult]) -> None:

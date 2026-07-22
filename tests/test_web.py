@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import http.client
+import re
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -209,6 +211,51 @@ class DashboardTests(unittest.TestCase):
         summary = self.database.summary()
         self.assertEqual(summary["baseline_return"], "16.00")
         self.assertEqual(summary["baseline_profit"], "14.00")
+
+    def test_deleting_losing_leg_recalculates_settled_plan(self):
+        recommendation = self._create_plan()
+        self._mark_recommendation_sent()
+        results = {
+            leg.match.match_id: MatchResult(
+                leg.match.match_id, ResultStatus.FINAL, 1, 0
+            )
+            for leg in recommendation.legs
+        }
+        losing_leg = recommendation.legs[0]
+        results[losing_leg.match.match_id] = MatchResult(
+            losing_leg.match.match_id, ResultStatus.FINAL, 0, 1
+        )
+        self.database.update_leg_results(recommendation.plan_id, results)
+        plan = self.database.get_plan(recommendation.plan_id)
+        assert plan is not None
+        settlement = ScoreFourfoldService._build_settlement(
+            plan, self.now + timedelta(days=1)
+        )
+        assert settlement is not None
+        subject, text_body, html_body = render_settlement(
+            plan, settlement, self.database.summary()
+        )
+        self.assertTrue(
+            self.database.settle_plan_with_mail(
+                settlement,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+            )
+        )
+        self.assertEqual(self.database.get_plan(recommendation.plan_id).status.value, "lost")
+
+        level, _ = self.application.trigger_delete_leg(
+            recommendation.plan_id, losing_leg.match.match_id
+        )
+
+        self.assertEqual(level, "ok")
+        updated = self.database.get_plan(recommendation.plan_id)
+        assert updated is not None
+        self.assertEqual(updated.pass_size, 3)
+        self.assertEqual(updated.status.value, "won")
+        self.assertEqual(updated.settled_net_prize, Decimal("16.00"))
+        self.assertEqual(updated.net_profit, Decimal("14.00"))
 
     def test_get_has_security_headers_and_action_is_post_only(self):
         server = DashboardServer(self.settings, self.application)
@@ -589,13 +636,22 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         self.assertEqual(status, 303)
         new_cookie = self._cookie_from(headers)
         self.assertNotEqual(new_cookie, forged)
-        status, _, payload = self._request(
+        status, page_headers, payload = self._request(
             "GET",
             "/",
             headers=self._public_headers(Cookie=new_cookie),
         )
         self.assertEqual(status, 200)
         self.assertIn("退出登录", payload.decode("utf-8"))
+        page = payload.decode("utf-8")
+        nonce = re.search(r'<script nonce="([A-Za-z0-9_-]+)">', page)
+        self.assertIsNotNone(nonce)
+        assert nonce is not None
+        self.assertIn(
+            f"script-src 'nonce-{nonce.group(1)}'",
+            page_headers["content-security-policy"],
+        )
+        self.assertNotIn('href="javascript:', page)
 
     def test_logout_requires_csrf_and_invalidates_old_cookie(self):
         status, headers, _ = self._login()

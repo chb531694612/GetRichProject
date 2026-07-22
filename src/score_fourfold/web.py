@@ -420,6 +420,7 @@ class DashboardApplication:
 
     def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "") -> str:
         now = datetime.now(self.settings.timezone)
+        script_nonce = secrets.token_urlsafe(18)
         summary = self.database.summary()
         plans = self.database.recent_plans(100)
         settled_stake = Decimal(str(summary["settled_stake"]))
@@ -497,14 +498,14 @@ class DashboardApplication:
 <section class="plans">{plan_cards}</section>
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
 </main>
-<script>
+<script nonce="{script_nonce}">
 function openModal(id){{var e=document.getElementById(id);if(e)e.classList.add('open')}}
 function closeModal(id){{var e=document.getElementById(id);if(e){{e.classList.remove('open');window.location.hash='_'}}}}
 function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
 function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
 function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
-function submitEdit(pid){{var f=document.getElementById('edit-form-'+pid);if(f){{var legs=f.querySelectorAll('.edit-leg');if(legs.length===0){{delPlan(pid);return}}f.submit()}}}}
 function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})}}
+document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target.dataset.planId);else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
 </script>
 </body></html>"""
 
@@ -525,7 +526,8 @@ function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})
             ai_html = (
                 f'<td class="ai-cell"><details open><summary>AI分析</summary>'
                 f'<p>{short}</p></details>'
-                f'<a href="javascript:openModal(\'{modal_id}\')" class="btn-sm" style="margin-top:4px">展开全文</a>'
+                f'<button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
+                f'class="btn-sm" style="margin-top:4px">展开全文</button>'
                 f'</td>'
             )
         else:
@@ -536,11 +538,12 @@ function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})
         ai_btn = ""
         if csrf_token:
             del_btn = (
-                f'<a href="javascript:delPlan(\'{_e(pid)}\')" class="btn-sm danger">删除整张计划</a>'
+                f'<button type="button" data-action="delete-plan" data-plan-id="{_e(pid)}" '
+                f'class="btn-sm danger">删除整张计划</button>'
             )
             ai_btn = (
-                f'<a href="javascript:runAIAnalysis(\'{_e(pid)}\')" class="btn-sm" '
-                f'style="background:var(--blue);color:#fff;border-color:var(--blue)">AI分析</a>'
+                f'<button type="button" data-action="analyze-plan" data-plan-id="{_e(pid)}" '
+                f'class="btn-sm" style="background:var(--blue);color:#fff;border-color:var(--blue)">AI分析</button>'
             )
             ai_btn += " <span class='muted small'>（AI分析可能需要10-30秒，完成后自动刷新）</span>"
 
@@ -559,8 +562,8 @@ function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})
             del_leg_btn = ""
             if csrf_token and plan.market is MarketType.CRS:
                 del_leg_btn = (
-                    f' <a href="javascript:delLeg(\'{_e(pid)}\',\'{_e(leg.match_id)}\')" '
-                    f'class="leg-del-btn" title="删除此场">x</a>'
+                    f' <button type="button" data-action="delete-leg" data-plan-id="{_e(pid)}" '
+                    f'data-match-id="{_e(leg.match_id)}" class="leg-del-btn" title="删除此场">x</button>'
                 )
             rows.append(
                 "<tr>"
@@ -577,7 +580,7 @@ function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})
             modal_id = f"ai-modal-{pid[:12]}"
             ai_modal = (
                 f'<div class="modal-overlay" id="{modal_id}"><div class="modal-box">'
-                f'<a href="javascript:closeModal(\'{modal_id}\')" class="close">&times;</a>'
+                f'<button type="button" data-action="close-modal" data-modal-id="{modal_id}" class="close">&times;</button>'
                 f'<h3>AI分析 — {_e(pid)}</h3>'
                 f'<p style="white-space:pre-wrap;line-height:1.7">{_e(plan.ai_summary)}</p>'
                 f'</div></div>'
@@ -640,11 +643,18 @@ def build_handler(application: DashboardApplication):
             content_type: str,
             length: int,
             extra_headers: tuple[tuple[str, str], ...] = (),
+            *,
+            script_nonce: str = "",
         ) -> None:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+            script_policy = f"; script-src 'nonce-{script_nonce}'" if script_nonce else ""
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                f"frame-ancestors 'none'; base-uri 'none'{script_policy}",
+            )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "same-origin")
@@ -664,11 +674,13 @@ def build_handler(application: DashboardApplication):
             close: bool = False,
         ) -> None:
             payload = body.encode("utf-8")
+            nonce_match = re.search(r'<script nonce="([A-Za-z0-9_-]{16,64})">', body)
+            script_nonce = nonce_match.group(1) if nonce_match else ""
             self.send_response(status)
             if close:
                 extra_headers += (("Connection", "close"),)
                 self.close_connection = True
-            self._headers(content_type, len(payload), extra_headers)
+            self._headers(content_type, len(payload), extra_headers, script_nonce=script_nonce)
             self.end_headers()
             self.wfile.write(payload)
 
