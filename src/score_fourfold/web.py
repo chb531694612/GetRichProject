@@ -524,14 +524,17 @@ document.addEventListener('click',function(event){{var target=event.target.close
             short = safe_summary[:50] + "..." if len(safe_summary) > 50 else safe_summary
             modal_id = f"ai-modal-{pid[:12]}"
             ai_html = (
-                f'<td class="ai-cell"><details open><summary>AI分析</summary>'
+                f'<td class="ai-cell" rowspan="{len(plan.legs)}"><details open><summary>AI分析</summary>'
                 f'<p>{short}</p></details>'
                 f'<button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
                 f'class="btn-sm" style="margin-top:4px">展开全文</button>'
                 f'</td>'
             )
         else:
-            ai_html = '<td class="ai-cell"><span class="muted small">—</span></td>'
+            ai_html = (
+                f'<td class="ai-cell" rowspan="{len(plan.legs)}">'
+                '<span class="muted small">—</span></td>'
+            )
 
         # Build plan action buttons (delete whole plan)
         del_btn = ""
@@ -557,7 +560,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
         actual_return = _money(plan.settled_net_prize) if plan.status != PlanStatus.PENDING else "等待结算"
         profit = _money(plan.net_profit) if plan.net_profit is not None else "等待结算"
         rows: list[str] = []
-        for leg in plan.legs:
+        for leg_index, leg in enumerate(plan.legs):
             actual, verdict, verdict_class = _leg_result(leg, market=plan.market)
             del_leg_btn = ""
             if csrf_token and plan.market is MarketType.CRS:
@@ -572,6 +575,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 f"<td>{_e(leg.home)} vs {_e(leg.away)}</td>"
                 f"<td><strong>{_e(leg.score_label)}</strong><br><span class='muted small'>SP {_e(leg.odds)}</span>{del_leg_btn}</td>"
                 f"<td>{_e(actual)}</td><td><span class='badge {verdict_class}'>{_e(verdict)}</span></td>"
+                f"{ai_html if leg_index == 0 else ''}"
                 "</tr>"
             )
         # Build AI modal if exists

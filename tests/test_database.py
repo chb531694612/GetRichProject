@@ -114,6 +114,30 @@ class DatabaseSafetyTests(unittest.TestCase):
         self.assertEqual(len(retry), 1)
         self.database.mark_email_sent(int(retry[0]["id"]), retry[0]["claim_token"], self.now)
 
+    def test_deleted_plan_can_be_recreated_with_fresh_mail(self):
+        recommendation = self._create_plan()
+        claimed = self.database.claim_due_emails(self.now, limit=1)
+        self.assertEqual(len(claimed), 1)
+        self.database.mark_email_sent(
+            int(claimed[0]["id"]), claimed[0]["claim_token"], self.now
+        )
+        self.assertTrue(self.database.delete_plan(recommendation.plan_id))
+
+        subject, text_body, html_body = render_recommendation(recommendation)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                recommendation,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=self.now + timedelta(hours=5),
+            )
+        )
+        recreated = self.database.get_plan(recommendation.plan_id)
+        assert recreated is not None
+        self.assertEqual(recreated.delivery_status, "queued")
+        self.assertEqual(len(self.database.claim_due_emails(self.now, limit=1)), 1)
+
     def test_fifth_mail_failure_becomes_dead_letter(self):
         self.database.enqueue_mail(
             dedupe_key="dead-letter-test",

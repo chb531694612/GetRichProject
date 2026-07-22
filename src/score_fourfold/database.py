@@ -600,6 +600,23 @@ class Database:
             ).fetchone()
             if int(existing["count"]) >= limit:
                 return False
+            existing_plan = connection.execute(
+                "SELECT 1 FROM plans WHERE plan_id = ?", (recommendation.plan_id,)
+            ).fetchone()
+            if existing_plan is None:
+                # A manually deleted deterministic plan can later be generated
+                # with the same ID. Remove its orphaned mail dedupe records so
+                # the replacement receives a fresh recommendation message.
+                connection.execute(
+                    """
+                    DELETE FROM email_outbox
+                    WHERE dedupe_key IN (?, ?)
+                    """,
+                    (
+                        f"recommendation:{recommendation.plan_id}",
+                        f"settlement:{recommendation.plan_id}",
+                    ),
+                )
             # Insert into recommendation_days for historical tracking.
             connection.execute(
                 """
@@ -826,8 +843,8 @@ class Database:
         """Delete a plan and all its legs. Returns True if deleted."""
         with self.connect() as connection:
             connection.execute(
-                "DELETE FROM email_outbox WHERE dedupe_key = ? AND status != 'sent'",
-                (f"recommendation:{plan_id}",),
+                "DELETE FROM email_outbox WHERE dedupe_key IN (?, ?)",
+                (f"recommendation:{plan_id}", f"settlement:{plan_id}"),
             )
             connection.execute("DELETE FROM recommendation_days WHERE plan_id = ?", (plan_id,))
             cursor = connection.execute("DELETE FROM plans WHERE plan_id = ?", (plan_id,))

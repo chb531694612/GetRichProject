@@ -166,6 +166,22 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", page)
         self.assertIn('class="flash warn"', page)
 
+    def test_ai_summary_is_rendered_once_with_rowspan(self):
+        recommendation = self._create_plan()
+        self._mark_recommendation_sent()
+        self.assertTrue(
+            self.database.update_ai_summary(
+                recommendation.plan_id,
+                "这是一段已持久化的AI分析内容。",
+            )
+        )
+
+        page = self.application.render(csrf_token="csrf-test-token")
+
+        self.assertIn("这是一段已持久化的AI分析内容。", page)
+        self.assertEqual(page.count('class="ai-cell"'), 1)
+        self.assertIn('class="ai-cell" rowspan="4"', page)
+
     def test_dashboard_distinguishes_quoted_and_actual_settlement_values(self):
         recommendation = self._create_plan()
         self._mark_recommendation_sent()
