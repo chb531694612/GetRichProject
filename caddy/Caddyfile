@@ -1,0 +1,16 @@
+{
+    default_sni {$PUBLIC_IP}
+    # Docker 容器不能替客户端安装信任根；root.crt 由用户按部署文档导出。
+    skip_install_trust
+}
+
+https://{$PUBLIC_IP} {
+    tls internal
+
+    reverse_proxy app:8080 {
+        # 应用只信任这台 Caddy 明确覆盖的代理头。
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Host {host}
+    }
+}

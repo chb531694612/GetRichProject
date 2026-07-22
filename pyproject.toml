@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "score-fourfold"
+version = "0.7.0"
+description = "Personal 2-yuan Jingcai exact-score accumulator recommendation and settlement service"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary - personal use" }
+authors = [{ name = "GetRichProject" }]
+dependencies = []
+
+[project.scripts]
+score-fourfold = "score_fourfold.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.unittest]
+start-directory = "tests"

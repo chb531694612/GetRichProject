@@ -1,0 +1,138 @@
+{
+  "matches": [
+    {
+      "match_id": "demo-001",
+      "match_num": "周二001",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示甲级联赛"},
+      "home": {"abbName": "海城队"},
+      "away": {"abbName": "山城队"},
+      "start_at": "2026-07-14T20:00:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s01s00", "labelZh": "1:0", "odds": 6.5, "noVigProb": 0.13},
+          {"code": "s01s01", "labelZh": "1:1", "odds": 7.0, "noVigProb": 0.12},
+          {"code": "s1sh", "labelZh": "胜其它", "odds": 25.0, "noVigProb": 0.20}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 1.65, "noVigProb": 0.55},
+          {"code": "d", "labelZh": "平", "odds": 3.60, "noVigProb": 0.25},
+          {"code": "a", "labelZh": "客胜", "odds": 5.00, "noVigProb": 0.20}
+        ]}
+      }
+    },
+    {
+      "match_id": "demo-002",
+      "match_num": "周二002",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示乙级联赛"},
+      "home": {"abbName": "江南队"},
+      "away": {"abbName": "江北队"},
+      "start_at": "2026-07-14T20:30:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s01s00", "labelZh": "1:0", "odds": 6.0, "noVigProb": 0.14},
+          {"code": "s00s00", "labelZh": "0:0", "odds": 8.0, "noVigProb": 0.10},
+          {"code": "s1sd", "labelZh": "平其它", "odds": 60.0, "noVigProb": 0.21}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 1.70, "noVigProb": 0.52},
+          {"code": "d", "labelZh": "平", "odds": 3.40, "noVigProb": 0.27},
+          {"code": "a", "labelZh": "客胜", "odds": 4.80, "noVigProb": 0.21}
+        ]}
+      }
+    },
+    {
+      "match_id": "demo-003",
+      "match_num": "周二003",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示丙级联赛"},
+      "home": {"abbName": "东港队"},
+      "away": {"abbName": "西港队"},
+      "start_at": "2026-07-14T21:00:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s01s00", "labelZh": "1:0", "odds": 6.8, "noVigProb": 0.12},
+          {"code": "s02s01", "labelZh": "2:1", "odds": 8.5, "noVigProb": 0.09},
+          {"code": "s1sh", "labelZh": "胜其它", "odds": 24.0, "noVigProb": 0.22}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 1.75, "noVigProb": 0.50},
+          {"code": "d", "labelZh": "平", "odds": 3.50, "noVigProb": 0.28},
+          {"code": "a", "labelZh": "客胜", "odds": 4.60, "noVigProb": 0.22}
+        ]}
+      }
+    },
+    {
+      "match_id": "demo-004",
+      "match_num": "周二004",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示甲级联赛"},
+      "home": {"abbName": "红星队"},
+      "away": {"abbName": "蓝星队"},
+      "start_at": "2026-07-14T21:30:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s01s00", "labelZh": "1:0", "odds": 7.2, "noVigProb": 0.115},
+          {"code": "s01s01", "labelZh": "1:1", "odds": 6.8, "noVigProb": 0.11},
+          {"code": "s1sa", "labelZh": "负其它", "odds": 30.0, "noVigProb": 0.23}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 1.85, "noVigProb": 0.48},
+          {"code": "d", "labelZh": "平", "odds": 3.30, "noVigProb": 0.30},
+          {"code": "a", "labelZh": "客胜", "odds": 4.20, "noVigProb": 0.22}
+        ]}
+      }
+    },
+    {
+      "match_id": "demo-005",
+      "match_num": "周二005",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示乙级联赛"},
+      "home": {"abbName": "林城队"},
+      "away": {"abbName": "湖城队"},
+      "start_at": "2026-07-14T22:00:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s00s00", "labelZh": "0:0", "odds": 7.5, "noVigProb": 0.11},
+          {"code": "s00s01", "labelZh": "0:1", "odds": 7.0, "noVigProb": 0.10},
+          {"code": "s1sd", "labelZh": "平其它", "odds": 55.0, "noVigProb": 0.24}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 2.05, "noVigProb": 0.42},
+          {"code": "d", "labelZh": "平", "odds": 3.20, "noVigProb": 0.31},
+          {"code": "a", "labelZh": "客胜", "odds": 3.60, "noVigProb": 0.27}
+        ]}
+      }
+    },
+    {
+      "match_id": "demo-006",
+      "match_num": "周二006",
+      "business_date": "2026-07-14",
+      "league": {"abbName": "演示丙级联赛"},
+      "home": {"abbName": "金桥队"},
+      "away": {"abbName": "银桥队"},
+      "start_at": "2026-07-14T22:30:00+08:00",
+      "markets": {
+        "crs": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "s01s00", "labelZh": "1:0", "odds": 6.9, "noVigProb": 0.12},
+          {"code": "s02s01", "labelZh": "2:1", "odds": 8.2, "noVigProb": 0.10},
+          {"code": "s1sh", "labelZh": "胜其它", "odds": 22.0, "noVigProb": 0.22}
+        ]},
+        "had": {"updateTime": "2026-07-14 11:55:00", "outcomes": [
+          {"code": "h", "labelZh": "主胜", "odds": 1.90, "noVigProb": 0.46},
+          {"code": "d", "labelZh": "平", "odds": 3.45, "noVigProb": 0.29},
+          {"code": "a", "labelZh": "客胜", "odds": 4.00, "noVigProb": 0.25}
+        ]}
+      }
+    }
+  ],
+  "results": [
+    {"match_id": "demo-001", "status": "finished", "finalScore": "1:0"},
+    {"match_id": "demo-002", "status": "finished", "finalScore": "1:0"},
+    {"match_id": "demo-003", "status": "finished", "finalScore": "1:0"},
+    {"match_id": "demo-004", "status": "finished", "finalScore": "1:0"},
+    {"match_id": "demo-005", "status": "finished", "finalScore": "0:0"},
+    {"match_id": "demo-006", "status": "finished", "finalScore": "2:1"}
+  ]
+}

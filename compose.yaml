@@ -1,0 +1,35 @@
+services:
+  app:
+    container_name: score-fourfold-app
+    build: .
+    image: score-fourfold:0.7.0
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Only the server itself can reach the app; 1Panel OpenResty proxies to it.
+      - "127.0.0.1:${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+    volumes:
+      - score-data:/app/data
+    networks:
+      - 1panel-network
+    command: ["daemon"]
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "score-fourfold", "health"]
+      interval: 5m
+      timeout: 30s
+      retries: 2
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  score-data:
+
+networks:
+  1panel-network:
+    external: true
