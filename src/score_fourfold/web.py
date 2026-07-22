@@ -23,6 +23,7 @@ from .config import Settings
 from .ai_analyzer import AIAnalysisError, analyze_plan_from_leg_data
 from .database import Database, StoredLeg, StoredPlan
 from .domain import MarketType, PlanStatus, ResultStatus
+from .mail import render_stored_recommendation
 
 
 LOGGER = logging.getLogger("score_fourfold.web")
@@ -183,11 +184,15 @@ class DashboardApplication:
         trigger_recommendation: Callable[[str], tuple[str, str]],
         secret: bytes | None = None,
         provider: object | None = None,
+        wake_mailer: Callable[[], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.settings = settings
         self.database = database
         self.trigger_recommendation = trigger_recommendation
         self.provider = provider
+        self.wake_mailer = wake_mailer
+        self._clock = clock or (lambda: datetime.now(self.settings.timezone))
         self._secret = secret or secrets.token_bytes(32)
         self.access_mode = getattr(settings, "web_access_mode", "ssh")
         self.public_origin = getattr(settings, "web_public_origin", "").rstrip("/")
@@ -216,7 +221,45 @@ class DashboardApplication:
         return self.access_mode == "public"
 
     def now(self) -> datetime:
-        return datetime.now(self.settings.timezone)
+        return self._clock().astimezone(self.settings.timezone)
+
+    def _refresh_mail_after_plan_change(self, plan_id: str) -> str:
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return "；计划已不存在，未生成更新邮件"
+        changed_at = self.now()
+        recommendation_day = datetime.fromisoformat(plan.recommendation_date).date()
+        first_send_at = datetime.combine(
+            recommendation_day,
+            self.settings.recommendation_first_mail_time,
+            tzinfo=self.settings.timezone,
+        )
+        deadline = datetime.combine(
+            recommendation_day,
+            self.settings.recommendation_deadline,
+            tzinfo=self.settings.timezone,
+        )
+        expires_at = deadline - timedelta(
+            minutes=self.settings.recommendation_send_buffer_minutes
+        )
+        subject, text_body, html_body = render_stored_recommendation(plan)
+        result = self.database.refresh_recommendation_mail(
+            plan_id,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            changed_at=changed_at,
+            first_send_at=first_send_at,
+            expires_at=expires_at,
+        )
+        if result in {"refreshed", "queued"} and self.wake_mailer is not None:
+            self.wake_mailer()
+        return {
+            "refreshed": "；尚未发出的首封推荐邮件已同步更新",
+            "queued": "；最新版推荐邮件已重新排队发送",
+            "expired": "；已超过当天推荐邮件截止时间，未重新发送",
+            "missing": "；计划已不存在，未生成更新邮件",
+        }[result]
 
     def new_request(self) -> tuple[str, str]:
         request_id = secrets.token_urlsafe(24)
@@ -250,7 +293,8 @@ class DashboardApplication:
         if not deleted:
             return ("warn", f"未找到比赛 {match_id}")
         self.database.update_plan_after_leg_delete(plan_id)
-        return ("ok", f"已从计划 {plan_id} 中删除比赛 {match_id}，统计数据已更新")
+        mail_detail = self._refresh_mail_after_plan_change(plan_id)
+        return ("ok", f"已从计划 {plan_id} 中删除比赛 {match_id}，统计数据已更新{mail_detail}")
 
     def trigger_ai_analysis(self, plan_id: str) -> tuple[str, str]:
         """Run AI analysis and persist one validated suggestion per plan leg."""
@@ -320,9 +364,10 @@ class DashboardApplication:
             return ("warn", "该推荐选项不存在或已经失效，请重新运行AI分析刷新选项")
         if not self.database.update_plan_leg_option(plan_id, match_id, option_code):
             return ("error", f"修改比赛 {match_id} 的推荐失败")
+        mail_detail = self._refresh_mail_after_plan_change(plan_id)
         return (
             "ok",
-            f"已将比赛 {leg.match_num} 的推荐修改为 {option.label}，赔率和奖金已重新计算",
+            f"已将比赛 {leg.match_num} 的推荐修改为 {option.label}，赔率和奖金已重新计算{mail_detail}",
         )
 
     def new_login_token(self) -> str:

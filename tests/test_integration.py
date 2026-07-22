@@ -68,7 +68,8 @@ class FullFlowTests(unittest.TestCase):
         )
         database = Database(settings.database_path)
         database.initialize()
-        clock = lambda: now
+        clock_value = [now]
+        clock = lambda: clock_value[0]
         service = ScoreFourfoldService(
             settings,
             database,
@@ -79,6 +80,10 @@ class FullFlowTests(unittest.TestCase):
 
         recommendation_outcome = service.recommend(now)
         self.assertEqual(recommendation_outcome.status, "created")
+        early = service.send_mail(now)
+        self.assertIn("0", early.detail)
+        self.assertFalse((tmp_path / "000001.html").exists())
+        clock_value[0] = now.replace(hour=15)
         sent = service.send_mail(now)
         self.assertIn("发送3封", sent.detail)
         self.assertTrue((tmp_path / "000001.html").exists())

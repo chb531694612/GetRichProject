@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 
 from score_fourfold.database import Database
 from score_fourfold.mail import Mailer, flush_outbox, render_recommendation
-from score_fourfold.scheduler import due_recommendation_slot, slot_job_name
+from score_fourfold.scheduler import (
+    due_recommendation_slot,
+    seconds_until_next_event,
+    slot_job_name,
+)
 from score_fourfold.service import ScoreFourfoldService
 
 from .helpers import make_match, make_recommendation, make_settings
@@ -95,6 +99,36 @@ class ScheduleSafetyTests(unittest.TestCase):
         self.assertIsNone(due_recommendation_slot(at_1745, slots, time(17, 45), has_run))
         at_1801 = datetime(2026, 7, 15, 18, 1, tzinfo=TZ)
         self.assertIsNone(due_recommendation_slot(at_1801, slots, time(17, 45), has_run))
+
+    def test_daemon_wakes_exactly_for_first_mail_at_1500(self):
+        now = datetime(2026, 7, 15, 14, 47, tzinfo=TZ)
+        self.assertEqual(
+            seconds_until_next_event(
+                now,
+                (time(10), time(14), time(17, 30)),
+                time(18),
+                1800,
+                time(15),
+            ),
+            13 * 60,
+        )
+
+    def test_recommendation_created_before_1500_is_not_sent_early(self):
+        created_at = datetime(2026, 7, 15, 12, 0, tzinfo=TZ)
+        clock = MutableClock(created_at)
+        provider = FakeProvider(
+            [make_match(i, created_at, business_date="2026-07-15") for i in range(1, 7)]
+        )
+        service = self._service(clock, provider)
+        self.assertIn(service.recommend(created_at).status, {"created", "partial"})
+
+        self.assertEqual(service.send_mail(created_at).status, "ok")
+        self.assertFalse(self.preview.exists())
+        self.assertGreater(service.database.summary()["emails_pending"], 0)
+
+        clock.value = datetime(2026, 7, 15, 15, 0, tzinfo=TZ)
+        service.send_mail(clock.value)
+        self.assertTrue(self.preview.exists())
 
     def test_service_does_not_call_provider_after_latest_start(self):
         now = datetime(2026, 7, 15, 17, 45, tzinfo=TZ)

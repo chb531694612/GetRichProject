@@ -28,6 +28,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         max_plans_per_business_date=1,
         send_no_recommendation=True,
         recommendation_times=(time(10, 0), time(14, 0), time(17, 30)),
+        recommendation_first_mail_time=time(15, 0),
         recommendation_latest_start=time(17, 45),
         recommendation_deadline=time(18, 0),
         recommendation_send_buffer_minutes=10,

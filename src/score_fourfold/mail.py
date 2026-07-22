@@ -11,7 +11,15 @@ from typing import Callable
 
 from .config import Settings
 from .database import Database, StoredPlan
-from .domain import MarketType, PlanStatus, Recommendation, Settlement
+from .domain import (
+    Match,
+    MarketType,
+    PlanStatus,
+    Recommendation,
+    ScoreOption,
+    SelectedLeg,
+    Settlement,
+)
 
 
 STYLE = """
@@ -189,6 +197,49 @@ def render_recommendation(recommendation: Recommendation) -> tuple[str, str, str
         ]
     )
     return subject, text_body, html_body
+
+
+def render_stored_recommendation(plan: StoredPlan) -> tuple[str, str, str]:
+    """Render the current persisted plan after a dashboard modification."""
+    legs: list[SelectedLeg] = []
+    for leg in plan.legs:
+        selected = ScoreOption(
+            code=leg.score_code,
+            label=leg.score_label,
+            odds=leg.odds,
+            probability=leg.probability,
+        )
+        match = Match(
+            match_id=leg.match_id,
+            match_num=leg.match_num,
+            business_date=leg.business_date,
+            league=leg.league,
+            home=leg.home,
+            away=leg.away,
+            start_at=leg.start_at,
+            odds_updated_at=leg.snapshot_fetched_at,
+            score_options=(selected,),
+            snapshot_fetched_at=leg.snapshot_fetched_at,
+            had_options=(selected,) if plan.market is MarketType.HAD else (),
+        )
+        legs.append(SelectedLeg(match=match, score=selected))
+    recommendation = Recommendation(
+        plan_id=plan.plan_id,
+        business_date=plan.issue_date,
+        created_at=plan.created_at,
+        legs=tuple(legs),
+        stake=plan.stake,
+        combined_odds=plan.combined_odds,
+        joint_probability=plan.joint_probability,
+        gross_prize=plan.gross_prize,
+        tax=plan.tax,
+        net_prize=plan.net_prize,
+        strategy_version=plan.strategy_version,
+        notes=("本邮件已根据个人看板中的手动调整刷新，请以当前内容为准。",),
+        market=plan.market,
+        ai_summary=plan.ai_summary,
+    )
+    return render_recommendation(recommendation)
 
 
 def _render_no_recommendation_v1(day: date, reason: str, now: datetime) -> tuple[str, str, str]:

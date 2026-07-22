@@ -51,6 +51,13 @@ class ScoreFourfoldService:
         deadline = datetime.combine(day, self.settings.recommendation_deadline, tzinfo=self.settings.timezone)
         return deadline - timedelta(minutes=self.settings.recommendation_send_buffer_minutes)
 
+    def _recommendation_first_mail_at(self, day: date) -> datetime:
+        return datetime.combine(
+            day,
+            self.settings.recommendation_first_mail_time,
+            tzinfo=self.settings.timezone,
+        )
+
     def _recommendation_window_open(self, now: datetime) -> bool:
         local_time = now.timetz().replace(tzinfo=None)
         return (
@@ -107,6 +114,10 @@ class ScoreFourfoldService:
                     text_body=text_body,
                     html_body=html_body,
                     expires_at=self._recommendation_mail_cutoff(wall_after_fetch.date()),
+                    not_before=max(
+                        rec.created_at,
+                        self._recommendation_first_mail_at(wall_after_fetch.date()),
+                    ),
                 )
                 if created:
                     created_plans.append(rec.plan_id)
@@ -131,6 +142,10 @@ class ScoreFourfoldService:
                 text_body=text_body,
                 html_body=html_body,
                 expires_at=self._recommendation_mail_cutoff(wall_after_fetch.date()),
+                not_before=max(
+                    recommendation.created_at,
+                    self._recommendation_first_mail_at(wall_after_fetch.date()),
+                ),
             )
             if not created:
                 return JobOutcome(

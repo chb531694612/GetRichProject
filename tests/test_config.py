@@ -43,6 +43,16 @@ class WebSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_public_origin, "https://8.8.8.8")
         self.assertEqual(settings.web_session_hours, 12)
+        self.assertEqual(settings.recommendation_first_mail_time.strftime("%H:%M"), "15:00")
+
+    def test_first_recommendation_mail_must_precede_cutoff(self):
+        with patch.dict(
+            os.environ,
+            {"RECOMMENDATION_FIRST_MAIL_TIME": "17:50"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "FIRST_MAIL_TIME"):
+                Settings.from_env()
 
     def test_public_mode_accepts_https_domain_for_openresty(self):
         with patch.dict(

@@ -224,6 +224,7 @@ def _safe_settings(settings: Settings) -> dict[str, object]:
         "max_plans_per_business_date": settings.max_plans_per_business_date,
         "poll_interval_seconds": settings.poll_interval_seconds,
         "recommendation_times": [value.strftime("%H:%M") for value in settings.recommendation_times],
+        "recommendation_first_mail_time": settings.recommendation_first_mail_time.strftime("%H:%M"),
         "recommendation_latest_start": settings.recommendation_latest_start.strftime("%H:%M"),
         "recommendation_deadline": settings.recommendation_deadline.strftime("%H:%M"),
         "recommendation_mail_cutoff": (
@@ -370,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
                         service.database,
                         _build_manual_trigger(service, wake_event),
                         provider=service.provider,
+                        wake_mailer=wake_event.set,
                     )
                     dashboard_server = DashboardServer(settings, application)
                     dashboard_server.start()
@@ -412,6 +414,7 @@ def main(argv: list[str] | None = None) -> None:
                         settings.recommendation_times,
                         settings.recommendation_deadline,
                         settings.poll_interval_seconds,
+                        settings.recommendation_first_mail_time,
                     )
                     wake_event.wait(wait_seconds)
                     wake_event.clear()

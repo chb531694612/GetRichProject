@@ -38,6 +38,7 @@ def seconds_until_next_event(
     slots: tuple[time, ...],
     deadline: time,
     poll_interval_seconds: int,
+    first_mail_time: time | None = None,
 ) -> float:
     """Wake on either the normal poll or the next recommendation/day-end edge."""
     if now.tzinfo is None:
@@ -47,6 +48,10 @@ def seconds_until_next_event(
         candidate = datetime.combine(now.date(), slot, tzinfo=now.tzinfo)
         if candidate > now:
             candidates.append(candidate)
+    if first_mail_time is not None:
+        first_mail = datetime.combine(now.date(), first_mail_time, tzinfo=now.tzinfo)
+        if first_mail > now:
+            candidates.append(first_mail)
     day_end = datetime.combine(now.date(), deadline, tzinfo=now.tzinfo)
     if day_end > now:
         candidates.append(day_end)

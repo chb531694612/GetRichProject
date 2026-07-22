@@ -128,6 +128,7 @@ class Settings:
     max_plans_per_business_date: int
     send_no_recommendation: bool
     recommendation_times: tuple[time, ...]
+    recommendation_first_mail_time: time
     recommendation_latest_start: time
     recommendation_deadline: time
     recommendation_send_buffer_minutes: int
@@ -201,6 +202,7 @@ class Settings:
             max_plans_per_business_date=max_plans_per_business_date,
             send_no_recommendation=_bool("SEND_NO_RECOMMENDATION", True),
             recommendation_times=_times("RECOMMENDATION_TIMES", "10:00,14:00,17:30"),
+            recommendation_first_mail_time=_time("RECOMMENDATION_FIRST_MAIL_TIME", "15:00"),
             recommendation_latest_start=_time("RECOMMENDATION_LATEST_START", "17:45"),
             recommendation_deadline=_time("RECOMMENDATION_DEADLINE", "18:00"),
             recommendation_send_buffer_minutes=_int(
@@ -253,6 +255,12 @@ class Settings:
             - settings.recommendation_send_buffer_minutes
         )
         last_slot_minutes = settings.recommendation_times[-1].hour * 60 + settings.recommendation_times[-1].minute
+        first_mail_minutes = (
+            settings.recommendation_first_mail_time.hour * 60
+            + settings.recommendation_first_mail_time.minute
+        )
+        if first_mail_minutes >= cutoff_minutes:
+            raise ValueError("RECOMMENDATION_FIRST_MAIL_TIME must be before the mail cutoff")
         if cutoff_minutes <= last_slot_minutes:
             raise ValueError("the recommendation mail cutoff must be after the final recommendation time")
         if settings.min_score_probability > 1 or settings.min_joint_probability > 1:

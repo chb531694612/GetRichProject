@@ -608,12 +608,14 @@ class Database:
         created_at: datetime,
         priority: int = 0,
         expires_at: datetime | None = None,
+        not_before: datetime | None = None,
     ) -> None:
         connection.execute(
             """
             INSERT OR IGNORE INTO email_outbox
-                (dedupe_key, kind, subject, text_body, html_body, priority, expires_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (dedupe_key, kind, subject, text_body, html_body, priority,
+                 expires_at, next_attempt_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dedupe_key,
@@ -623,6 +625,7 @@ class Database:
                 html_body,
                 priority,
                 expires_at.isoformat() if expires_at else None,
+                not_before.isoformat() if not_before else None,
                 created_at.isoformat(),
             ),
         )
@@ -635,11 +638,17 @@ class Database:
         text_body: str,
         html_body: str,
         expires_at: datetime,
+        not_before: datetime | None = None,
     ) -> bool:
         if expires_at.tzinfo is None:
             raise ValueError("recommendation expires_at must be timezone-aware")
         if expires_at <= recommendation.created_at:
             raise ValueError("recommendation expires_at must be after created_at")
+        if not_before is not None:
+            if not_before.tzinfo is None:
+                raise ValueError("recommendation not_before must be timezone-aware")
+            if not_before >= expires_at:
+                raise ValueError("recommendation not_before must be before expires_at")
         with self.connect() as connection:
             # Serialize the count-and-insert gate across processes. CRS permits
             # three plans per day; every other market remains one-per-day.
@@ -665,10 +674,12 @@ class Database:
                     """
                     DELETE FROM email_outbox
                     WHERE dedupe_key IN (?, ?)
+                       OR dedupe_key LIKE ?
                     """,
                     (
                         f"recommendation:{recommendation.plan_id}",
                         f"settlement:{recommendation.plan_id}",
+                        f"recommendation-update:{recommendation.plan_id}:%",
                     ),
                 )
             # Insert into recommendation_days for historical tracking.
@@ -787,6 +798,7 @@ class Database:
                 created_at=recommendation.created_at,
                 priority=100,
                 expires_at=expires_at,
+                not_before=not_before,
             )
             return True
 
@@ -801,6 +813,7 @@ class Database:
         created_at: datetime,
         priority: int = 0,
         expires_at: datetime | None = None,
+        not_before: datetime | None = None,
     ) -> bool:
         with self.connect() as connection:
             before = connection.total_changes
@@ -814,8 +827,102 @@ class Database:
                 created_at=created_at,
                 priority=priority,
                 expires_at=expires_at,
+                not_before=not_before,
             )
             return connection.total_changes > before
+
+    def refresh_recommendation_mail(
+        self,
+        plan_id: str,
+        *,
+        subject: str,
+        text_body: str,
+        html_body: str,
+        changed_at: datetime,
+        first_send_at: datetime,
+        expires_at: datetime,
+    ) -> str:
+        """Refresh an unsent recommendation or queue a revision after delivery.
+
+        Returns ``refreshed`` when the original pending message was replaced,
+        ``queued`` when a new update message was added, ``expired`` after the
+        recommendation cutoff, or ``missing`` when the plan no longer exists.
+        """
+        if any(value.tzinfo is None for value in (changed_at, first_send_at, expires_at)):
+            raise ValueError("recommendation mail times must be timezone-aware")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+            if exists is None:
+                return "missing"
+            if changed_at >= expires_at:
+                return "expired"
+            original = connection.execute(
+                "SELECT id, status FROM email_outbox WHERE dedupe_key = ?",
+                (f"recommendation:{plan_id}",),
+            ).fetchone()
+            if original is not None and original["status"] == "pending":
+                not_before = max(changed_at, first_send_at)
+                connection.execute(
+                    """
+                    UPDATE email_outbox
+                    SET subject = ?, text_body = ?, html_body = ?, attempts = 0,
+                        last_error = '', claim_token = NULL, claimed_until = NULL,
+                        next_attempt_at = ?, expires_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        subject,
+                        text_body,
+                        html_body,
+                        not_before.isoformat(),
+                        expires_at.isoformat(),
+                        int(original["id"]),
+                    ),
+                )
+                return "refreshed"
+            pending_update = connection.execute(
+                """
+                SELECT id FROM email_outbox
+                WHERE kind = 'recommendation-update'
+                  AND dedupe_key LIKE ? AND status = 'pending'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (f"recommendation-update:{plan_id}:%",),
+            ).fetchone()
+            if pending_update is not None:
+                connection.execute(
+                    """
+                    UPDATE email_outbox
+                    SET subject = ?, text_body = ?, html_body = ?, attempts = 0,
+                        last_error = '', next_attempt_at = ?, expires_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        f"[更新] {subject}",
+                        "本邮件为计划修改后的最新版，请以本邮件为准。\n\n" + text_body,
+                        html_body,
+                        changed_at.isoformat(),
+                        expires_at.isoformat(),
+                        int(pending_update["id"]),
+                    ),
+                )
+                return "queued"
+            self._insert_outbox(
+                connection,
+                dedupe_key=f"recommendation-update:{plan_id}:{uuid.uuid4().hex}",
+                kind="recommendation-update",
+                subject=f"[更新] {subject}",
+                text_body="本邮件为计划修改后的最新版，请以本邮件为准。\n\n" + text_body,
+                html_body=html_body,
+                created_at=changed_at,
+                priority=110,
+                expires_at=expires_at,
+                not_before=changed_at,
+            )
+            return "queued"
 
     def pending_plans(self) -> list[StoredPlan]:
         with self.connect() as connection:
@@ -1092,8 +1199,15 @@ class Database:
         """Delete a plan and all its legs. Returns True if deleted."""
         with self.connect() as connection:
             connection.execute(
-                "DELETE FROM email_outbox WHERE dedupe_key IN (?, ?)",
-                (f"recommendation:{plan_id}", f"settlement:{plan_id}"),
+                """
+                DELETE FROM email_outbox
+                WHERE dedupe_key IN (?, ?) OR dedupe_key LIKE ?
+                """,
+                (
+                    f"recommendation:{plan_id}",
+                    f"settlement:{plan_id}",
+                    f"recommendation-update:{plan_id}:%",
+                ),
             )
             connection.execute("DELETE FROM recommendation_days WHERE plan_id = ?", (plan_id,))
             cursor = connection.execute("DELETE FROM plans WHERE plan_id = ?", (plan_id,))
