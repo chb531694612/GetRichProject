@@ -72,7 +72,10 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         ],
         "tools": [{"type": "web_search"}],
         "tool_choice": "required",
-        "enable_thinking": True,
+        # DashScope does not allow tool_choice="required" while thinking mode
+        # is enabled.  Web search is mandatory for this analyzer, so use the
+        # non-thinking path and keep tool_choice required.
+        "enable_thinking": False,
         "max_output_tokens": max_tokens,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

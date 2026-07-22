@@ -62,6 +62,7 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(payload["model"], "qwen3.7-max")
         self.assertEqual(payload["tools"], [{"type": "web_search"}])
         self.assertEqual(payload["tool_choice"], "required")
+        self.assertFalse(payload["enable_thinking"])
 
     def test_probe_rejects_missing_key_and_empty_response(self):
         with self.assertRaisesRegex(AIAnalysisError, "not configured"):
