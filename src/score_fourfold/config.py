@@ -310,12 +310,32 @@ class Settings:
                 raise ValueError("WEB_PUBLIC_ORIGIN contains an invalid port") from exc
             if public_port not in {None, 443}:
                 raise ValueError("WEB_PUBLIC_ORIGIN must use the default HTTPS port 443")
+            hostname = public_origin.hostname
             try:
-                public_ip = ipaddress.ip_address(public_origin.hostname)
-            except ValueError as exc:
-                raise ValueError("WEB_PUBLIC_ORIGIN host must be the server public IPv4 address") from exc
-            if public_ip.version != 4 or not public_ip.is_global:
-                raise ValueError("WEB_PUBLIC_ORIGIN host must be the server public IPv4 address")
+                public_ip = ipaddress.ip_address(hostname)
+            except ValueError:
+                # 1Panel OpenResty commonly terminates HTTPS on a DNS name.
+                # Accept a normalized, fully-qualified hostname while still
+                # rejecting localhost, single-label and malformed hostnames.
+                try:
+                    ascii_hostname = hostname.encode("idna").decode("ascii")
+                except UnicodeError as exc:
+                    raise ValueError("WEB_PUBLIC_ORIGIN contains an invalid hostname") from exc
+                labels = ascii_hostname.rstrip(".").split(".")
+                valid_label = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+                if (
+                    len(ascii_hostname) > 253
+                    or len(labels) < 2
+                    or any(not valid_label.fullmatch(label) for label in labels)
+                ):
+                    raise ValueError(
+                        "WEB_PUBLIC_ORIGIN host must be a public IPv4 address or valid domain"
+                    )
+            else:
+                if public_ip.version != 4 or not public_ip.is_global:
+                    raise ValueError(
+                        "WEB_PUBLIC_ORIGIN host must be a public IPv4 address or valid domain"
+                    )
         return settings
 
     def validate_mail(self) -> list[str]:

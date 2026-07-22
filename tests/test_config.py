@@ -44,6 +44,16 @@ class WebSettingsTests(unittest.TestCase):
         self.assertEqual(settings.web_public_origin, "https://8.8.8.8")
         self.assertEqual(settings.web_session_hours, 12)
 
+    def test_public_mode_accepts_https_domain_for_openresty(self):
+        with patch.dict(
+            os.environ,
+            self._public_env(WEB_PUBLIC_ORIGIN="https://cchbin.site"),
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.web_public_origin, "https://cchbin.site")
+
     def test_public_mode_rejects_missing_proxy_trust_or_password_hash(self):
         for override in (
             {"WEB_TRUST_PROXY_HEADERS": "false"},
@@ -63,10 +73,11 @@ class WebSettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "WEB_HOST=0.0.0.0"):
                 Settings.from_env()
 
-    def test_public_mode_rejects_hostname_private_ip_path_and_nonstandard_port(self):
+    def test_public_mode_rejects_bad_hostname_private_ip_path_and_nonstandard_port(self):
         origins = (
             "http://8.8.8.8",
-            "https://dashboard.example.com",
+            "https://localhost",
+            "https://bad_host.example.com",
             "https://192.168.1.10",
             "https://8.8.8.8/login",
             "https://8.8.8.8:8443",
