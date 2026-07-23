@@ -185,6 +185,18 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("rowspan=", page)
         self.assertIn("查看总体分析", page)
 
+    def test_dashboard_marks_recommendation_and_each_match_during_ai_work(self):
+        self._create_plan()
+        self._mark_recommendation_sent()
+
+        page = self.application.render(csrf_token="csrf-test-token")
+
+        self.assertIn('id="recommend-form"', page)
+        self.assertIn("推荐生成中（含 AI 分析）", page)
+        self.assertIn("本场比赛 AI 分析中，请稍候", page)
+        self.assertIn("AI 正在联网分析，最长可能需要约 10 分钟", page)
+        self.assertIn("target.disabled=true", page)
+
     def test_dashboard_renders_ai_replacements_and_manual_pick_editor(self):
         recommendation = self._create_plan()
         self._mark_recommendation_sent()

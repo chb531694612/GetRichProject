@@ -58,6 +58,7 @@ button:disabled{background:#98a2b3;cursor:not-allowed}.flash{padding:13px 16px;b
 .plan-money strong{display:block;font-size:17px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:1250px}th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px}th{color:var(--muted);font-size:12px;background:#fcfcfd}
 tr:last-child td{border-bottom:0}.empty{text-align:center;padding:50px 20px;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:12px;margin-top:30px}
 .pick-cell{min-width:220px}.ai-cell{min-width:290px;max-width:360px;font-size:13px;line-height:1.5}.ai-choice{padding:8px 10px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe}.ai-choice .reason{margin-top:4px;color:var(--muted)}.ai-choice button{margin-top:7px;padding:6px 10px;border-radius:7px;font-size:12px}.inline-edit{margin-top:7px}.inline-edit summary{cursor:pointer;color:var(--blue);font-size:12px}.inline-edit-controls{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap}.inline-edit-controls button{padding:5px 9px;border-radius:6px;font-size:12px}.edit-score-select{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:5px 7px;max-width:165px;background:#fff}
+.ai-loading{padding:9px 11px;border-radius:9px;background:#fffaeb;border:1px solid #fedf89;color:#93370d;font-weight:700}.working-status{display:none;margin-top:7px;color:#93370d;font-weight:700}.working-status.visible{display:block}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;justify-content:center;align-items:center;padding:20px}.modal-overlay:target,.modal-overlay.open{display:flex}
 .modal-box{background:var(--card);border-radius:16px;max-width:700px;max-height:80vh;overflow-y:auto;padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.18)}.modal-box h3{margin:0 0 12px}.modal-box .close{float:right;font-size:22px;text-decoration:none;color:var(--muted);line-height:1}.modal-box .close:hover{color:var(--ink)}
 .plan-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}.plan-actions button,.plan-actions .btn-sm{border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}.plan-actions button.danger,.plan-actions .btn-sm.danger{color:var(--red);border-color:#fecdca;background:#fef3f2}.plan-actions button.danger:hover,.plan-actions .btn-sm.danger:hover{background:#fecdca}.plan-actions button.warn,.plan-actions .btn-sm.warn{color:var(--amber);border-color:#fedf89;background:#fffaeb}
@@ -596,8 +597,8 @@ class DashboardApplication:
 <div class="metric"><div class="muted">整票命中率</div><div class="value">{_e(f'{hit_rate:.2f}%' if hit_rate is not None else '—')}</div><div class="small muted">已结算 {settled} · 待结算 {summary['plans_pending']}</div></div>
 </section>
 <section class="panel action"><div><strong>手动尝试今日推荐</strong><div class="muted small">{_e(action_reason)}</div></div>
-<form method="post" action="/actions/recommend"><input type="hidden" name="request_id" value="{_e(request_id)}">
-<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button type="submit"{disabled}>立即尝试今日全部推荐</button></form></section>
+<form id="recommend-form" method="post" action="/actions/recommend"><input type="hidden" name="request_id" value="{_e(request_id)}">
+<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>立即尝试今日全部推荐</button><div id="recommend-working" class="working-status">推荐生成中（含 AI 分析），请勿重复提交，最长可能需要约 10 分钟…</div></form></section>
 <div class="section-title"><div><h2>推荐记录</h2><div class="muted small">包括未送达记录，最多显示最近100张</div></div><a class="button" href="/">刷新页面</a></div>
 <section class="plans">{plan_cards}</section>
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
@@ -608,9 +609,10 @@ function closeModal(id){{var e=document.getElementById(id);if(e){{e.classList.re
 function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
 function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
 function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
-function runAIAnalysis(pid){{postAction('/actions/analyze-plan',{{plan_id:pid}})}}
+function runAIAnalysis(target){{var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){{plan.querySelectorAll('.ai-cell').forEach(function(cell){{cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'}});var status=plan.querySelector('[data-ai-status]');if(status){{status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}}}postAction('/actions/analyze-plan',{{plan_id:target.dataset.planId}})}}
 function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
-document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target.dataset.planId);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+var recommendForm=document.getElementById('recommend-form');if(recommendForm)recommendForm.addEventListener('submit',function(){{var button=document.getElementById('recommend-submit');var status=document.getElementById('recommend-working');if(button){{button.disabled=true;button.textContent='推荐生成中…'}}if(status)status.classList.add('visible')}})
+document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
 </script>
 </body></html>"""
 
@@ -644,7 +646,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
                     f' <button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
                     'class="btn-sm">查看总体分析</button>'
                 )
-            ai_btn += " <span class='muted small'>（AI分析可能需要10-30秒，完成后自动刷新）</span>"
+            ai_btn += " <span class='muted small' data-ai-status>（AI联网分析最长可能需要约10分钟，完成后自动刷新）</span>"
 
         if plan.delivery_status != "sent":
             return f"""<article class="plan"><div class="plan-head"><div>

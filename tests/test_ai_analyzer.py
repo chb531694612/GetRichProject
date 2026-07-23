@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from score_fourfold.ai_analyzer import (
     AIAnalysisError,
+    analyze_matches,
     analyze_plan_from_leg_data,
     probe_qwen,
     qwen_analyze,
@@ -49,6 +50,27 @@ def _qwen_payload(content: str, *, searched: bool = True) -> dict:
 
 
 class AIAnalyzerTests(unittest.TestCase):
+    def test_timeout_is_normalized_and_automatic_analysis_does_not_raise(self):
+        settings = make_settings(
+            Path("data"),
+            qwen_api_key="secret",
+            ai_analysis_enabled=True,
+            ai_http_timeout_seconds=600,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            side_effect=TimeoutError("The read operation timed out"),
+        ) as mocked:
+            with self.assertRaisesRegex(AIAnalysisError, "timed out after 600 seconds"):
+                probe_qwen(settings)
+        self.assertEqual(mocked.call_args.kwargs["timeout"], 600)
+
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            side_effect=TimeoutError("The read operation timed out"),
+        ):
+            self.assertEqual(analyze_matches([], MarketType.CRS, settings), "")
+
     def test_probe_uses_authenticated_qwen_responses_with_required_search(self):
         settings = make_settings(Path("data"), qwen_api_key="secret", ai_analysis_enabled=True)
         with patch(

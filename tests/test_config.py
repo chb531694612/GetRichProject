@@ -34,6 +34,8 @@ class WebSettingsTests(unittest.TestCase):
             settings = Settings.from_env()
 
         self.assertEqual(settings.web_access_mode, "ssh")
+        self.assertEqual(settings.http_timeout_seconds, 20)
+        self.assertEqual(settings.ai_http_timeout_seconds, 600)
         self.assertFalse(settings.web_password_hash)
         self.assertFalse(settings.web_trust_proxy_headers)
 

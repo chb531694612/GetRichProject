@@ -107,10 +107,13 @@ OKOOO_BASE_URL=https://www.okooo.com
 
 ```dotenv
 AI_ANALYSIS_ENABLED=true
+AI_HTTP_TIMEOUT_SECONDS=600
 QWEN_API_KEY=只写在服务器.env中的百炼密钥
 QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/responses
 QWEN_MODEL=qwen3.7-max
 ```
+
+`AI_HTTP_TIMEOUT_SECONDS` 只控制 AI Responses API 请求，默认允许等待 600 秒；比赛数据源和邮件仍使用 `HTTP_TIMEOUT_SECONDS`，避免普通网络请求长时间占用服务。
 
 接口参数以[阿里云百炼联网搜索官方文档](https://help.aliyun.com/zh/model-studio/web-search/)为准。`QWEN_API_URL` 必须使用以 `/responses` 结尾的 Responses API 地址；如果百炼控制台为业务空间提供了专属 Base URL，请在其后追加 `/responses`。
 

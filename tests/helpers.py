@@ -40,6 +40,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         poll_interval_seconds=60,
         result_check_delay_minutes=150,
         http_timeout_seconds=3,
+        ai_http_timeout_seconds=600,
         web_enabled=True,
         web_host="127.0.0.1",
         web_port=8080,

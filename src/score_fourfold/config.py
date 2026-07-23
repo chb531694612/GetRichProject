@@ -140,6 +140,7 @@ class Settings:
     poll_interval_seconds: int
     result_check_delay_minutes: int
     http_timeout_seconds: int
+    ai_http_timeout_seconds: int
     web_enabled: bool
     web_host: str
     web_port: int
@@ -216,6 +217,7 @@ class Settings:
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 1800, minimum=60),
             result_check_delay_minutes=_int("RESULT_CHECK_DELAY_MINUTES", 150, minimum=90),
             http_timeout_seconds=_int("HTTP_TIMEOUT_SECONDS", 20, minimum=1),
+            ai_http_timeout_seconds=_int("AI_HTTP_TIMEOUT_SECONDS", 600, minimum=1),
             web_enabled=_bool("WEB_ENABLED", True),
             web_host=os.getenv("WEB_HOST", "127.0.0.1").strip(),
             web_port=_int("WEB_PORT", 8080, minimum=1),

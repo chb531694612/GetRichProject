@@ -91,7 +91,9 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=settings.http_timeout_seconds) as response:
+        with urllib.request.urlopen(
+            request, timeout=settings.ai_http_timeout_seconds
+        ) as response:
             response_body = response.read()
     except urllib.error.HTTPError as exc:
         try:
@@ -101,6 +103,10 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         raise AIAnalysisError(f"Qwen HTTP {exc.code}: {error_detail}") from exc
     except urllib.error.URLError as exc:
         raise AIAnalysisError(f"Qwen unreachable: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise AIAnalysisError(
+            f"Qwen timed out after {settings.ai_http_timeout_seconds} seconds"
+        ) from exc
 
     try:
         result = json.loads(response_body.decode("utf-8"))
