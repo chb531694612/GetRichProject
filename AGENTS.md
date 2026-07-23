@@ -22,7 +22,8 @@
 - 当前部署：1Panel 管理的 OpenResty 提供 HTTPS；本项目 Compose 只运行 app，不再运行 Caddy。
 - app 固定容器名：`score-fourfold-app`。
 - app 加入外部 Docker 网络：`1panel-network`。
-- OpenResty 反向代理目标：`http://score-fourfold-app:8080`。
+- 当前 1Panel OpenResty 容器使用 `host` 网络，反向代理目标为 `http://127.0.0.1:8080`；只有将 OpenResty 加入 `1panel-network` 后才可改用 `http://score-fourfold-app:8080`。
+- 站点代理片段位于 `/opt/1panel/www/sites/score-fourfold/proxy/root.conf`。AI 请求最长允许 600 秒，因此该片段必须设置 `proxy_connect_timeout 30s`、`proxy_send_timeout 660s` 和 `proxy_read_timeout 660s`，为应用处理和重定向额外保留 60 秒。
 - 宿主机仅绑定 `127.0.0.1:8080`，不得在安全组或防火墙公开 8080。
 
 ### 2.1 生产服务器远程操作授权
@@ -117,7 +118,7 @@ git diff --check
 5. **启动前验证**：依次运行 `check-config`、`health`；按变更需要再运行只读的 `probe-data`，启用 AI 时可运行 `probe-ai`。
 6. **正式启动**：`docker compose up -d --force-recreate app`。
 7. **运行验证**：检查 `docker compose ps`、最近日志、容器内 `score-fourfold health`。
-8. **OpenResty 验证**：浏览器访问 HTTPS 域名，确认登录、Host/Origin 校验与反代正常。反代目标保持 `http://score-fourfold-app:8080`。
+8. **OpenResty 验证**：浏览器访问 HTTPS 域名，确认登录、Host/Origin 校验与反代正常。反代目标必须与 OpenResty 实际网络模式一致；当前 `host` 网络保持 `http://127.0.0.1:8080`。
 9. **功能验收**：针对本次变更执行最小且非破坏性的页面验证。删除类功能不得拿真实生产计划随意测试。
 10. **清理**：只有新版本稳定后才精确清理确认过的旧容器；不自动删除卷、备份或旧代码目录。
 
@@ -126,7 +127,8 @@ git diff --check
 - GitHub 推送不会自动更新服务器；必须明确指导服务器 `git pull`、重建和重建容器。
 - 同一个镜像标签重新构建后，必须使用 `--force-recreate` 确保运行容器采用新镜像。
 - OpenResty 由 1Panel 管理，不要重新添加 Caddy 服务，不要占用宿主机 80/443。
-- 若出现 502，先检查 app 是否 healthy、是否加入 `1panel-network`、OpenResty 代理目标是否为容器名，而不是盲目开放 8080。
+- 若出现 502，先检查 app 是否 healthy、宿主机 `127.0.0.1:8080` 是否可达，以及 OpenResty 代理目标是否与其网络模式一致，不得盲目公开 8080。
+- 若长时间 AI 操作出现 504，检查站点错误日志中的 `upstream timed out`，并核对代理片段的 `proxy_read_timeout` 和 `proxy_send_timeout` 均不少于 660 秒；修改后必须先执行 `openresty -t`，成功后再平滑重载。
 - 若出现操作 403，检查 `WEB_PUBLIC_ORIGIN`、Host、`X-Forwarded-Proto`、`X-Forwarded-For`、Origin/Referer 和登录 CSRF，不得通过关闭安全校验绕过。
 
 ## 8. 完成标准
