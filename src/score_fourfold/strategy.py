@@ -359,7 +359,7 @@ def _select_crs_multi(
     now: datetime,
     settings: Settings,
     *,
-    max_plans: int = 3,
+    max_plans: int = 1,
 ) -> list[SelectionResult]:
     """Select up to max_plans CRS accumulators across 4x1/3x1/2x1."""
     if now.tzinfo is None:
@@ -425,8 +425,8 @@ def _select_crs_multi(
 
 
 def select_accumulator(matches: list[Match], now: datetime, settings: Settings) -> list[SelectionResult]:
-    """Choose up to 3 CRS accumulators across 4x1, 3x1, 2x1."""
-    return _select_crs_multi(matches, now, settings, max_plans=3)
+    """Choose one CRS accumulator across 4x1, 3x1, 2x1."""
+    return _select_crs_multi(matches, now, settings, max_plans=1)
 
 
 def select_had_accumulator(

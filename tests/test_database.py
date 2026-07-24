@@ -43,9 +43,9 @@ class DatabaseSafetyTests(unittest.TestCase):
         self.assertTrue(created)
         return recommendation
 
-    def test_database_enforces_three_crs_plans_per_recommendation_date(self):
+    def test_database_enforces_one_crs_plan_per_recommendation_date(self):
         recommendation = self._create_plan()
-        for number in (2, 3, 4):
+        for number in (2, 3):
             candidate = replace(
                 recommendation,
                 plan_id=f"BF4-TEST-{number:04d}",
@@ -59,9 +59,9 @@ class DatabaseSafetyTests(unittest.TestCase):
                 html_body=html_body,
                 expires_at=self.now + timedelta(hours=5),
             )
-            self.assertEqual(created, number <= 3)
+            self.assertEqual(created, number <= 1)
         self.assertEqual(
-            self.database.count_plans_for_recommendation_date(recommendation.recommendation_date), 3
+            self.database.count_plans_for_recommendation_date(recommendation.recommendation_date), 1
         )
 
     def test_same_issue_date_is_allowed_on_next_recommendation_date(self):
@@ -95,6 +95,35 @@ class DatabaseSafetyTests(unittest.TestCase):
         self.assertEqual(
             self.database.count_plans_for_recommendation_date("2026-07-15"), 1
         )
+
+    def test_recommendation_dates_and_plans_for_date(self):
+        first = self._create_plan()
+        second_date = self.now + timedelta(days=1)
+        second_matches = [make_match(index, second_date, odds="2.00") for index in range(1, 5)]
+        second = replace(
+            make_recommendation(second_date, second_matches),
+            plan_id="BF4-TEST-SECOND-DAY",
+        )
+        subject, text_body, html_body = render_recommendation(second)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                second,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=second.created_at + timedelta(hours=5),
+            )
+        )
+        dates = self.database.recommendation_dates()
+        self.assertEqual(len(dates), 2)
+        self.assertEqual(dates[0], "2026-07-15")
+        self.assertEqual(dates[1], "2026-07-14")
+        day1_plans = self.database.plans_for_recommendation_date("2026-07-14")
+        self.assertEqual(len(day1_plans), 1)
+        self.assertEqual(day1_plans[0].plan_id, first.plan_id)
+        day2_plans = self.database.plans_for_recommendation_date("2026-07-15")
+        self.assertEqual(len(day2_plans), 1)
+        self.assertEqual(day2_plans[0].plan_id, second.plan_id)
 
     def test_outbox_lease_prevents_parallel_claim(self):
         self._create_plan()

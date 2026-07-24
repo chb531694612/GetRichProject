@@ -91,10 +91,10 @@ class HadStrategyTests(unittest.TestCase):
         )
         outcome = service.recommend(self.now)
         self.assertEqual(outcome.status, "created")
-        self.assertEqual(database.count_plans_for_recommendation_date("2026-07-14"), 4)
+        self.assertEqual(database.count_plans_for_recommendation_date("2026-07-14"), 2)
         self.assertEqual(
             database.count_plans_for_recommendation_market("2026-07-14", MarketType.CRS),
-            3,
+            1,
         )
         self.assertEqual(
             database.count_plans_for_recommendation_market("2026-07-14", MarketType.HAD),
@@ -200,7 +200,8 @@ class HadStrategyTests(unittest.TestCase):
         settings = make_settings(self.tmp_path)
         matches = [make_match(i, self.now) for i in range(1, 5)]
         crs = select_accumulator(matches, self.now, settings)
-        self.assertEqual([item.recommendation.pass_size for item in crs], [2, 3, 4])
+        self.assertEqual(len(crs), 1)
+        self.assertEqual(crs[0].recommendation.pass_size, 2)
         self.assertTrue(all(item.recommendation.market is MarketType.CRS for item in crs))
 
 

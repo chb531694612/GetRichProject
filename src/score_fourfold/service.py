@@ -84,7 +84,7 @@ class ScoreFourfoldService:
         matches: list,
         wall_after_fetch: datetime,
         recommendation_date: str,
-        max_crs_plans: int = 3,
+        max_crs_plans: int = 1,
     ) -> JobOutcome:
         existing_count = self.database.count_plans_for_recommendation_market(
             recommendation_date, market
@@ -165,7 +165,7 @@ class ScoreFourfoldService:
         if not self._recommendation_window_open(wall_now):
             return JobOutcome("closed", "已超过今日推荐启动或邮件安全截止时间，未请求赔率、未生成计划")
         recommendation_date = wall_now.date().isoformat()
-        max_crs_plans = 3
+        max_crs_plans = 1
         # CRS: allow up to max_crs_plans plans per day
         crs_pending = self.database.count_plans_for_recommendation_market(
             recommendation_date, MarketType.CRS

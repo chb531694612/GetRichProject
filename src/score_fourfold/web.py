@@ -51,6 +51,9 @@ button,.button{border:0;border-radius:10px;padding:11px 18px;background:var(--bl
 button:disabled{background:#98a2b3;cursor:not-allowed}.flash{padding:13px 16px;border-radius:10px;margin-bottom:16px;border:1px solid}
 .flash.ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.flash.warn{background:#fffaeb;border-color:#fedf89;color:#93370d}
 .flash.error{background:#fef3f2;border-color:#fecdca;color:#b42318}.section-title{display:flex;justify-content:space-between;align-items:end;margin:28px 0 12px}
+.date-nav{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.date-nav .button[disabled]{background:#98a2b3;cursor:not-allowed;opacity:.6}
+.date-current{font-weight:700;font-size:15px;margin:0 4px}
 .section-title h2{margin:0;font-size:21px}.plans{display:grid;gap:16px}.plan{overflow:hidden}.plan-head{padding:17px 20px;display:flex;justify-content:space-between;gap:14px;align-items:flex-start;border-bottom:1px solid var(--line)}
 .plan-title{font-size:18px;font-weight:750}.badges{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.badge{border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700;background:#eef2f6;color:#344054}
 .badge.green{background:#ecfdf3;color:#067647}.badge.red{background:#fef3f2;color:#b42318}.badge.amber{background:#fffaeb;color:#93370d}
@@ -125,6 +128,15 @@ def _plan_status_label(plan: StoredPlan) -> tuple[str, str]:
 class WebSession:
     csrf_token: str
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTask:
+    status: str
+    level: str
+    detail: str
+    started_at: datetime
+    finished_at: datetime | None = None
 
 
 def _origin(value: str) -> tuple[str, str] | None:
@@ -205,6 +217,8 @@ class DashboardApplication:
         self._sessions: dict[str, WebSession] = {}
         self._login_failures: dict[str, list[datetime]] = {}
         self._password_workers = threading.BoundedSemaphore(2)
+        self._recommendation_task: BackgroundTask | None = None
+        self._analysis_tasks: dict[str, BackgroundTask] = {}
         if self.public_mode:
             parsed_origin = _origin(self.public_origin)
             if parsed_origin is None or parsed_origin[0] != "https":
@@ -273,8 +287,127 @@ class DashboardApplication:
         expected = hmac.new(self._secret, request_id.encode("ascii"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
 
+    def queue_recommendation(self, request_id: str) -> tuple[str, str]:
+        """Start a manual recommendation in the background and return immediately."""
+        started_at = self.now()
+        with self._lock:
+            if (
+                self._recommendation_task is not None
+                and self._recommendation_task.status == "running"
+            ):
+                return (
+                    "warn",
+                    "今日全部推荐正在后台生成，请勿重复提交；预计 1–40 分钟后刷新查看。",
+                )
+            self._recommendation_task = BackgroundTask(
+                "running",
+                "warn",
+                "今日全部推荐正在后台生成；预计 1–40 分钟后刷新查看。",
+                started_at,
+            )
+        threading.Thread(
+            target=self._run_recommendation_task,
+            args=(request_id, started_at),
+            name=f"manual-recommend-{request_id[:12]}",
+            daemon=True,
+        ).start()
+        return (
+            "ok",
+            "已提交后台生成，无需停留在当前页面；预计 1–40 分钟后回来刷新查看。",
+        )
+
+    def _run_recommendation_task(self, request_id: str, started_at: datetime) -> None:
+        level = "error"
+        detail = "手动推荐后台执行异常，错误通知已进入邮件队列。"
+        try:
+            status, detail = self.trigger_recommendation(request_id)
+            level = (
+                "ok"
+                if status in {"created", "duplicate"}
+                else (
+                    "warn"
+                    if status
+                    in {
+                        "busy",
+                        "cooldown",
+                        "closed",
+                        "no-recommendation",
+                        "partial",
+                    }
+                    else "error"
+                )
+            )
+        except Exception:
+            LOGGER.exception("background manual recommendation failed")
+        finished_at = self.now()
+        with self._lock:
+            current = self._recommendation_task
+            if current is not None and current.started_at == started_at:
+                self._recommendation_task = BackgroundTask(
+                    "finished", level, detail, started_at, finished_at
+                )
+
+    def queue_ai_analysis(self, plan_id: str) -> tuple[str, str]:
+        """Start one plan's AI analysis in the background and return immediately."""
+        if self.database.get_plan(plan_id) is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        if not self.settings.ai_analysis_enabled:
+            return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
+        if not self.settings.qwen_api_key:
+            return ("warn", "未配置 QWEN_API_KEY")
+        started_at = self.now()
+        with self._lock:
+            current = self._analysis_tasks.get(plan_id)
+            if current is not None and current.status == "running":
+                return (
+                    "warn",
+                    f"计划 {plan_id} 正在后台进行 AI 分析，请勿重复提交；预计 1–10 分钟后刷新查看。",
+                )
+            self._analysis_tasks[plan_id] = BackgroundTask(
+                "running",
+                "warn",
+                f"计划 {plan_id} 正在后台进行 AI 分析；预计 1–10 分钟后刷新查看。",
+                started_at,
+            )
+        threading.Thread(
+            target=self._run_ai_analysis_task,
+            args=(plan_id, started_at),
+            name=f"ai-analysis-{plan_id[:12]}",
+            daemon=True,
+        ).start()
+        return (
+            "ok",
+            f"计划 {plan_id} 已提交后台 AI 分析，无需等待；预计 1–10 分钟后回来刷新查看。",
+        )
+
+    def _run_ai_analysis_task(self, plan_id: str, started_at: datetime) -> None:
+        level = "error"
+        detail = f"计划 {plan_id} 的 AI 分析后台执行异常，请查看日志。"
+        try:
+            level, detail = self.trigger_ai_analysis(plan_id)
+        except Exception:
+            LOGGER.exception("background AI analysis of plan %s failed", plan_id)
+        finished_at = self.now()
+        with self._lock:
+            current = self._analysis_tasks.get(plan_id)
+            if current is not None and current.started_at == started_at:
+                self._analysis_tasks[plan_id] = BackgroundTask(
+                    "finished", level, detail, started_at, finished_at
+                )
+
+    def recommendation_task(self) -> BackgroundTask | None:
+        with self._lock:
+            return self._recommendation_task
+
+    def analysis_task(self, plan_id: str) -> BackgroundTask | None:
+        with self._lock:
+            return self._analysis_tasks.get(plan_id)
+
     def trigger_delete_plan(self, plan_id: str) -> tuple[str, str]:
         """Delete entire plan and return (level, detail)."""
+        task = self.analysis_task(plan_id)
+        if task is not None and task.status == "running":
+            return ("warn", f"计划 {plan_id} 正在进行 AI 分析，请完成后再删除")
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
@@ -285,6 +418,9 @@ class DashboardApplication:
 
     def trigger_delete_leg(self, plan_id: str, match_id: str) -> tuple[str, str]:
         """Delete a single leg from a plan and recalculate stats."""
+        task = self.analysis_task(plan_id)
+        if task is not None and task.status == "running":
+            return ("warn", f"计划 {plan_id} 正在进行 AI 分析，请完成后再修改")
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
@@ -354,6 +490,9 @@ class DashboardApplication:
         self, plan_id: str, match_id: str, option_code: str
     ) -> tuple[str, str]:
         """Apply a manual or AI-proposed option to one plan leg."""
+        task = self.analysis_task(plan_id)
+        if task is not None and task.status == "running":
+            return ("warn", f"计划 {plan_id} 正在进行 AI 分析，请完成后再修改")
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
@@ -518,7 +657,7 @@ class DashboardApplication:
 <div class="field"><label for="password">密码</label><input id="password" name="password" type="password" maxlength="512" autocomplete="current-password" required></div>
 <button type="submit">登录</button></form></section></main></body></html>"""
 
-    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "") -> str:
+    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "", date: str = "") -> str:
         now = datetime.now(self.settings.timezone)
         script_nonce = secrets.token_urlsafe(18)
         # SSH mode is already restricted to loopback requests and has no login
@@ -527,7 +666,20 @@ class DashboardApplication:
         if not self.public_mode and not csrf_token:
             csrf_token = "ssh-loopback"
         summary = self.database.summary()
-        plans = self.database.recent_plans(100)
+        all_dates = self.database.recommendation_dates()
+        if date and date in all_dates:
+            selected_date = date
+        elif all_dates:
+            selected_date = all_dates[0]
+        else:
+            selected_date = ""
+        if selected_date:
+            plans = self.database.plans_for_recommendation_date(selected_date)
+        else:
+            plans = []
+        date_index = all_dates.index(selected_date) if selected_date in all_dates else -1
+        prev_date = all_dates[date_index + 1] if date_index >= 0 and date_index + 1 < len(all_dates) else ""
+        next_date = all_dates[date_index - 1] if date_index > 0 else ""
         settled_stake = Decimal(str(summary["settled_stake"]))
         profit = Decimal(str(summary["baseline_profit"]))
         settled = int(summary["plans_won"]) + int(summary["plans_lost"]) + int(summary["plans_void"])
@@ -564,17 +716,47 @@ class DashboardApplication:
         else:
             action_reason = "使用服务器当前真实赔率尝试比分与胜平负推荐；仍会执行所有筛选和截止规则，手动操作间隔至少5分钟。"
         action_enabled = time_open and not today_complete
+        recommendation_task = self.recommendation_task()
+        recommendation_running = (
+            recommendation_task is not None and recommendation_task.status == "running"
+        )
+        if recommendation_running:
+            action_enabled = False
+            action_reason = "今日全部推荐正在后台生成；预计 1–40 分钟后刷新页面查看结果。"
         request_id, signature = self.new_request()
 
         flash = ""
         safe_level = level if level in {"ok", "warn", "error"} else "warn"
         if message:
             flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+        background_result = ""
+        if recommendation_task is not None and recommendation_task.status == "finished":
+            task_level = (
+                recommendation_task.level
+                if recommendation_task.level in {"ok", "warn", "error"}
+                else "warn"
+            )
+            background_result = (
+                f'<div class="flash {task_level}">后台推荐结果：'
+                f'{_e(recommendation_task.detail[:800])}</div>'
+            )
 
         plan_cards = "".join(self._render_plan(plan, csrf_token) for plan in plans)
         if not plan_cards:
-            plan_cards = '<div class="panel empty">还没有推荐记录。服务生成第一张计划后会显示在这里。</div>'
+            if selected_date:
+                plan_cards = f'<div class="panel empty">{_e(selected_date)} 没有推荐记录。</div>'
+            else:
+                plan_cards = '<div class="panel empty">还没有推荐记录。服务生成第一张计划后会显示在这里。</div>'
+        date_nav = ""
+        if all_dates:
+            prev_link = f'<a class="button" href="/?date={_e(prev_date)}">← 更早</a>' if prev_date else '<span class="button" disabled>← 更早</span>'
+            next_link = f'<a class="button" href="/?date={_e(next_date)}">更新 →</a>' if next_date else '<span class="button" disabled>更新 →</span>'
+            refresh_href = f"/?date={_e(selected_date)}" if selected_date else "/"
+            date_label = _e(selected_date) if selected_date else "暂无记录"
+            date_nav = f'<div class="date-nav">{prev_link}<span class="date-current">{date_label}（第 {date_index + 1} / {len(all_dates)} 天）</span>{next_link}<a class="button" href="{refresh_href}">刷新</a></div>'
         disabled = "" if action_enabled else " disabled"
+        recommend_button_text = "推荐生成中…" if recommendation_running else "立即尝试今日全部推荐"
+        working_class = "working-status visible" if recommendation_running else "working-status"
 
         logout = ""
         if self.public_mode:
@@ -588,7 +770,7 @@ class DashboardApplication:
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>比分串关个人看板</title>
 <style>{STYLE}</style></head><body><main class="wrap">
-{flash}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">推荐记录、赛果和2元基准模拟账本</div></div>
+{flash}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">推荐记录、赛果和2元基准模拟账本</div></div>
 <div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
 <section class="grid">
 <div class="metric"><div class="muted">已计入计划</div><div class="value">{_e(summary['plans_total'])}</div><div class="small muted">比分 {summary.get('plans_crs', 0)} · 胜平负 {summary.get('plans_had', 0)}</div></div>
@@ -598,8 +780,9 @@ class DashboardApplication:
 </section>
 <section class="panel action"><div><strong>手动尝试今日推荐</strong><div class="muted small">{_e(action_reason)}</div></div>
 <form id="recommend-form" method="post" action="/actions/recommend"><input type="hidden" name="request_id" value="{_e(request_id)}">
-<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>立即尝试今日全部推荐</button><div id="recommend-working" class="working-status">推荐生成中（含 AI 分析），请勿重复提交，最长可能需要约 10 分钟…</div></form></section>
-<div class="section-title"><div><h2>推荐记录</h2><div class="muted small">包括未送达记录，最多显示最近100张</div></div><a class="button" href="/">刷新页面</a></div>
+<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>{_e(recommend_button_text)}</button><div id="recommend-working" class="{working_class}">推荐正在后台生成（含 AI 分析），无需停留在本页；预计 1–40 分钟后刷新查看。</div></form></section>
+<div class="section-title"><div><h2>推荐记录</h2><div class="muted small">按推荐日期浏览，每天一个比分一个胜平负</div></div></div>
+{date_nav}
 <section class="plans">{plan_cards}</section>
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
 </main>
@@ -623,6 +806,8 @@ document.addEventListener('click',function(event){{var target=event.target.close
         market_label = plan.market.label_zh
         pick_header = "推荐比分" if plan.market is MarketType.CRS else "推荐结果"
         pid = plan.plan_id
+        analysis_task = self.analysis_task(pid)
+        analysis_running = analysis_task is not None and analysis_task.status == "running"
 
         suggestion_by_match = {
             suggestion.match_id: suggestion for suggestion in plan.ai_suggestions
@@ -632,7 +817,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
         # Build plan action buttons (delete whole plan)
         del_btn = ""
         ai_btn = ""
-        if csrf_token:
+        if csrf_token and not analysis_running:
             del_btn = (
                 f'<button type="button" data-action="delete-plan" data-plan-id="{_e(pid)}" '
                 f'class="btn-sm danger">删除整张计划</button>'
@@ -647,6 +832,22 @@ document.addEventListener('click',function(event){{var target=event.target.close
                     'class="btn-sm">查看总体分析</button>'
                 )
             ai_btn += " <span class='muted small' data-ai-status>（AI联网分析最长可能需要约10分钟，完成后自动刷新）</span>"
+        elif csrf_token:
+            ai_btn = (
+                f'<button type="button" class="btn-sm" disabled>AI 分析中…</button> '
+                "<span class='working-status visible' data-ai-status>"
+                "正在后台逐场分析；无需停留在本页，预计 1–10 分钟后刷新查看。</span>"
+            )
+        if analysis_task is not None and analysis_task.status == "finished":
+            result_class = (
+                analysis_task.level
+                if analysis_task.level in {"ok", "warn", "error"}
+                else "warn"
+            )
+            ai_btn += (
+                f' <span class="flash {result_class}" style="padding:5px 9px;margin:0">'
+                f'后台分析结果：{_e(analysis_task.detail[:500])}</span>'
+            )
 
         if plan.delivery_status != "sent":
             return f"""<article class="plan"><div class="plan-head"><div>
@@ -661,7 +862,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
         for leg_index, leg in enumerate(plan.legs):
             actual, verdict, verdict_class = _leg_result(leg, market=plan.market)
             del_leg_btn = ""
-            if csrf_token and plan.market is MarketType.CRS:
+            if csrf_token and not analysis_running and plan.market is MarketType.CRS:
                 del_leg_btn = (
                     f' <button type="button" data-action="delete-leg" data-plan-id="{_e(pid)}" '
                     f'data-match-id="{_e(leg.match_id)}" class="leg-del-btn" title="删除此场">x</button>'
@@ -674,7 +875,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 for option in leg.options
             )
             edit_html = ""
-            if csrf_token and len(leg.options) > 1:
+            if csrf_token and not analysis_running and len(leg.options) > 1:
                 edit_html = (
                     '<details class="inline-edit"><summary>手动修改推荐</summary>'
                     '<div class="inline-edit-controls">'
@@ -683,11 +884,13 @@ document.addEventListener('click',function(event){{var target=event.target.close
                     f'data-match-id="{_e(leg.match_id)}" data-select-id="{_e(select_id)}" '
                     'data-option-label="">保存修改</button></div></details>'
                 )
-            elif csrf_token:
+            elif csrf_token and not analysis_running:
                 edit_html = '<div class="muted small">运行AI分析可刷新本场可选项</div>'
 
             suggestion = suggestion_by_match.get(leg.match_id)
-            if suggestion is None:
+            if analysis_running:
+                ai_cell = '<div class="ai-loading">本场比赛正在后台 AI 分析中…</div>'
+            elif suggestion is None:
                 ai_cell = '<span class="muted">点击下方“AI分析并推荐”生成本场建议</span>'
             else:
                 same_pick = suggestion.option_code == leg.score_code
@@ -1048,12 +1251,14 @@ def build_handler(application: DashboardApplication):
             query = parse_qs(parsed.query, keep_blank_values=False)
             message = query.get("message", [""])[0]
             level = query.get("level", ["ok"])[0]
+            date = query.get("date", [""])[0]
             self._send(
                 200,
                 application.render(
                     message=message,
                     level=level,
                     csrf_token=session.csrf_token if session is not None else "",
+                    date=date,
                 ),
             )
 
@@ -1096,7 +1301,7 @@ def build_handler(application: DashboardApplication):
                     if not application.verify_session_csrf(session, csrf):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
-                level, detail = application.trigger_ai_analysis(values["plan_id"])
+                level, detail = application.queue_ai_analysis(values["plan_id"])
                 self._redirect(detail, level)
                 return
 
@@ -1243,12 +1448,12 @@ def build_handler(application: DashboardApplication):
                 self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                 return
             try:
-                status, detail = application.trigger_recommendation(request_id)
+                status, detail = application.queue_recommendation(request_id)
             except Exception:
                 LOGGER.exception("manual recommendation handler failed")
                 self._redirect("手动推荐执行异常，错误通知已进入邮件队列。", "error")
                 return
-            level = "ok" if status in {"created", "duplicate"} else ("warn" if status in {"busy", "cooldown", "closed", "no-recommendation", "partial"} else "error")
+            level = status if status in {"ok", "warn", "error"} else "error"
             self._redirect(detail, level)
 
         def log_message(self, fmt: str, *args) -> None:

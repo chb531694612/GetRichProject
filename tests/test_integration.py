@@ -85,16 +85,16 @@ class FullFlowTests(unittest.TestCase):
         self.assertFalse((tmp_path / "000001.html").exists())
         clock_value[0] = now.replace(hour=15)
         sent = service.send_mail(now)
-        self.assertIn("发送3封", sent.detail)
+        self.assertIn("发送1封", sent.detail)
         self.assertTrue((tmp_path / "000001.html").exists())
 
         settlement_at = now + timedelta(days=1)
         settlement_outcome = service.settle(settlement_at)
-        self.assertIn("完成3张", settlement_outcome.detail)
+        self.assertIn("完成1张", settlement_outcome.detail)
         service.send_mail(settlement_at)
         summary = database.summary()
-        self.assertEqual(summary["plans_won"], 3)
-        self.assertEqual(summary["baseline_profit"], "50.00")
+        self.assertEqual(summary["plans_won"], 1)
+        self.assertEqual(summary["baseline_profit"], "6.00")
         self.assertTrue((tmp_path / "000002.html").exists())
 
         for path in [data_file, database_path, Path(f"{database_path}-wal"), Path(f"{database_path}-shm"), *preview_files]:

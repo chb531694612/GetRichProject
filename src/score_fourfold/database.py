@@ -650,10 +650,10 @@ class Database:
             if not_before >= expires_at:
                 raise ValueError("recommendation not_before must be before expires_at")
         with self.connect() as connection:
-            # Serialize the count-and-insert gate across processes. CRS permits
-            # three plans per day; every other market remains one-per-day.
+            # Serialize the count-and-insert gate across processes. Each market
+            # permits one plan per recommendation day.
             connection.execute("BEGIN IMMEDIATE")
-            limit = 3 if recommendation.market is MarketType.CRS else 1
+            limit = 1
             existing = connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM plans
@@ -947,6 +947,21 @@ class Database:
                 "SELECT * FROM plans ORDER BY created_at DESC LIMIT ?", (safe_limit,)
             ).fetchall()
             return [self._load_plan(connection, row) for row in rows]
+
+    def plans_for_recommendation_date(self, recommendation_date: str) -> list[StoredPlan]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM plans WHERE recommendation_date = ? ORDER BY created_at",
+                (recommendation_date,),
+            ).fetchall()
+            return [self._load_plan(connection, row) for row in rows]
+
+    def recommendation_dates(self) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT recommendation_date FROM plans ORDER BY recommendation_date DESC"
+            ).fetchall()
+            return [row["recommendation_date"] for row in rows]
 
     def _load_plan(self, connection: sqlite3.Connection, row: sqlite3.Row) -> StoredPlan:
         leg_rows = connection.execute(

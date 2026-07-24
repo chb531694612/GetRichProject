@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import re
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -88,6 +89,15 @@ class DashboardTests(unittest.TestCase):
     def _trigger(self, request_id: str) -> tuple[str, str]:
         self.triggered.append(request_id)
         return "created", "已创建测试计划"
+
+    @staticmethod
+    def _wait_for(predicate, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError("background task did not finish in time")
 
     def _create_plan(self, *, secret_team: str | None = None):
         matches = [
@@ -192,10 +202,91 @@ class DashboardTests(unittest.TestCase):
         page = self.application.render(csrf_token="csrf-test-token")
 
         self.assertIn('id="recommend-form"', page)
-        self.assertIn("推荐生成中（含 AI 分析）", page)
+        self.assertIn("推荐正在后台生成（含 AI 分析）", page)
         self.assertIn("本场比赛 AI 分析中，请稍候", page)
         self.assertIn("AI 正在联网分析，最长可能需要约 10 分钟", page)
         self.assertIn("target.disabled=true", page)
+
+    def test_recommendation_is_queued_and_rendered_without_waiting(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_trigger(_request_id: str) -> tuple[str, str]:
+            started.set()
+            release.wait(2)
+            return "created", "后台推荐已完成"
+
+        application = DashboardApplication(
+            self.settings,
+            self.database,
+            slow_trigger,
+            secret=b"background-recommend-test-secret",
+        )
+        level, detail = application.queue_recommendation("background-request-0001")
+        self.assertEqual(level, "ok")
+        self.assertIn("无需停留", detail)
+        self.assertTrue(started.wait(1))
+
+        page = application.render(csrf_token="csrf-test-token")
+        self.assertIn("今日全部推荐正在后台生成", page)
+        self.assertIn("推荐生成中…", page)
+        self.assertIn("预计 1–40 分钟后刷新", page)
+        duplicate_level, _ = application.queue_recommendation("background-request-0002")
+        self.assertEqual(duplicate_level, "warn")
+
+        release.set()
+        self._wait_for(
+            lambda: application.recommendation_task() is not None
+            and application.recommendation_task().status == "finished"
+        )
+        self.assertIn("后台推荐结果：后台推荐已完成", application.render())
+
+    def test_plan_ai_is_queued_and_each_leg_stays_marked_while_running(self):
+        recommendation = self._create_plan()
+        self._mark_recommendation_sent()
+        started = threading.Event()
+        release = threading.Event()
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            mail_preview_dir=self.preview,
+            ai_analysis_enabled=True,
+            qwen_api_key="secret",
+        )
+        application = DashboardApplication(settings, self.database, self._trigger)
+
+        def slow_analysis(_plan_id: str) -> tuple[str, str]:
+            started.set()
+            release.wait(2)
+            return "ok", "后台逐场分析已完成"
+
+        application.trigger_ai_analysis = slow_analysis
+        level, detail = application.queue_ai_analysis(recommendation.plan_id)
+        self.assertEqual(level, "ok")
+        self.assertIn("无需等待", detail)
+        self.assertTrue(started.wait(1))
+
+        page = application.render(csrf_token="csrf-test-token")
+        self.assertEqual(page.count("本场比赛正在后台 AI 分析中"), 4)
+        self.assertIn("正在后台逐场分析", page)
+        self.assertNotIn('data-action="delete-leg"', page)
+        duplicate_level, _ = application.queue_ai_analysis(recommendation.plan_id)
+        self.assertEqual(duplicate_level, "warn")
+        self.assertEqual(application.trigger_delete_plan(recommendation.plan_id)[0], "warn")
+        first_leg = recommendation.legs[0]
+        self.assertEqual(
+            application.trigger_update_leg(
+                recommendation.plan_id, first_leg.match.match_id, "s01s01"
+            )[0],
+            "warn",
+        )
+
+        release.set()
+        self._wait_for(
+            lambda: application.analysis_task(recommendation.plan_id) is not None
+            and application.analysis_task(recommendation.plan_id).status == "finished"
+        )
+        self.assertIn("后台分析结果：后台逐场分析已完成", application.render())
 
     def test_dashboard_renders_ai_replacements_and_manual_pick_editor(self):
         recommendation = self._create_plan()
@@ -548,9 +639,44 @@ class DashboardTests(unittest.TestCase):
             )
             self.assertEqual(status, 303)
             self.assertTrue(headers["location"].startswith("/?message="))
+            self._wait_for(lambda: self.triggered == [request_id])
             self.assertEqual(self.triggered, [request_id])
         finally:
             server.stop()
+
+    def test_dashboard_pagination_by_date(self):
+        first = self._create_plan()
+        earlier = datetime(2026, 7, 14, 12, 0, tzinfo=TZ)
+        earlier_matches = [
+            make_match(i, earlier, business_date="2026-07-14", odds="2.00")
+            for i in range(1, 5)
+        ]
+        earlier_rec = replace(
+            make_recommendation(earlier, earlier_matches),
+            plan_id="BF4-TEST-EARLIER",
+        )
+        subject, text_body, html_body = render_recommendation(earlier_rec)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                earlier_rec,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=earlier + timedelta(hours=5),
+            )
+        )
+        page = self.application.render()
+        self.assertIn("2026-07-15", page)
+        self.assertIn("第 1 / 2 天", page)
+        self.assertIn(first.plan_id, page)
+        self.assertNotIn(earlier_rec.plan_id, page)
+        self.assertIn("?date=2026-07-14", page)
+
+        page_earlier = self.application.render(date="2026-07-14")
+        self.assertIn(earlier_rec.plan_id, page_earlier)
+        self.assertNotIn(first.plan_id, page_earlier)
+        self.assertIn("第 2 / 2 天", page_earlier)
+        self.assertIn("?date=2026-07-15", page_earlier)
 
 
 class ManualActionAndDatabaseGateTests(unittest.TestCase):
@@ -610,7 +736,7 @@ class ManualActionAndDatabaseGateTests(unittest.TestCase):
         self.assertEqual(provider.match_calls, 1)
         self.assertEqual(
             self.database.count_plans_for_recommendation_date("2026-07-15"),
-            3,
+            1,
         )
         self.assertTrue(wake.is_set())
         self.assertTrue(self.database.has_job_run(slot_job_name(self.now, self.settings.recommendation_times[0])))
@@ -674,12 +800,12 @@ class ManualActionAndDatabaseGateTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as executor:
             created = list(executor.map(create, range(8)))
 
-        self.assertEqual(sum(created), 3)
+        self.assertEqual(sum(created), 1)
         self.assertEqual(
             self.database.count_plans_for_recommendation_date("2026-07-15"),
-            3,
+            1,
         )
-        self.assertEqual(self.database.summary()["emails_pending"], 3)
+        self.assertEqual(self.database.summary()["emails_pending"], 1)
 
 
 PUBLIC_IP = "8.8.8.8"
