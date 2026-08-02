@@ -379,7 +379,8 @@ def _select_crs_multi(
     market_label = MarketType.CRS.label_zh
 
     # Produce one plan for each supported size, in the advertised order.
-    for pass_size in (2, 3, 4):
+    # 比分优：优先 5串1→4串1，比赛不够时才回退 3串1→2串1
+    for pass_size in (5, 4, 3, 2):
         if len(results) >= max_plans:
             break
         valid_combinations = []
@@ -425,7 +426,7 @@ def _select_crs_multi(
 
 
 def select_accumulator(matches: list[Match], now: datetime, settings: Settings) -> list[SelectionResult]:
-    """Choose one CRS accumulator across 4x1, 3x1, 2x1."""
+    """Choose one CRS accumulator across 5x1, 4x1, 3x1, 2x1."""
     return _select_crs_multi(matches, now, settings, max_plans=1)
 
 

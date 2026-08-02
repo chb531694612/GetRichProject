@@ -201,7 +201,7 @@ class HadStrategyTests(unittest.TestCase):
         matches = [make_match(i, self.now) for i in range(1, 5)]
         crs = select_accumulator(matches, self.now, settings)
         self.assertEqual(len(crs), 1)
-        self.assertEqual(crs[0].recommendation.pass_size, 2)
+        self.assertEqual(crs[0].recommendation.pass_size, 4)
         self.assertTrue(all(item.recommendation.market is MarketType.CRS for item in crs))
 
 

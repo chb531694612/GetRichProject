@@ -94,7 +94,7 @@ class FullFlowTests(unittest.TestCase):
         service.send_mail(settlement_at)
         summary = database.summary()
         self.assertEqual(summary["plans_won"], 1)
-        self.assertEqual(summary["baseline_profit"], "6.00")
+        self.assertEqual(summary["baseline_profit"], "62.00")
         self.assertTrue((tmp_path / "000002.html").exists())
 
         for path in [data_file, database_path, Path(f"{database_path}-wal"), Path(f"{database_path}-shm"), *preview_files]:

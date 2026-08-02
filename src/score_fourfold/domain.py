@@ -50,7 +50,7 @@ class Match:
     score_options: tuple[ScoreOption, ...]
     snapshot_fetched_at: datetime | None = None
     betting_all_up: bool = True
-    supported_pass_sizes: frozenset[int] = frozenset({2, 3, 4})
+    supported_pass_sizes: frozenset[int] = frozenset({2, 3, 4, 5})
     status: str = ""
     had_options: tuple[ScoreOption, ...] = ()
     had_betting_all_up: bool = False

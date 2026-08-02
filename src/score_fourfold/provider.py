@@ -271,7 +271,7 @@ def parse_sporttery_matches(payload: dict[str, Any], tz) -> list[Match]:
     value = payload.get("value", {})
     if not isinstance(value, dict):
         raise ProviderError("odds payload has no value object")
-    supported_pass_sizes = _all_up_pass_sizes(value.get("allUpList"), "crs", required={2, 3, 4})
+    supported_pass_sizes = _all_up_pass_sizes(value.get("allUpList"), "crs", required={2, 3, 4, 5})
     groups = value.get("matchInfoList", [])
     if "matchInfoList" not in value:
         raise ProviderError("odds payload is missing value.matchInfoList")
@@ -467,9 +467,9 @@ def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
         league = _str(league_raw.get("abbName") if isinstance(league_raw, dict) else league_raw)
         supported = frozenset(
             int(value)
-            for value in raw.get("supported_pass_sizes", (2, 3, 4))
-            if int(value) in {2, 3, 4}
-        ) or frozenset({2, 3, 4})
+            for value in raw.get("supported_pass_sizes", (2, 3, 4, 5))
+            if int(value) in {2, 3, 4, 5}
+        ) or frozenset({2, 3, 4, 5})
         had_supported = frozenset(
             int(value)
             for value in raw.get("had_supported_pass_sizes", (4, 5, 6))
@@ -717,8 +717,8 @@ class SportteryProvider:
             and (not _str(item.get("poolCode")) or _str(item.get("poolCode")).lower() == "crs")
             if (size := _pass_size(item.get("formula"))) is not None
         }
-        if not supported_pass_sizes.intersection({2, 3, 4}):
-            raise ProviderError("official calculator does not expose CRS 2x1, 3x1 or 4x1")
+        if not supported_pass_sizes.intersection({2, 3, 4, 5}):
+            raise ProviderError("official calculator does not expose CRS 2x1, 3x1, 4x1 or 5x1")
         matches = parse_sporttery_matches(payload, self.settings.timezone)
         # The official CRS market contains exactly 31 mutually exclusive
         # outcomes. Incomplete markets inflate normalized probabilities.
