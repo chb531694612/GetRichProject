@@ -1016,7 +1016,7 @@ class Database:
                 ORDER BY created_at
                 """
             ).fetchall()
-            return [self._load_plan(connection, row) for row in rows]
+            return self._load_plans(connection, rows)
 
     def get_plan(self, plan_id: str) -> StoredPlan | None:
         with self.connect() as connection:
@@ -1029,7 +1029,7 @@ class Database:
             rows = connection.execute(
                 "SELECT * FROM plans ORDER BY created_at DESC LIMIT ?", (safe_limit,)
             ).fetchall()
-            return [self._load_plan(connection, row) for row in rows]
+            return self._load_plans(connection, rows)
 
     def plans_for_recommendation_date(self, recommendation_date: str) -> list[StoredPlan]:
         with self.connect() as connection:
@@ -1059,7 +1059,7 @@ class Database:
                 "SELECT * FROM plans ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (safe_per_page, offset),
             ).fetchall()
-            plans = [self._load_plan(connection, row) for row in rows]
+            plans = self._load_plans(connection, rows)
             return plans, total
 
     @staticmethod
@@ -1135,7 +1135,7 @@ class Database:
                 f"SELECT p.* FROM plans p{where} ORDER BY p.created_at DESC LIMIT ? OFFSET ?",
                 [*params, safe_per_page, offset],
             ).fetchall()
-            return [self._load_plan(connection, row) for row in rows], total
+            return self._load_plans(connection, rows), total
 
     def filtered_summary(self, filters: dict[str, object]) -> dict[str, int | str]:
         where, params = self._filtered_plan_where(filters)
@@ -1261,17 +1261,82 @@ class Database:
             )
             return cursor.rowcount > 0
 
-    def _load_plan(self, connection: sqlite3.Connection, row: sqlite3.Row) -> StoredPlan:
+    def _load_plans(
+        self,
+        connection: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[StoredPlan]:
+        """Load a plan page with three detail queries instead of three per plan."""
+        if not rows:
+            return []
+        plan_ids = [str(row["plan_id"]) for row in rows]
+        placeholders = ",".join("?" for _ in plan_ids)
         leg_rows = connection.execute(
-            "SELECT * FROM plan_legs WHERE plan_id = ? ORDER BY position", (row["plan_id"],)
+            f"SELECT * FROM plan_legs WHERE plan_id IN ({placeholders}) ORDER BY plan_id, position",
+            plan_ids,
         ).fetchall()
         option_rows = connection.execute(
-            """
-            SELECT * FROM plan_leg_options
-            WHERE plan_id = ? ORDER BY match_id, rowid
-            """,
-            (row["plan_id"],),
+            f"SELECT * FROM plan_leg_options WHERE plan_id IN ({placeholders}) ORDER BY plan_id, match_id, rowid",
+            plan_ids,
         ).fetchall()
+        suggestion_rows = connection.execute(
+            f"SELECT * FROM plan_ai_suggestions WHERE plan_id IN ({placeholders}) ORDER BY plan_id, rowid",
+            plan_ids,
+        ).fetchall()
+        legs_by_plan: dict[str, list[sqlite3.Row]] = {}
+        options_by_plan: dict[str, list[sqlite3.Row]] = {}
+        suggestions_by_plan: dict[str, list[sqlite3.Row]] = {}
+        for item in leg_rows:
+            legs_by_plan.setdefault(str(item["plan_id"]), []).append(item)
+        for item in option_rows:
+            options_by_plan.setdefault(str(item["plan_id"]), []).append(item)
+        for item in suggestion_rows:
+            suggestions_by_plan.setdefault(str(item["plan_id"]), []).append(item)
+        return [
+            self._load_plan(
+                connection,
+                row,
+                detail_rows=(
+                    legs_by_plan.get(str(row["plan_id"]), []),
+                    options_by_plan.get(str(row["plan_id"]), []),
+                    suggestions_by_plan.get(str(row["plan_id"]), []),
+                ),
+            )
+            for row in rows
+        ]
+
+    def _load_plan(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        detail_rows: tuple[
+            Sequence[sqlite3.Row],
+            Sequence[sqlite3.Row],
+            Sequence[sqlite3.Row],
+        ] | None = None,
+    ) -> StoredPlan:
+        if detail_rows is None:
+            leg_rows = connection.execute(
+                "SELECT * FROM plan_legs WHERE plan_id = ? ORDER BY position",
+                (row["plan_id"],),
+            ).fetchall()
+            option_rows = connection.execute(
+                """
+                SELECT * FROM plan_leg_options
+                WHERE plan_id = ? ORDER BY match_id, rowid
+                """,
+                (row["plan_id"],),
+            ).fetchall()
+            suggestion_rows = connection.execute(
+                """
+                SELECT * FROM plan_ai_suggestions
+                WHERE plan_id = ? ORDER BY rowid
+                """,
+                (row["plan_id"],),
+            ).fetchall()
+        else:
+            leg_rows, option_rows, suggestion_rows = detail_rows
         options_by_match: dict[str, list[ScoreOption]] = {}
         for option in option_rows:
             options_by_match.setdefault(str(option["match_id"]), []).append(
@@ -1310,13 +1375,6 @@ class Database:
             )
             for leg in leg_rows
         )
-        suggestion_rows = connection.execute(
-            """
-            SELECT * FROM plan_ai_suggestions
-            WHERE plan_id = ? ORDER BY rowid
-            """,
-            (row["plan_id"],),
-        ).fetchall()
         ai_suggestions = tuple(
             StoredAISuggestion(
                 match_id=str(item["match_id"]),
@@ -1753,7 +1811,7 @@ class Database:
                 UPDATE plans
                 SET status = ?, settled_at = ?, settled_gross_prize_cents = ?, settled_tax_cents = ?,
                     settled_net_prize_cents = ?, net_profit_cents = ?
-                WHERE plan_id = ? AND status = 'pending'
+                WHERE plan_id = ? AND status IN ('pending', 'void')
                 """,
                 (
                     settlement.status.value,

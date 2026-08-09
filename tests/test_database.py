@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.database import Database
@@ -489,6 +490,27 @@ class PaginationAndCalendarTests(unittest.TestCase):
         self.assertEqual(total2, 12)
         self.assertEqual(len(plans2), 2)
         self.assertEqual(plans2[0].plan_id, "BF4-TEST-0002")
+
+    def test_paginated_plans_prefetches_details_for_the_whole_page(self):
+        for n in range(1, 4):
+            self._create_sent_plan(
+                plan_id=f"BF4-BATCH-{n:04d}",
+                business_date=f"2026-07-{n:02d}",
+                day_offset=n - 1,
+            )
+
+        with patch.object(
+            self.database,
+            "_load_plan",
+            wraps=self.database._load_plan,
+        ) as load_plan:
+            plans, total = self.database.paginated_plans(page=1, per_page=10)
+
+        self.assertEqual((len(plans), total), (3, 3))
+        self.assertEqual(load_plan.call_count, 3)
+        self.assertTrue(
+            all(call.kwargs.get("detail_rows") is not None for call in load_plan.call_args_list)
+        )
 
     def test_paginated_plans_empty_database(self):
         plans, total = self.database.paginated_plans(page=1)

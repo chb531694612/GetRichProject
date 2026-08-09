@@ -182,7 +182,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('data-level="warn"', page)
 
     def test_json_api_bootstrap_plans_and_recommend_without_page_reload(self):
-        self._create_plan()
+        recommendation = self._create_plan()
         server = DashboardServer(self.settings, self.application)
         server.start()
         try:
@@ -213,6 +213,29 @@ class DashboardTests(unittest.TestCase):
             clamped = json.loads(payload)["data"]
             self.assertEqual(clamped["pagination"]["page"], 1)
             self.assertEqual(len(clamped["items"]), 1)
+
+            purchase_payload = json.dumps(
+                {
+                    "plan_id": recommendation.plan_id,
+                    "purchased": True,
+                    "filters": {"market": "crs"},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            status, _, payload = self._request(
+                server,
+                "POST",
+                "/api/v1/actions/mark-purchased",
+                body=purchase_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-CSRF-Token": "ssh-loopback",
+                },
+            )
+            self.assertEqual(status, 200)
+            purchase = json.loads(payload)
+            self.assertTrue(purchase["data"]["plan"]["purchased"])
+            self.assertEqual(purchase["data"]["summary"]["plans_purchased"], 1)
 
             request_payload = json.dumps(
                 bootstrap["recommendation_request"], ensure_ascii=False
@@ -1796,6 +1819,40 @@ class NewFeatureTests(unittest.TestCase):
         level, detail = app.queue_settle_plan(rec.plan_id)
         self.assertEqual(level, "warn")
         self.assertIn("已结算", detail)
+
+    def test_queue_settle_plan_allows_void_plan_recheck(self):
+        rec = self._create_sent_plan()
+        self.assertTrue(
+            self.database.settle_plan_with_mail(
+                Settlement(
+                    plan_id=rec.plan_id,
+                    status=PlanStatus.VOID,
+                    settled_at=self.now,
+                    gross_prize=Decimal("2"),
+                    tax=Decimal("0"),
+                    net_prize=Decimal("2"),
+                    net_profit=Decimal("0"),
+                    leg_results=(),
+                ),
+                subject="void",
+                text_body="void",
+                html_body="void",
+            )
+        )
+        called: list[str] = []
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-void-secret" * 2,
+            trigger_settle_plan=lambda plan_id: (called.append(plan_id) or ("ok", "done")),
+        )
+
+        level, detail = app.queue_settle_plan(rec.plan_id)
+
+        self.assertEqual(level, "ok")
+        self._wait_for(lambda: called == [rec.plan_id])
+        self.assertIn("已提交后台", detail)
 
     # --- fetch-based postAction in JS ---
 

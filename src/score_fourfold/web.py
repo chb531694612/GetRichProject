@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from .auth import verify_password
 from .config import Settings
 from .ai_analyzer import AIAnalysisError, analyze_plan_from_leg_data
-from .api import DashboardAPI
+from .api import DashboardAPI, serialize_plan
 from .database import Database, StoredLeg, StoredPlan
 from .domain import MarketType, PlanStatus, ResultStatus
 from .mail import render_stored_recommendation
@@ -489,7 +489,7 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
-        if plan.status != PlanStatus.PENDING:
+        if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}:
             return ("warn", f"计划 {plan_id} 已结算，无需重复更新")
         if self.trigger_settle_plan is None:
             return ("warn", "赛果手动更新未配置")
@@ -1711,6 +1711,8 @@ def build_handler(application: DashboardApplication):
                     data = dashboard_api.calendar(query)
                 elif parsed.path == "/api/v1/settings":
                     data = dashboard_api.settings()
+                elif parsed.path == "/api/v1/plan-task":
+                    data = dashboard_api.plan_task(query)
                 elif parsed.path.startswith("/api/v1/tasks/"):
                     task_id = parsed.path.removeprefix("/api/v1/tasks/")
                     data = dashboard_api.task(task_id)
@@ -1805,6 +1807,17 @@ def build_handler(application: DashboardApplication):
                 else:
                     self._json_response({"level": "error", "detail": "接口不存在"}, 404)
                     return
+                if path.startswith("/api/v1/actions/"):
+                    plan_id = str(payload.get("plan_id", ""))
+                    if plan_id:
+                        plan = application.database.get_plan(plan_id)
+                        if plan is not None:
+                            data["plan"] = serialize_plan(plan)
+                        elif path == "/api/v1/actions/delete-plan":
+                            data["deleted"] = True
+                    data["summary"] = dashboard_api.summary_from_values(
+                        payload.get("filters", {})
+                    )
             except (ValueError, RuntimeError) as exc:
                 self._json_response({"level": "error", "detail": str(exc)}, 400)
                 return

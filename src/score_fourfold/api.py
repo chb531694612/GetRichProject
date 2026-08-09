@@ -27,12 +27,33 @@ class ApiTask:
 
 def _leg_result(leg: StoredLeg, market: MarketType) -> dict[str, Any]:
     if leg.result_status is ResultStatus.PENDING:
-        return {"status": "pending", "score": "", "outcome": "", "hit": None}
+        return {
+            "status": "pending",
+            "score": "",
+            "outcome": "",
+            "market_result": "待公布",
+            "verdict": "待定",
+            "hit": None,
+        }
     if leg.result_status is ResultStatus.VOID:
-        return {"status": "void", "score": "", "outcome": "无效", "hit": True}
+        return {
+            "status": "void",
+            "score": "",
+            "outcome": "无效",
+            "market_result": "比赛无效",
+            "verdict": "不计入串关",
+            "hit": None,
+        }
     score = f"{leg.result_home}:{leg.result_away}"
     if leg.result_home is None or leg.result_away is None:
-        return {"status": "pending", "score": "", "outcome": "", "hit": None}
+        return {
+            "status": "pending",
+            "score": "",
+            "outcome": "",
+            "market_result": "待公布",
+            "verdict": "待定",
+            "hit": None,
+        }
     if market is MarketType.HAD:
         outcome = "主胜" if leg.result_home > leg.result_away else (
             "客胜" if leg.result_home < leg.result_away else "平"
@@ -45,7 +66,19 @@ def _leg_result(leg: StoredLeg, market: MarketType) -> dict[str, Any]:
     else:
         outcome = score
         hit = score == leg.score_label.replace("：", ":")
-    return {"status": "final", "score": score, "outcome": outcome, "hit": hit}
+    market_result = {
+        MarketType.CRS: f"比分 {outcome}",
+        MarketType.HAD: f"胜平负 {outcome}",
+        MarketType.TTG: f"进球数 {outcome}球",
+    }[market]
+    return {
+        "status": "final",
+        "score": score,
+        "outcome": outcome,
+        "market_result": market_result,
+        "verdict": "命中" if hit else "未中",
+        "hit": hit,
+    }
 
 
 def serialize_plan(plan: StoredPlan) -> dict[str, Any]:
@@ -182,6 +215,39 @@ class DashboardAPI:
             "month": month,
             "days": self.database.filtered_calendar_stats(year, month, filters),
         }
+
+    def summary_from_values(self, values: object) -> dict[str, int | str]:
+        if not isinstance(values, dict):
+            return self.database.filtered_summary({})
+        query: dict[str, list[str]] = {}
+        for key in ("market", "status", "date", "q", "purchased"):
+            value = values.get(key)
+            if isinstance(value, bool):
+                query[key] = ["true" if value else "false"]
+            elif value is not None and str(value).strip():
+                query[key] = [str(value)]
+        return self.database.filtered_summary(self._filters(query))
+
+    def plan_task(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        kind = query.get("kind", [""])[0].strip()
+        plan_id = query.get("plan_id", [""])[0].strip()
+        if kind not in {"settle", "ai"} or not plan_id:
+            raise ValueError("invalid plan task")
+        task_key = f"settle-{plan_id}" if kind == "settle" else plan_id
+        task = self.application.analysis_task(task_key)
+        response: dict[str, Any] = {
+            "kind": kind,
+            "plan_id": plan_id,
+            "status": task.status if task is not None else "idle",
+            "level": task.level if task is not None else "warn",
+            "detail": task.detail if task is not None else "任务不存在或尚未开始",
+            "summary": self.database.filtered_summary(self._filters(query)),
+        }
+        if task is not None and task.finished_at is not None:
+            response["finished_at"] = task.finished_at.isoformat()
+            plan = self.database.get_plan(plan_id)
+            response["plan"] = serialize_plan(plan) if plan is not None else None
+        return response
 
     def bootstrap(self, csrf_token: str) -> dict[str, Any]:
         request_id, signature = self.application.new_request()

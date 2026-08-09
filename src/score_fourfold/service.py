@@ -378,7 +378,7 @@ class ScoreFourfoldService:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return JobOutcome("missing", f"计划 {plan_id} 不存在")
-        if plan.status is not PlanStatus.PENDING:
+        if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}:
             return JobOutcome("duplicate", f"计划 {plan_id} 已结算，无需重复更新")
 
         latest_start = max(leg.start_at for leg in plan.legs)
@@ -398,7 +398,7 @@ class ScoreFourfoldService:
             leg
             for leg in plan.legs
             if leg.match_id not in results
-            or results[leg.match_id].status is ResultStatus.PENDING
+            or results[leg.match_id].status in {ResultStatus.PENDING, ResultStatus.VOID}
         ]
         fallback_count = 0
         if missing_legs:
@@ -419,6 +419,11 @@ class ScoreFourfoldService:
         }
         if relevant:
             self.database.update_leg_results(plan_id, relevant)
+        else:
+            detail = f"计划 {plan_id} 未取得任何新赛果，请稍后重试"
+            if primary_error:
+                detail += "；官方赛果接口暂时不可用"
+            return JobOutcome("missing-results", detail)
 
         refreshed = self.database.get_plan(plan_id)
         if refreshed is None:

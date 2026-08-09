@@ -96,12 +96,70 @@ function selectCalendarDate(value: string) {
   loadPlans(true)
 }
 
+function planMatchesFilters(plan: any) {
+  if (filters.market && plan.market !== filters.market) return false
+  if (filters.status && plan.status !== filters.status) return false
+  if (filters.date && plan.recommendation_date !== filters.date) return false
+  if (filters.purchased && plan.purchased !== (filters.purchased === 'true')) return false
+  const search = filters.q.trim().toLowerCase()
+  if (search) {
+    const values = [plan.plan_id, ...plan.legs.flatMap((leg: any) => [leg.match_num, leg.league, leg.home, leg.away])]
+    if (!values.some((value: unknown) => String(value || '').toLowerCase().includes(search))) return false
+  }
+  return true
+}
+
+function applyActionData(data: any, fallbackPlanId = '') {
+  if (!data) return
+  if (data.summary) result.value.summary = data.summary
+  const planId = data.plan?.plan_id || fallbackPlanId
+  const index = result.value.items.findIndex((item: any) => item.plan_id === planId)
+  if (data.deleted || (data.plan && !planMatchesFilters(data.plan))) {
+    if (index >= 0) result.value.items.splice(index, 1)
+    if (data.deleted) {
+      result.value.pagination.total = Math.max(0, result.value.pagination.total - 1)
+      result.value.pagination.pages = Math.max(1, Math.ceil(result.value.pagination.total / result.value.pagination.per_page))
+    }
+  } else if (data.plan && index >= 0) {
+    result.value.items[index] = data.plan
+  } else if (data.plan && page.value === 1) {
+    result.value.items.unshift(data.plan)
+  }
+}
+
+async function pollPlanTask(kind: 'settle' | 'ai', planId: string) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1500))
+    const query = new URLSearchParams({ kind, plan_id: planId })
+    Object.entries(filters).forEach(([key, value]) => value && query.set(key, value))
+    try {
+      const task = await apiGet<any>(`/api/v1/plan-task?${query}`)
+      if (task.status === 'finished') {
+        applyActionData(task, planId)
+        toast(task.detail, task.level)
+        return
+      }
+    } catch (error) {
+      toast((error as Error).message, 'error')
+      return
+    }
+  }
+  toast('后台任务仍在执行，稍后可继续查看当前计划', 'warn')
+}
+
 async function action(path: string, payload: Record<string, unknown>, key = path) {
   busy.value = key
   try {
-    const response = await apiPost(path, payload)
+    const requestPayload = { ...payload, filters: { ...filters } }
+    const response = await apiPost<any>(path, requestPayload)
     toast(response.detail || '操作成功', response.level)
-    await loadPlans()
+    const planId = String(payload.plan_id || '')
+    applyActionData(response.data, planId)
+    if (planId && path === '/api/v1/actions/settle-plan' && response.level === 'ok') {
+      void pollPlanTask('settle', planId)
+    } else if (planId && path === '/api/v1/actions/analyze-plan' && response.level === 'ok') {
+      void pollPlanTask('ai', planId)
+    }
     return response
   } catch (error) {
     toast((error as Error).message, 'error')
@@ -296,13 +354,13 @@ onMounted(async () => {
                 <td>{{ leg.home }} <em>vs</em> {{ leg.away }}</td>
                 <td><span class="pick">{{ leg.pick_label }}</span><small v-if="leg.ai_suggestion" class="ai-tip">AI：{{ leg.ai_suggestion.label }}</small></td>
                 <td>{{ leg.odds }}</td>
-                <td><span v-if="leg.result.status === 'pending'" class="muted">待公布</span><span v-else>{{ leg.result.score || leg.result.outcome }}</span></td>
+                <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ leg.result.market_result }}</span><small v-if="leg.result.score">全场比分 {{ leg.result.score }}</small><b :class="['verdict', leg.result.hit === true ? 'hit' : leg.result.hit === false ? 'miss' : leg.result.status]">{{ leg.result.verdict }}</b></td>
                 <td><select :value="leg.pick_code" @change="action('/api/v1/actions/update-leg',{plan_id:plan.plan_id,match_id:leg.match_id,option_code:($event.target as HTMLSelectElement).value},`update-${leg.match_id}`)"><option v-for="option in leg.options" :key="option.code" :value="option.code">{{ option.label }} · {{ option.odds }}</option></select><button class="text-danger" @click="deleteLeg(plan,leg)">删除</button></td>
               </tr></tbody>
             </table>
           </div>
           <footer class="plan-actions">
-            <div><button class="soft" :disabled="busy === `settle-${plan.plan_id}` || plan.status !== 'pending'" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">更新本计划赛果</button><button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button><button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button></div>
+            <div><button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button><button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button><button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button></div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
           </footer>
           <details v-if="plan.ai_summary" class="ai-summary"><summary>查看 AI 总体分析</summary><p>{{ plan.ai_summary }}</p></details>

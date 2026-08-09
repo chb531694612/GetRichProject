@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from score_fourfold.config import Settings
 from score_fourfold.database import Database
-from score_fourfold.domain import MatchResult, PlanStatus, ResultStatus
+from score_fourfold.domain import MatchResult, PlanStatus, ResultStatus, Settlement
 from score_fourfold.mail import Mailer, render_recommendation, render_settlement
 from score_fourfold.service import ScoreFourfoldService
 
@@ -208,6 +208,46 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertEqual(outcome.status, "ok")
         self.assertEqual(fallback.call_count, len(self.matches))
         self.assertIn("官网详情兜底 4 场", outcome.detail)
+
+    def test_void_plan_can_be_refreshed_and_corrected(self):
+        void_results = tuple(
+            MatchResult(match.match_id, ResultStatus.VOID, official_status="invalid")
+            for match in self.matches
+        )
+        self.assertTrue(
+            self.database.settle_plan_with_mail(
+                Settlement(
+                    plan_id=self.recommendation.plan_id,
+                    status=PlanStatus.VOID,
+                    settled_at=self.now,
+                    gross_prize=Decimal("2.00"),
+                    tax=Decimal("0.00"),
+                    net_prize=Decimal("2.00"),
+                    net_profit=Decimal("0.00"),
+                    leg_results=void_results,
+                ),
+                subject="void",
+                text_body="void",
+                html_body="void",
+            )
+        )
+        provider = _FakeResultProvider(
+            {
+                match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+                for match in self.matches
+            }
+        )
+
+        outcome = self._service(provider).settle_plan(
+            self.recommendation.plan_id,
+            max(match.start_at for match in self.matches) + timedelta(hours=1),
+        )
+
+        self.assertEqual(outcome.status, "ok")
+        corrected = self.database.get_plan(self.recommendation.plan_id)
+        assert corrected is not None
+        self.assertEqual(corrected.status, PlanStatus.WON)
+        self.assertTrue(all(leg.result_status is ResultStatus.FINAL for leg in corrected.legs))
 
     def test_postponed_match_stays_pending_within_one_day(self):
         """A delayed match stays pending — the ticket is still valid."""
