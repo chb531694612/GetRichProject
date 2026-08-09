@@ -288,6 +288,23 @@ async function removeModel(id: string) {
 function money(value: string | number) { return `¥${Number(value || 0).toFixed(2)}` }
 function formatTime(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
 function shortId(value: string) { return value.length > 20 ? `${value.slice(0, 9)}…${value.slice(-6)}` : value }
+function formatResult(market: string, result: any) {
+  if (result.status === 'pending') return '待公布'
+  if (result.status === 'void') return '比赛无效'
+  const score = result.score
+  if (market === 'crs') return `比分 ${result.outcome}`
+  if (market === 'had') return `${result.outcome}（${score}）`
+  if (market === 'ttg') return `${result.outcome}球（${score}）`
+  return result.market_result
+}
+async function applyAiSuggestion(plan: any, leg: any) {
+  if (!leg.ai_suggestion) return
+  await action('/api/v1/actions/update-leg', {
+    plan_id: plan.plan_id,
+    match_id: leg.match_id,
+    option_code: leg.ai_suggestion.code
+  }, `ai-pick-${leg.match_id}`)
+}
 
 watch(() => filters.q, () => {
   window.clearTimeout(searchTimer)
@@ -333,6 +350,7 @@ onMounted(async () => {
       <select v-model="filters.purchased" @change="loadPlans(true)"><option value="">购买状态</option><option value="true">已购买</option><option value="false">未购买</option></select>
       <input v-model="filters.date" type="date" @change="loadPlans(true)" />
       <label class="search"><span>⌕</span><input v-model="filters.q" placeholder="搜索计划编号、球队或联赛" /></label>
+      <button class="ghost" @click="loadPlans(true)">查询</button>
       <button v-if="Object.values(filters).some(Boolean)" class="link" @click="Object.assign(filters,{market:'',status:'',purchased:'',date:'',q:''}); loadPlans(true)">清空筛选</button>
       <span class="result-count">共 {{ result.pagination.total || 0 }} 张</span>
     </section>
@@ -348,14 +366,24 @@ onMounted(async () => {
           </header>
           <div class="money-row"><span>投注 <b>{{ money(plan.stake) }}</b></span><span>联合赔率 <b>{{ plan.combined_odds }}</b></span><span>理论奖金 <b>{{ money(plan.net_prize) }}</b></span><span v-if="plan.net_profit !== ''">净盈亏 <b :class="Number(plan.net_profit) >= 0 ? 'profit' : 'loss'">{{ money(plan.net_profit) }}</b></span></div>
           <div class="legs-wrap">
-            <table><thead><tr><th>场次 / 联赛</th><th>比赛</th><th>推荐</th><th>SP</th><th>赛果</th><th>调整</th></tr></thead>
+            <table><thead><tr><th>场次 / 联赛</th><th>比赛</th><th>推荐</th><th>AI分析</th><th>SP</th><th>赛果</th><th>结算 / 调整</th></tr></thead>
               <tbody><tr v-for="leg in plan.legs" :key="leg.match_id">
                 <td><b>{{ leg.match_num }}</b><small>{{ leg.league }} · {{ formatTime(leg.start_at) }}</small></td>
                 <td>{{ leg.home }} <em>vs</em> {{ leg.away }}</td>
-                <td><span class="pick">{{ leg.pick_label }}</span><small v-if="leg.ai_suggestion" class="ai-tip">AI：{{ leg.ai_suggestion.label }}</small></td>
+                <td><span class="pick">{{ leg.pick_label }}</span></td>
+                <td><span v-if="leg.ai_suggestion" class="ai-suggestion">{{ leg.ai_suggestion.label }}</span><span v-else class="muted">-</span></td>
                 <td>{{ leg.odds }}</td>
-                <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ leg.result.market_result }}</span><small v-if="leg.result.score">全场比分 {{ leg.result.score }}</small><b :class="['verdict', leg.result.hit === true ? 'hit' : leg.result.hit === false ? 'miss' : leg.result.status]">{{ leg.result.verdict }}</b></td>
-                <td><select :value="leg.pick_code" @change="action('/api/v1/actions/update-leg',{plan_id:plan.plan_id,match_id:leg.match_id,option_code:($event.target as HTMLSelectElement).value},`update-${leg.match_id}`)"><option v-for="option in leg.options" :key="option.code" :value="option.code">{{ option.label }} · {{ option.odds }}</option></select><button class="text-danger" @click="deleteLeg(plan,leg)">删除</button></td>
+                <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ formatResult(plan.market, leg.result) }}</span></td>
+                <td class="settle-cell">
+                  <b :class="['verdict', leg.result.hit === true ? 'hit' : leg.result.hit === false ? 'miss' : leg.result.status]">{{ leg.result.verdict }}</b>
+                  <div class="settle-actions">
+                    <button v-if="leg.ai_suggestion" class="soft" @click="applyAiSuggestion(plan, leg)">使用AI分析</button>
+                    <template v-if="leg.result.status === 'pending'">
+                      <select :value="leg.pick_code" @change="action('/api/v1/actions/update-leg',{plan_id:plan.plan_id,match_id:leg.match_id,option_code:($event.target as HTMLSelectElement).value},`update-${leg.match_id}`)"><option v-for="option in leg.options" :key="option.code" :value="option.code">{{ option.label }} · {{ option.odds }}</option></select>
+                      <button class="text-danger" @click="deleteLeg(plan,leg)">删除</button>
+                    </template>
+                  </div>
+                </td>
               </tr></tbody>
             </table>
           </div>
