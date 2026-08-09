@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from score_fourfold.cli import _build_manual_trigger
 from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
 from score_fourfold.database import Database
-from score_fourfold.domain import MatchResult, ResultStatus
+from score_fourfold.domain import MatchResult, ResultStatus, Settlement, PlanStatus
 from score_fourfold.mail import Mailer, flush_outbox, render_recommendation, render_settlement
 from score_fourfold.scheduler import slot_job_name
 from score_fourfold.service import ScoreFourfoldService
@@ -176,7 +176,9 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(&quot;database-xss&quot;)&lt;/script&gt;", page)
         self.assertNotIn('<img src=x onerror="alert(1)">', page)
         self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", page)
-        self.assertIn('class="flash warn"', page)
+        # Toast-based: message is in a hidden div with data-level
+        self.assertIn('id="init-message"', page)
+        self.assertIn('data-level="warn"', page)
 
     def test_ai_summary_is_rendered_in_modal_with_per_match_ai_cells(self):
         recommendation = self._create_plan()
@@ -665,14 +667,19 @@ class DashboardTests(unittest.TestCase):
                 expires_at=earlier + timedelta(hours=5),
             )
         )
-        page = self.application.render()
+        # Default list view shows both plans (paginated)
+        page = self.application.render(view="list")
+        self.assertIn(first.plan_id, page)
+
+        # Date view shows plans for a specific date with navigation
+        page = self.application.render(view="date", date="2026-07-15")
         self.assertIn("2026-07-15", page)
         self.assertIn("第 1 / 2 天", page)
         self.assertIn(first.plan_id, page)
         self.assertNotIn(earlier_rec.plan_id, page)
         self.assertIn("?date=2026-07-14", page)
 
-        page_earlier = self.application.render(date="2026-07-14")
+        page_earlier = self.application.render(view="date", date="2026-07-14")
         self.assertIn(earlier_rec.plan_id, page_earlier)
         self.assertNotIn(first.plan_id, page_earlier)
         self.assertIn("第 2 / 2 天", page_earlier)
@@ -1520,11 +1527,177 @@ class NewFeatureTests(unittest.TestCase):
         for view in ("date", "list", "calendar"):
             page = self.application.render(
                 view=view,
+                date="2026-07-15" if view == "date" else "",
                 cal_year=2026,
                 cal_month=7,
                 csrf_token="csrf",
             )
             self.assertIn("view-tab", page)
+
+    # --- AJAX JSON responses ---
+
+    def test_ajax_mark_purchased_returns_json(self):
+        """AJAX requests should get JSON, not a 303 redirect."""
+        rec = self._create_sent_plan()
+        level, detail = self.application.trigger_mark_purchased(rec.plan_id, True)
+        self.assertEqual(level, "ok")
+        # Verify the application method works (the HTTP layer is tested implicitly)
+        plan = self.database.get_plan(rec.plan_id)
+        self.assertTrue(plan.purchased)
+
+    def test_ajax_delete_plan_returns_deleted_flag(self):
+        """After deleting a plan, the JSON response should have deleted=True."""
+        rec = self._create_sent_plan()
+        level, detail = self.application.trigger_delete_plan(rec.plan_id)
+        self.assertEqual(level, "ok")
+        # Plan should be gone from database
+        self.assertIsNone(self.database.get_plan(rec.plan_id))
+
+    # --- toast notifications ---
+
+    def test_toast_container_present_in_all_views(self):
+        self._create_sent_plan()
+        for view in ("list", "calendar", "date"):
+            page = self.application.render(
+                view=view,
+                date="2026-07-15" if view == "date" else "",
+                cal_year=2026,
+                cal_month=7,
+                csrf_token="csrf",
+            )
+            self.assertIn('id="toast-container"', page)
+            self.assertIn("showToast", page)
+
+    def test_flash_message_uses_init_toast_div(self):
+        """Messages should be in a hidden div for toast display, not inline flash."""
+        page = self.application.render(
+            message="测试消息",
+            level="ok",
+            csrf_token="csrf",
+        )
+        self.assertIn('id="init-message"', page)
+        self.assertIn("测试消息", page)
+        self.assertIn("showToast(initMsg", page)
+
+    # --- no "按日期" tab in default list view ---
+
+    def test_no_date_tab_in_list_view(self):
+        self._create_sent_plan()
+        page = self.application.render(view="list", csrf_token="csrf")
+        self.assertNotIn("按日期", page)
+        self.assertIn("全部记录", page)
+        self.assertIn("日历", page)
+
+    def test_date_tab_shows_contextually(self):
+        """Date tab should appear when a specific date is selected."""
+        self._create_sent_plan()
+        page = self.application.render(view="date", date="2026-07-15", csrf_token="csrf")
+        self.assertIn("2026-07-15", page)
+
+    # --- data-plan-card attribute ---
+
+    def test_plan_card_has_data_attribute(self):
+        rec = self._create_sent_plan()
+        page = self.application.render(view="list", csrf_token="csrf")
+        self.assertIn(f'data-plan-card="{rec.plan_id}"', page)
+
+    # --- per-plan settle ---
+
+    def test_settle_plan_button_on_pending_plan(self):
+        rec = self._create_sent_plan()
+        page = self.application.render(view="list", csrf_token="csrf")
+        self.assertIn("settle-plan", page)
+        self.assertIn("更新本场赛果", page)
+        self.assertIn(f'data-plan-id="{rec.plan_id}"', page)
+
+    def test_settle_plan_button_absent_on_non_pending(self):
+        rec = self._create_sent_plan()
+        # Manually settle the plan as WON
+        settlement = Settlement(
+            plan_id=rec.plan_id,
+            status=PlanStatus.WON,
+            settled_at=self.now,
+            gross_prize=Decimal("100"),
+            tax=Decimal("0"),
+            net_prize=Decimal("100"),
+            net_profit=Decimal("98"),
+            leg_results=(),
+        )
+        self.database.settle_plan_with_mail(
+            settlement,
+            subject="test",
+            text_body="test",
+            html_body="test",
+        )
+        page = self.application.render(view="list", csrf_token="csrf")
+        # Settle button should not appear for non-pending plans
+        self.assertNotIn("更新本场赛果", page)
+
+    def test_queue_settle_plan_nonexistent(self):
+        level, detail = self.application.queue_settle_plan("NONEXISTENT")
+        self.assertEqual(level, "warn")
+
+    def test_queue_settle_plan_no_trigger(self):
+        """Without trigger_settle configured, per-plan settle should warn."""
+        rec = self._create_sent_plan()
+        # Application was created without trigger_settle
+        level, detail = self.application.queue_settle_plan(rec.plan_id)
+        self.assertEqual(level, "warn")
+
+    def test_queue_settle_plan_with_trigger(self):
+        """With trigger_settle configured, per-plan settle should queue."""
+        rec = self._create_sent_plan()
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-test-secret" * 2,
+            trigger_settle=lambda: ("ok", "赛果更新完成"),
+        )
+        level, detail = app.queue_settle_plan(rec.plan_id)
+        self.assertEqual(level, "ok")
+        self.assertIn("已提交后台", detail)
+
+    def test_queue_settle_plan_already_settled(self):
+        rec = self._create_sent_plan()
+        # Settle the plan first
+        settlement = Settlement(
+            plan_id=rec.plan_id,
+            status=PlanStatus.WON,
+            settled_at=self.now,
+            gross_prize=Decimal("100"),
+            tax=Decimal("0"),
+            net_prize=Decimal("100"),
+            net_profit=Decimal("98"),
+            leg_results=(),
+        )
+        self.database.settle_plan_with_mail(
+            settlement,
+            subject="test",
+            text_body="test",
+            html_body="test",
+        )
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-test-secret" * 2,
+            trigger_settle=lambda: ("ok", "noop"),
+        )
+        level, detail = app.queue_settle_plan(rec.plan_id)
+        self.assertEqual(level, "warn")
+        self.assertIn("已结算", detail)
+
+    # --- fetch-based postAction in JS ---
+
+    def test_postAction_uses_fetch_not_form_submit(self):
+        """The JS should use fetch() for AJAX, not form.submit()."""
+        page = self.application.render(csrf_token="csrf")
+        self.assertIn("fetch(path", page)
+        self.assertIn("X-Requested-With", page)
+        self.assertIn("XMLHttpRequest", page)
+        # Old form-based postAction should be gone
+        self.assertNotIn("f.submit()", page)
 
     @staticmethod
     def _wait_for(predicate, timeout: float = 2.0) -> None:

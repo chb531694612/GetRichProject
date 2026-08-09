@@ -74,6 +74,9 @@ tr:last-child td{border-bottom:0}.empty{text-align:center;padding:50px 20px;colo
 .pagination{display:flex;gap:6px;justify-content:center;align-items:center;margin-top:20px;flex-wrap:wrap}.pagination a,.pagination span{padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:13px;text-decoration:none}.pagination span.current{background:var(--blue);color:#fff;border-color:var(--blue);font-weight:700}.pagination span.disabled{color:var(--muted);opacity:.5}
 .calendar{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}.calendar-head{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line)}.calendar-head h3{margin:0;font-size:18px}.calendar-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:0}.calendar-dow{padding:8px;text-align:center;font-size:12px;color:var(--muted);font-weight:700;border-bottom:1px solid var(--line)}.calendar-day{padding:8px 6px;min-height:80px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px}.calendar-day:nth-child(7n){border-right:0}.calendar-day.empty{background:#fafbfc}.calendar-day .day-num{font-weight:700;margin-bottom:4px}.calendar-day .day-stats{line-height:1.5}.calendar-day .day-stats a{color:var(--blue);text-decoration:none;font-weight:600}.calendar-day.today{background:#eff6ff}
 .purchase-badge{background:#ecfdf3;color:#067647}.plan-actions .ticket-thumb{max-width:200px;max-height:150px;border-radius:8px;border:1px solid var(--line);margin-top:8px;cursor:pointer}.ticket-upload-form{display:inline-flex;gap:6px;align-items:center;margin-top:4px}.ticket-upload-form input[type=file]{font-size:12px}.settle-btn{background:#475467;color:#fff;border-color:#475467}
+.toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px;max-width:420px;pointer-events:none}.toast{padding:14px 18px;border-radius:12px;font-size:14px;font-weight:600;opacity:0;transform:translateX(120%);transition:all .35s cubic-bezier(.22,1,.36,1);box-shadow:0 6px 24px rgba(0,0,0,.13);max-width:420px;word-wrap:break-word;pointer-events:auto}.toast.show{opacity:1;transform:translateX(0)}.toast.ok{background:#ecfdf3;border:1px solid #abefc6;color:#067647}.toast.warn{background:#fffaeb;border:1px solid #fedf89;color:#93370d}.toast.error{background:#fef3f2;border:1px solid #fecdca;color:#b42318}
+.loading-overlay{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;margin-right:5px;vertical-align:-2px}@keyframes spin{to{transform:rotate(360deg)}}
+.btn-sm.settle-plan-btn{background:#475467;color:#fff;border-color:#475467}.btn-sm.settle-plan-btn:disabled{opacity:.6;cursor:not-allowed}
 @media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.top,.action{display:block}.action form{margin-top:14px}.plan-head{display:block}.badges{justify-content:flex-start;margin-top:8px}.calendar-day{min-height:60px}}
 @media(max-width:480px){.grid{grid-template-columns:1fr}.wrap{padding:18px 12px 40px}.metric .value{font-size:24px}.calendar-day{min-height:50px;font-size:11px}}
 """
@@ -460,6 +463,131 @@ class DashboardApplication:
         with self._lock:
             return self._settle_task
 
+    def queue_settle_plan(self, plan_id: str) -> tuple[str, str]:
+        """Start a per-plan settlement in the background and return immediately."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        if plan.status != PlanStatus.PENDING:
+            return ("warn", f"计划 {plan_id} 已结算，无需重复更新")
+        if self.trigger_settle is None:
+            return ("warn", "赛果手动更新未配置")
+        started_at = self.now()
+        with self._lock:
+            current = self._analysis_tasks.get(f"settle-{plan_id}")
+            if current is not None and current.status == "running":
+                return (
+                    "warn",
+                    f"计划 {plan_id} 的赛果更新正在后台执行，请勿重复提交。",
+                )
+            self._analysis_tasks[f"settle-{plan_id}"] = BackgroundTask(
+                "running",
+                "warn",
+                f"计划 {plan_id} 正在后台更新赛果并尝试结算。",
+                started_at,
+            )
+        threading.Thread(
+            target=self._run_settle_plan_task,
+            args=(plan_id, started_at),
+            name=f"settle-plan-{plan_id[:12]}",
+            daemon=True,
+        ).start()
+        return (
+            "ok",
+            f"已提交后台更新计划 {plan_id} 的赛果，无需等待；预计 1–3 分钟后查看结果。",
+        )
+
+    def _run_settle_plan_task(self, plan_id: str, started_at: datetime) -> None:
+        level = "error"
+        detail = f"计划 {plan_id} 的赛果更新后台执行异常。"
+        try:
+            plan = self.database.get_plan(plan_id)
+            if plan is None:
+                level, detail = "warn", f"计划 {plan_id} 不存在"
+            else:
+                level, detail = self._settle_single_plan(plan)
+        except Exception:
+            LOGGER.exception("background per-plan settle failed for %s", plan_id)
+        finished_at = self.now()
+        with self._lock:
+            current = self._analysis_tasks.get(f"settle-{plan_id}")
+            if current is not None and current.started_at == started_at:
+                self._analysis_tasks[f"settle-{plan_id}"] = BackgroundTask(
+                    "finished", level, detail, started_at, finished_at
+                )
+
+    def _settle_single_plan(self, plan: StoredPlan) -> tuple[str, str]:
+        """Fetch results for a single plan's matches and attempt settlement."""
+        import urllib.request, urllib.error
+        from .provider import SportteryProvider, MatchResult, ProviderError
+
+        plan_id = plan.plan_id
+        now = self.now()
+        delay = timedelta(minutes=self.settings.result_check_delay_minutes)
+        max_start = max(leg.start_at for leg in plan.legs)
+        if max_start + delay > now:
+            return ("warn", f"计划 {plan_id} 的最晚比赛尚未到赛果检查时间，请稍后再试")
+
+        # Determine date range from plan's matches
+        match_dates = [leg.start_at.date() for leg in plan.legs]
+        start_date = min(match_dates)
+        end_date = now.date()
+
+        # Try to get results from the provider
+        results: dict[str, "MatchResult"] = {}
+        if self.provider is not None:
+            get_results = getattr(self.provider, "get_results", None)
+            if callable(get_results):
+                try:
+                    results = get_results(start_date, end_date)
+                except Exception as exc:
+                    LOGGER.warning("per-plan settle: provider get_results failed: %s", exc)
+
+        # Check which matches are still missing
+        missing_ids = [leg.match_id for leg in plan.legs if leg.match_id not in results]
+        if missing_ids:
+            # Try webpage fallback: fetch results with a wider date range
+            try:
+                wider_start = start_date - timedelta(days=7)
+                wider_results = get_results(wider_start, end_date) if callable(get_results) else {}
+                for mid in missing_ids:
+                    if mid in wider_results:
+                        results[mid] = wider_results[mid]
+            except Exception as exc:
+                LOGGER.warning("per-plan settle: wider range search failed: %s", exc)
+
+        # Update leg results
+        relevant = {mid: results[mid] for leg in plan.legs if (mid := leg.match_id) in results}
+        if relevant:
+            self.database.update_leg_results(plan_id, relevant)
+        else:
+            return ("warn", f"未能获取到计划 {plan_id} 任何比赛的赛果，请稍后重试或前往官网查看")
+
+        # Attempt settlement
+        refreshed = self.database.get_plan(plan_id)
+        if refreshed is None:
+            return ("warn", f"计划 {plan_id} 已不存在")
+        if refreshed.status != PlanStatus.PENDING:
+            return ("ok", f"计划 {plan_id} 已结算，状态：{refreshed.status.value}")
+
+        # Try settlement via the service's settlement logic
+        settlement = None
+        if hasattr(self, '_build_settlement') or self.trigger_settle is not None:
+            # Use the global trigger_settle which runs the full settle flow
+            # but we only care about our plan
+            try:
+                self.trigger_settle()
+            except Exception as exc:
+                LOGGER.warning("per-plan settle: global settle trigger failed: %s", exc)
+
+        refreshed = self.database.get_plan(plan_id)
+        if refreshed is not None and refreshed.status != PlanStatus.PENDING:
+            updated_count = len(relevant)
+            return ("ok", f"计划 {plan_id} 赛果已更新（{updated_count}场），已自动结算，状态：{refreshed.status.value}")
+        else:
+            still_missing = [leg.match_id for leg in (refreshed or plan).legs if leg.result_status == ResultStatus.PENDING]
+            return ("warn", f"计划 {plan_id} 已更新{len(relevant)}场赛果，但仍有{len(still_missing)}场未公布赛果，计划暂未结算")
+
     def trigger_mark_purchased(self, plan_id: str, purchased: bool) -> tuple[str, str]:
         """Mark or unmark a plan as purchased."""
         plan = self.database.get_plan(plan_id)
@@ -763,7 +891,7 @@ class DashboardApplication:
 <div class="field"><label for="password">密码</label><input id="password" name="password" type="password" maxlength="512" autocomplete="current-password" required></div>
 <button type="submit">登录</button></form></section></main></body></html>"""
 
-    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "", date: str = "", view: str = "date", page: int = 1, cal_year: int = 0, cal_month: int = 0) -> str:
+    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "", date: str = "", view: str = "list", page: int = 1, cal_year: int = 0, cal_month: int = 0) -> str:
         now = datetime.now(self.settings.timezone)
         script_nonce = secrets.token_urlsafe(18)
         # SSH mode is already restricted to loopback requests and has no login
@@ -782,7 +910,7 @@ class DashboardApplication:
                 all_dates=all_dates, cal_year=cal_year, cal_month=cal_month,
             )
 
-        # ---- View: list (paginated all plans) ----
+        # ---- View: list (paginated all plans) — now the default ----
         if view == "list":
             return self._render_plan_list(
                 message=message, level=level, csrf_token=csrf_token,
@@ -790,7 +918,7 @@ class DashboardApplication:
                 all_dates=all_dates, page=page,
             )
 
-        # ---- View: date (default, existing behavior) ----
+        # ---- View: date (accessed via calendar clicks) ----
         if date and date in all_dates:
             selected_date = date
         elif all_dates:
@@ -854,8 +982,10 @@ class DashboardApplication:
 
         flash = ""
         safe_level = level if level in {"ok", "warn", "error"} else "warn"
+        # Flash messages are now shown as toasts via JS; keep a hidden div for initial message
+        init_toast = ""
         if message:
-            flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+            init_toast = f'<div id="init-message" data-level="{safe_level}" style="display:none">{_e(message[:800])}</div>'
         background_result = ""
         if recommendation_task is not None and recommendation_task.status == "finished":
             task_level = (
@@ -909,8 +1039,9 @@ class DashboardApplication:
 
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>比分串关个人看板</title>
-<style>{STYLE}</style></head><body><main class="wrap">
-{flash}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">推荐记录、赛果和2元基准模拟账本</div></div>
+<style>{STYLE}</style></head><body>
+<div class="toast-container" id="toast-container"></div>
+{init_toast}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">推荐记录、赛果和2元基准模拟账本</div></div>
 <div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
 <section class="grid">
 <div class="metric"><div class="muted">已计入计划</div><div class="value">{_e(summary['plans_total'])}</div><div class="small muted">比分 {summary.get('plans_crs', 0)} · 胜平负 {summary.get('plans_had', 0)}</div></div>
@@ -928,40 +1059,55 @@ class DashboardApplication:
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
 </main>
 <script nonce="{script_nonce}">
-function openModal(id){{var e=document.getElementById(id);if(e)e.classList.add('open')}}
-function closeModal(id){{var e=document.getElementById(id);if(e){{e.classList.remove('open');window.location.hash='_'}}}}
-function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
-function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
-function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
-function runAIAnalysis(target){{var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){{plan.querySelectorAll('.ai-cell').forEach(function(cell){{cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'}});var status=plan.querySelector('[data-ai-status]');if(status){{status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}}}postAction('/actions/analyze-plan',{{plan_id:target.dataset.planId}})}}
-function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
-function markPurchased(pid,purchased){{var msg=purchased?'确定标记此计划为已购买？':'确定取消购买标记？';if(confirm(msg))postAction('/actions/mark-purchased',{{plan_id:pid,purchased:purchased?'1':'0'}})}}
-function triggerSettle(){{if(confirm('确定手动更新赛果吗？将在后台执行，预计1-5分钟。'))postAction('/actions/settle',{{}})}}
-var recommendForm=document.getElementById('recommend-form');if(recommendForm)recommendForm.addEventListener('submit',function(){{var button=document.getElementById('recommend-submit');var status=document.getElementById('recommend-working');if(button){{button.disabled=true;button.textContent='推荐生成中…'}}if(status)status.classList.add('visible')}})
-document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='mark-purchased')markPurchased(target.dataset.planId,target.dataset.purchased==='1');else if(action==='settle')triggerSettle();else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+{self._shared_script(csrf_token, script_nonce)}
+var initMsg=document.getElementById('init-message');if(initMsg){{showToast(initMsg.dataset.level,initMsg.textContent)}}
 </script>
 </body></html>"""
 
     def _render_view_tabs(self, view: str, selected_date: str, csrf_token: str) -> str:
-        date_href = f"/?date={_e(selected_date)}" if selected_date else "/"
         tabs = [
-            ("date", "按日期", date_href),
             ("list", "全部记录", "/?view=list"),
             ("calendar", "日历", "/?view=calendar"),
         ]
+        # If a specific date is selected, show a contextual tab
+        if view == "date" and selected_date:
+            tabs.insert(0, ("date", f"{selected_date} 推荐", f"/?date={_e(selected_date)}"))
         items = []
         for tab_id, label, href in tabs:
             cls = "view-tab active" if view == tab_id else "view-tab"
-            items.append(f'<a class="{cls}" href="{href}">{label}</a>')
+            items.append(f'<a class="{cls}" href="{href}">{_e(label)}</a>')
         return f'<div class="view-tabs">{"".join(items)}</div>'
 
     def _render_settle_button(self, csrf_token: str, settle_running: bool) -> str:
         if settle_running:
             return '<button type="button" class="settle-btn" disabled>赛果更新中…</button>'
         return (
-            '<button type="button" data-action="settle" class="settle-btn">手动更新赛果</button>'
-            '<span class="muted small" style="margin-left:8px">在后台获取最新赛果并结算到期计划</span>'
+            '<button type="button" data-action="settle" class="settle-btn">手动更新全部赛果</button>'
+            '<span class="muted small" style="margin-left:8px">在后台获取最新赛果并结算所有到期计划</span>'
         )
+
+    def _shared_script(self, csrf_token: str, script_nonce: str) -> str:
+        token_json = json.dumps(csrf_token)
+        # Use plain string with placeholder replacement to avoid f-string brace hell
+        js = r"""
+function showToast(level,msg){var c=document.getElementById('toast-container');if(!c)return;var t=document.createElement('div');t.className='toast '+level;t.textContent=msg;c.appendChild(t);setTimeout(function(){t.classList.add('show')},10);setTimeout(function(){t.classList.remove('show');setTimeout(function(){t.remove()},400)},5000)}
+function refreshPlanCard(pid,html){if(!pid||!html)return;var old=document.querySelector('[data-plan-card="'+pid+'"]');if(!old)return;var tmp=document.createElement('div');tmp.innerHTML=html.trim();var nw=tmp.firstElementChild;if(nw)old.replaceWith(nw)}
+function removePlanCard(pid){if(!pid)return;var old=document.querySelector('[data-plan-card="'+pid+'"]');if(old)old.remove()}
+function postAction(path,data){data.csrf_token=__TOKEN__;var btn=document.activeElement;if(btn&&btn.tagName==='BUTTON'){btn.disabled=true;var orig=btn.innerHTML;btn.innerHTML='<span class="loading-overlay"></span>处理中…'}return fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'XMLHttpRequest'},body:new URLSearchParams(data)}).then(function(r){return r.json()}).then(function(result){showToast(result.level||'warn',result.detail||'操作完成');if(result.deleted&&result.plan_id){removePlanCard(result.plan_id)}else if(result.plan_html&&result.plan_id){refreshPlanCard(result.plan_id,result.plan_html)}return result}).catch(function(err){showToast('error','网络错误：'+err.message)}).finally(function(){if(btn&&btn.tagName==='BUTTON'){btn.disabled=false;btn.innerHTML=orig}})}
+function uploadTicketFile(form){var fd=new FormData(form);fd.set('csrf_token',__TOKEN__);var btn=form.querySelector('button[type=submit]');if(btn){btn.disabled=true;btn.innerHTML='<span class="loading-overlay"></span>上传中…'}return fetch('/actions/upload-ticket',{method:'POST',headers:{'X-Requested-With':'XMLHttpRequest'},body:fd}).then(function(r){return r.json()}).then(function(result){showToast(result.level||'warn',result.detail||'上传完成');if(result.plan_html&&result.plan_id){refreshPlanCard(result.plan_id,result.plan_html)}return result}).catch(function(err){showToast('error','上传失败：'+err.message)}).finally(function(){if(btn){btn.disabled=false;btn.innerHTML='上传实票'}})}
+function delPlan(pid){if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{plan_id:pid})}
+function delLeg(pid,mid){if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{plan_id:pid,match_id:mid})}
+function runAIAnalysis(target){var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){plan.querySelectorAll('.ai-cell').forEach(function(cell){cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'});var status=plan.querySelector('[data-ai-status]');if(status){status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}postAction('/actions/analyze-plan',{plan_id:target.dataset.planId})}
+function updateLeg(target,optionCode){if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode})}
+function markPurchased(pid,purchased){var msg=purchased?'确定标记此计划为已购买？':'确定取消购买标记？';if(confirm(msg))postAction('/actions/mark-purchased',{plan_id:pid,purchased:purchased?'1':'0'})}
+function triggerSettle(){if(confirm('确定手动更新全部赛果吗？将在后台执行，预计1-5分钟。'))postAction('/actions/settle',{})}
+function settlePlan(pid){if(confirm('确定更新此计划赛果吗？将在后台获取最新赛果并尝试结算。'))postAction('/actions/settle-plan',{plan_id:pid})}
+function openModal(id){var e=document.getElementById(id);if(e)e.classList.add('open')}
+function closeModal(id){var e=document.getElementById(id);if(e){e.classList.remove('open');window.location.hash='_'}}
+document.addEventListener('click',function(event){var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){var select=document.getElementById(target.dataset.selectId);if(select){target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}else if(action==='mark-purchased')markPurchased(target.dataset.planId,target.dataset.purchased==='1');else if(action==='settle')triggerSettle();else if(action==='settle-plan')settlePlan(target.dataset.planId);else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)})
+document.addEventListener('submit',function(event){var form=event.target;if(form.matches('.ticket-upload-form')){event.preventDefault();uploadTicketFile(form)}var rf=document.getElementById('recommend-form');if(form===rf){event.preventDefault();var button=document.getElementById('recommend-submit');var status=document.getElementById('recommend-working');if(button){button.disabled=true;button.innerHTML='<span class="loading-overlay"></span>推荐生成中…'}if(status)status.classList.add('visible');postAction('/actions/recommend',{request_id:form.querySelector('[name=request_id]').value,signature:form.querySelector('[name=signature]').value}).then(function(result){if(result.level==='ok'||result.level==='warn'){if(button){button.innerHTML='已提交后台生成'}}else{if(button){button.disabled=false;button.innerHTML='立即尝试今日全部推荐'}}})}})
+"""
+        return js.replace("__TOKEN__", token_json)
 
     def _render_calendar(
         self, *, message: str, level: str, csrf_token: str,
@@ -1020,8 +1166,9 @@ document.addEventListener('click',function(event){{var target=event.target.close
 
         flash = ""
         safe_level = level if level in {"ok", "warn", "error"} else "warn"
+        init_toast = ""
         if message:
-            flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+            init_toast = f'<div id="init-message" data-level="{safe_level}" style="display:none">{_e(message[:800])}</div>'
 
         view_tabs = self._render_view_tabs("calendar", "", csrf_token)
         logout = ""
@@ -1035,15 +1182,18 @@ document.addEventListener('click',function(event){{var target=event.target.close
 
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>日历 — 比分串关个人看板</title>
-<style>{STYLE}</style></head><body><main class="wrap">
-{flash}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">日历视图 — 按月查看每日计划与中奖情况</div></div>
+<style>{STYLE}</style></head><body>
+<div class="toast-container" id="toast-container"></div>
+<main class="wrap">
+{init_toast}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">日历视图 — 按月查看每日计划与中奖情况</div></div>
 <div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
 {view_tabs}
 <div class="calendar"><div class="calendar-head"><div>{prev_link}</div><h3>{month_label}</h3><div>{next_link}</div></div>{grid}</div>
 <div class="footer">点击日期可查看当天详细计划。{footer_access}</div>
 </main>
 <script nonce="{script_nonce}">
-function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
+{self._shared_script(csrf_token, script_nonce)}
+var initMsg=document.getElementById('init-message');if(initMsg){{showToast(initMsg.dataset.level,initMsg.textContent)}}
 </script>
 </body></html>"""
 
@@ -1059,20 +1209,34 @@ function postAction(path,data){{var f=document.createElement('form');f.method='P
             page = total_pages
             plans, total = self.database.paginated_plans(page, per_page)
 
-        flash = ""
         safe_level = level if level in {"ok", "warn", "error"} else "warn"
+        init_toast = ""
         if message:
-            flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+            init_toast = f'<div id="init-message" data-level="{safe_level}" style="display:none">{_e(message[:800])}</div>'
 
         settle_task = self.settle_task()
+        settle_running = settle_task is not None and settle_task.status == "running"
         background_result = ""
         if settle_task is not None and settle_task.status == "finished":
             task_level = settle_task.level if settle_task.level in {"ok", "warn", "error"} else "warn"
             background_result = f'<div class="flash {task_level}">赛果更新结果：{_e(settle_task.detail[:800])}</div>'
 
+        recommendation_task = self.recommendation_task()
+        background_result_rec = ""
+        if recommendation_task is not None and recommendation_task.status == "finished":
+            task_level = (
+                recommendation_task.level
+                if recommendation_task.level in {"ok", "warn", "error"}
+                else "warn"
+            )
+            background_result_rec = (
+                f'<div class="flash {task_level}">后台推荐结果：'
+                f'{_e(recommendation_task.detail[:800])}</div>'
+            )
+
         plan_cards = "".join(self._render_plan(plan, csrf_token) for plan in plans)
         if not plan_cards:
-            plan_cards = '<div class="panel empty">还没有推荐记录。</div>'
+            plan_cards = '<div class="panel empty">还没有推荐记录。服务生成第一张计划后会显示在这里。</div>'
 
         # Pagination controls
         pages_html: list[str] = []
@@ -1080,7 +1244,6 @@ function postAction(path,data){{var f=document.createElement('form');f.method='P
             pages_html.append(f'<a href="/?view=list&page={page - 1}">← 上一页</a>')
         else:
             pages_html.append('<span class="disabled">← 上一页</span>')
-        # Show page numbers (max 7 visible)
         start_page = max(1, page - 3)
         end_page = min(total_pages, start_page + 6)
         if start_page > 1:
@@ -1102,7 +1265,57 @@ function postAction(path,data){{var f=document.createElement('form');f.method='P
             pages_html.append('<span class="disabled">下一页 →</span>')
         pagination = f'<div class="pagination">{"".join(pages_html)}</div>'
 
+        # Summary metrics
+        settled_stake = Decimal(str(summary["settled_stake"]))
+        profit = Decimal(str(summary["baseline_profit"]))
+        settled = int(summary["plans_won"]) + int(summary["plans_lost"]) + int(summary["plans_void"])
+        decisive = int(summary["plans_won"]) + int(summary["plans_lost"])
+        hit_rate = (Decimal(int(summary["plans_won"])) / Decimal(decisive) * 100) if decisive else None
+        roi = (profit / settled_stake * 100) if settled_stake else None
+        profit_class = "positive" if profit > 0 else ("negative" if profit < 0 else "")
+
+        # Recommend form
+        cutoff = datetime.combine(now.date(), self.settings.recommendation_deadline, tzinfo=self.settings.timezone)
+        cutoff -= timedelta(minutes=self.settings.recommendation_send_buffer_minutes)
+        time_open = (
+            now.timetz().replace(tzinfo=None) < self.settings.recommendation_latest_start
+            and now < cutoff
+        )
+        recommendation_date = now.date().isoformat()
+        crs_exists = self.database.has_plan_for_recommendation_market(
+            recommendation_date, MarketType.CRS
+        )
+        had_exists = (
+            not self.settings.had_enabled
+            or self.database.has_plan_for_recommendation_market(
+                recommendation_date, MarketType.HAD
+            )
+        )
+        today_complete = crs_exists and had_exists
+        if today_complete:
+            action_reason = "今日比分与胜平负计划均已生成，不能重复生成。"
+        elif not time_open:
+            action_reason = "已超过今日手动推荐时间，明天可再次尝试。"
+        elif crs_exists:
+            action_reason = "今日比分计划已存在；将尝试补生成胜平负计划。仍会执行所有筛选和截止规则，手动操作间隔至少5分钟。"
+        elif had_exists and self.settings.had_enabled:
+            action_reason = "今日胜平负计划已存在；将尝试补生成比分计划。仍会执行所有筛选和截止规则，手动操作间隔至少5分钟。"
+        else:
+            action_reason = "使用服务器当前真实赔率尝试比分与胜平负推荐；仍会执行所有筛选和截止规则，手动操作间隔至少5分钟。"
+        action_enabled = time_open and not today_complete
+        recommendation_running = (
+            recommendation_task is not None and recommendation_task.status == "running"
+        )
+        if recommendation_running:
+            action_enabled = False
+            action_reason = "今日全部推荐正在后台生成；预计 1–40 分钟后刷新页面查看结果。"
+        request_id, signature = self.new_request()
+        disabled = "" if action_enabled else " disabled"
+        recommend_button_text = "推荐生成中…" if recommendation_running else "立即尝试今日全部推荐"
+        working_class = "working-status visible" if recommendation_running else "working-status"
+
         view_tabs = self._render_view_tabs("list", "", csrf_token)
+        settle_button = self._render_settle_button(csrf_token, settle_running)
         logout = ""
         if self.public_mode:
             logout = (
@@ -1113,26 +1326,30 @@ function postAction(path,data){{var f=document.createElement('form');f.method='P
         footer_access = "已通过HTTPS加密并要求登录。" if self.public_mode else "网页仅通过SSH安全通道访问。"
 
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>全部记录 — 比分串关个人看板</title>
-<style>{STYLE}</style></head><body><main class="wrap">
-{flash}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">全部记录 — 共 {total} 张计划，每页 {per_page} 张</div></div>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>比分串关个人看板</title>
+<style>{STYLE}</style></head><body>
+<div class="toast-container" id="toast-container"></div>
+<main class="wrap">
+{init_toast}{background_result_rec}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">全部记录 — 共 {total} 张计划，每页 {per_page} 张</div></div>
 <div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
+<section class="grid">
+<div class="metric"><div class="muted">已计入计划</div><div class="value">{_e(summary['plans_total'])}</div><div class="small muted">比分 {summary.get('plans_crs', 0)} · 胜平负 {summary.get('plans_had', 0)}</div></div>
+<div class="metric"><div class="muted">累计模拟投入</div><div class="value">{_e(summary['baseline_stake'])} 元</div><div class="small muted">只统计邮件已提交的计划</div></div>
+<div class="metric"><div class="muted">已结算净盈亏</div><div class="value {profit_class}">{_e(summary['baseline_profit'])} 元</div><div class="small muted">累计返还 {summary['baseline_return']} 元 · 已结算回报率 {_e(f'{roi:.2f}%' if roi is not None else '—')}</div></div>
+<div class="metric"><div class="muted">整票命中率</div><div class="value">{_e(f'{hit_rate:.2f}%' if hit_rate is not None else '—')}</div><div class="small muted">已结算 {settled} · 待结算 {summary['plans_pending']}</div></div>
+</section>
+<section class="panel action"><div><strong>手动尝试今日推荐</strong><div class="muted small">{_e(action_reason)}</div></div>
+<form id="recommend-form" method="post" action="/actions/recommend"><input type="hidden" name="request_id" value="{_e(request_id)}">
+<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>{_e(recommend_button_text)}</button><div id="recommend-working" class="{working_class}">推荐正在后台生成（含 AI 分析），无需停留在本页；预计 1–40 分钟后刷新查看。</div></form>
+<div style="margin-top:10px">{settle_button}</div></section>
 {view_tabs}
 <section class="plans">{plan_cards}</section>
 {pagination}
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
 </main>
 <script nonce="{script_nonce}">
-function openModal(id){{var e=document.getElementById(id);if(e)e.classList.add('open')}}
-function closeModal(id){{var e=document.getElementById(id);if(e){{e.classList.remove('open');window.location.hash='_'}}}}
-function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
-function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
-function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
-function runAIAnalysis(target){{var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){{plan.querySelectorAll('.ai-cell').forEach(function(cell){{cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'}});var status=plan.querySelector('[data-ai-status]');if(status){{status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}}}postAction('/actions/analyze-plan',{{plan_id:target.dataset.planId}})}}
-function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
-function markPurchased(pid,purchased){{var msg=purchased?'确定标记此计划为已购买？':'确定取消购买标记？';if(confirm(msg))postAction('/actions/mark-purchased',{{plan_id:pid,purchased:purchased?'1':'0'}})}}
-function triggerSettle(){{if(confirm('确定手动更新赛果吗？将在后台执行，预计1-5分钟。'))postAction('/actions/settle',{{}})}}
-document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='mark-purchased')markPurchased(target.dataset.planId,target.dataset.purchased==='1');else if(action==='settle')triggerSettle();else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+{self._shared_script(csrf_token, script_nonce)}
+var initMsg=document.getElementById('init-message');if(initMsg){{showToast(initMsg.dataset.level,initMsg.textContent)}}
 </script>
 </body></html>"""
 
@@ -1151,9 +1368,10 @@ document.addEventListener('click',function(event){{var target=event.target.close
         }
         modal_id = f"ai-modal-{pid[:12]}"
 
-        # Build plan action buttons (delete whole plan)
+        # Build plan action buttons (delete whole plan, AI analysis, per-plan settle)
         del_btn = ""
         ai_btn = ""
+        settle_plan_btn = ""
         if csrf_token and not analysis_running:
             del_btn = (
                 f'<button type="button" data-action="delete-plan" data-plan-id="{_e(pid)}" '
@@ -1163,6 +1381,12 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 f'<button type="button" data-action="analyze-plan" data-plan-id="{_e(pid)}" '
                 f'class="btn-sm" style="background:var(--blue);color:#fff;border-color:var(--blue)">AI分析并推荐</button>'
             )
+            # Per-plan settle button for pending plans
+            if plan.delivery_status == "sent" and plan.status == PlanStatus.PENDING:
+                settle_plan_btn = (
+                    f'<button type="button" data-action="settle-plan" data-plan-id="{_e(pid)}" '
+                    f'class="btn-sm settle-plan-btn">更新本场赛果</button>'
+                )
             if plan.ai_summary:
                 ai_btn += (
                     f' <button type="button" data-action="open-modal" data-modal-id="{modal_id}" '
@@ -1217,12 +1441,12 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 )
 
         if plan.delivery_status != "sent":
-            return f"""<article class="plan"><div class="plan-head"><div>
+            return f"""<article class="plan" data-plan-card="{_e(pid)}"><div class="plan-head"><div>
 <div class="plan-title">{_e(plan.recommendation_date)} · {_e(market_label)}{plan.pass_size}串1</div>
 <div class="muted small">{_e(pid)} · 生成于 {_e(plan.created_at.strftime('%Y-%m-%d %H:%M:%S'))}</div></div>
 <div class="badges"><span class="badge {delivery_class}">{_e(delivery_text)}</span><span class="badge {status_class}">{_e(status_text)}</span></div></div>
 <div class="panel" style="margin:0;border:0;box-shadow:none;border-radius:0">购买内容已隐藏。只有推荐邮件成功提交后，页面才会显示球队、选项和固定奖金，并计入2元模拟账本。</div>
-<div class="plan-actions" style="padding:8px 20px">{ai_btn} {del_btn}</div></article>"""
+<div class="plan-actions" style="padding:8px 20px">{ai_btn} {settle_plan_btn} {del_btn}</div></article>"""
         actual_return = _money(plan.settled_net_prize) if plan.status != PlanStatus.PENDING else "等待结算"
         profit = _money(plan.net_profit) if plan.net_profit is not None else "等待结算"
         rows: list[str] = []
@@ -1299,7 +1523,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 f'</div></div>'
             )
 
-        return f"""<article class="plan"><div class="plan-head"><div>
+        return f"""<article class="plan" data-plan-card="{_e(pid)}"><div class="plan-head"><div>
 <div class="plan-title">{_e(plan.recommendation_date)} · {_e(market_label)}{plan.pass_size}串1</div>
 <div class="muted small">{_e(pid)} · 生成于 {_e(plan.created_at.strftime('%Y-%m-%d %H:%M:%S'))} · 最晚比赛编号日期 {_e(plan.issue_date)}</div></div>
 <div class="badges"><span class="badge {delivery_class}">{_e(delivery_text)}</span><span class="badge {status_class}">{_e(status_text)}</span>
@@ -1309,7 +1533,7 @@ document.addEventListener('click',function(event){{var target=event.target.close
 <div><span class="muted small">本期净盈亏</span><strong>{profit}</strong></div></div>
 <div class="table-wrap"><table><thead><tr><th>编号/联赛</th><th>开赛时间</th><th>对阵</th><th>{_e(pick_header)}</th><th>赛果</th><th>结果</th><th>AI逐场推荐</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
-<div class="plan-actions" style="padding:8px 20px">{ai_btn} {del_btn} {purchase_btns}</div>{ai_modal}</article>"""
+<div class="plan-actions" style="padding:8px 20px">{ai_btn} {settle_plan_btn} {del_btn} {purchase_btns}</div>{ai_modal}</article>"""
 
 
 class LimitedThreadingHTTPServer(ThreadingHTTPServer):
@@ -1416,6 +1640,41 @@ def build_handler(application: DashboardApplication):
         def _redirect(self, message: str, level: str) -> None:
             location = "/?" + urlencode({"message": message[:800], "level": level})
             self._redirect_to(location)
+
+        def _is_ajax(self) -> bool:
+            return self.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+        def _json_response(self, data: dict) -> None:
+            body = json.dumps(data, ensure_ascii=False)
+            payload = body.encode("utf-8")
+            self.send_response(200)
+            self._headers("application/json; charset=utf-8", len(payload))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _respond_action(
+            self,
+            level: str,
+            detail: str,
+            *,
+            plan_id: str = "",
+            action: str = "",
+            csrf_token: str = "",
+        ) -> None:
+            """Send a JSON response for AJAX requests, or a 303 redirect otherwise."""
+            if self._is_ajax():
+                response: dict[str, object] = {"level": level, "detail": detail}
+                if plan_id:
+                    response["plan_id"] = plan_id
+                    if action == "delete-plan":
+                        response["deleted"] = True
+                    else:
+                        plan = application.database.get_plan(plan_id)
+                        if plan is not None:
+                            response["plan_html"] = application._render_plan(plan, csrf_token)
+                self._json_response(response)
+            else:
+                self._redirect(detail, level)
 
         def _single_header(self, name: str, *, required: bool = False) -> str | None:
             values = self.headers.get_all(name, [])
@@ -1738,7 +1997,7 @@ def build_handler(application: DashboardApplication):
             message = query.get("message", [""])[0]
             level = query.get("level", ["ok"])[0]
             date = query.get("date", [""])[0]
-            view = query.get("view", ["date"])[0]
+            view = query.get("view", ["list"])[0]
             page = int(query.get("page", ["1"])[0]) if query.get("page", ["1"])[0].isdigit() else 1
             cal_year = int(query.get("cal_year", ["0"])[0]) if query.get("cal_year", ["0"])[0].isdigit() else 0
             cal_month = int(query.get("cal_month", ["0"])[0]) if query.get("cal_month", ["0"])[0].isdigit() else 0
@@ -1758,7 +2017,7 @@ def build_handler(application: DashboardApplication):
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
-            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/mark-purchased", "/actions/upload-ticket"}:
+            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/settle-plan", "/actions/mark-purchased", "/actions/upload-ticket"}:
                 self._discard_request_body()
                 self._send(404, "<h1>404</h1>", close=True)
                 return
@@ -1775,7 +2034,7 @@ def build_handler(application: DashboardApplication):
             session: WebSession | None = None
             if application.public_mode:
                 authenticated = self._session()
-                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/mark-purchased", "/actions/upload-ticket"}:
+                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/settle-plan", "/actions/mark-purchased", "/actions/upload-ticket"}:
                     if authenticated is None:
                         self._discard_request_body()
                         self._redirect_to("/login")
@@ -1796,7 +2055,7 @@ def build_handler(application: DashboardApplication):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
                 level, detail = application.queue_ai_analysis(values["plan_id"])
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="analyze-plan", csrf_token=values.get("csrf_token", ""))
                 return
 
             # ---- handles /actions/delete-plan ----
@@ -1813,7 +2072,7 @@ def build_handler(application: DashboardApplication):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
                 level, detail = application.trigger_delete_plan(values["plan_id"])
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="delete-plan", csrf_token=values.get("csrf_token", ""))
                 return
 
             # ---- handles /actions/delete-leg ----
@@ -1830,7 +2089,7 @@ def build_handler(application: DashboardApplication):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
                 level, detail = application.trigger_delete_leg(values["plan_id"], values["match_id"])
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="delete-leg", csrf_token=values.get("csrf_token", ""))
                 return
             # ---- handles /actions/update-leg ----
             if path == "/actions/update-leg":
@@ -1850,10 +2109,10 @@ def build_handler(application: DashboardApplication):
                 level, detail = application.trigger_update_leg(
                     values["plan_id"], values["match_id"], values["option_code"]
                 )
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="update-leg", csrf_token=values.get("csrf_token", ""))
                 return
 
-            # ---- handles /actions/settle ----
+            # ---- handles /actions/settle (global) ----
             if path == "/actions/settle":
                 form = self._read_form()
                 if form is None:
@@ -1867,7 +2126,24 @@ def build_handler(application: DashboardApplication):
                         self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
                         return
                 level, detail = application.queue_settle()
-                self._redirect(detail, level)
+                self._respond_action(level, detail, csrf_token=values.get("csrf_token", ""))
+                return
+
+            # ---- handles /actions/settle-plan (per-plan) ----
+            if path == "/actions/settle-plan":
+                form = self._read_form()
+                if form is None:
+                    return
+                values = self._form_values(form, {"plan_id", "csrf_token"})
+                if values is None:
+                    return
+                if session is not None:
+                    csrf = values.get("csrf_token", "")
+                    if not application.verify_session_csrf(session, csrf):
+                        self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
+                        return
+                level, detail = application.queue_settle_plan(values["plan_id"])
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="settle-plan", csrf_token=values.get("csrf_token", ""))
                 return
 
             # ---- handles /actions/mark-purchased ----
@@ -1885,7 +2161,7 @@ def build_handler(application: DashboardApplication):
                         return
                 purchased = values["purchased"] in {"1", "true", "yes"}
                 level, detail = application.trigger_mark_purchased(values["plan_id"], purchased)
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=values["plan_id"], action="mark-purchased", csrf_token=values.get("csrf_token", ""))
                 return
 
             # ---- handles /actions/upload-ticket (multipart) ----
@@ -1910,7 +2186,7 @@ def build_handler(application: DashboardApplication):
                     return
                 filename, file_data = file_field
                 level, detail = application.trigger_upload_ticket(plan_id_val, str(filename), file_data)
-                self._redirect(detail, level)
+                self._respond_action(level, detail, plan_id=plan_id_val, action="upload-ticket", csrf_token=csrf_val)
                 return
 
             if path == "/login" and not application.public_mode:
@@ -2006,10 +2282,13 @@ def build_handler(application: DashboardApplication):
                 status, detail = application.queue_recommendation(request_id)
             except Exception:
                 LOGGER.exception("manual recommendation handler failed")
-                self._redirect("手动推荐执行异常，错误通知已进入邮件队列。", "error")
+                if self._is_ajax():
+                    self._json_response({"level": "error", "detail": "手动推荐执行异常，错误通知已进入邮件队列。"})
+                else:
+                    self._redirect("手动推荐执行异常，错误通知已进入邮件队列。", "error")
                 return
             level = status if status in {"ok", "warn", "error"} else "error"
-            self._redirect(detail, level)
+            self._respond_action(level, detail, csrf_token=values.get("csrf_token", ""))
 
         def log_message(self, fmt: str, *args) -> None:
             LOGGER.info("%s - %s", self._client_ip() or self.client_address[0], fmt % args)
