@@ -255,13 +255,6 @@ class ScoreFourfoldService:
             "已生成今日无有效购买推荐通知" if created else "今日无推荐通知已存在",
         )
 
-    _DELAY_TOKENS = ("postpone", "delay", "推迟", "延期", "延迟", "延后", "中断")
-
-    @classmethod
-    def _is_delayed_official_status(cls, official_status: str) -> bool:
-        lowered = official_status.lower()
-        return any(token in lowered for token in cls._DELAY_TOKENS)
-
     @staticmethod
     def _selected_score(leg) -> tuple[int, int] | None:
         code_match = re.fullmatch(r"s(\d{2})s(\d{2})", leg.score_code)
@@ -366,38 +359,11 @@ class ScoreFourfoldService:
         results = self.provider.get_results(start_date, end_date)
         settled_count = 0
         updated_count = 0
-        one_day = timedelta(days=1)
         for plan in active_plans:
             relevant = {leg.match_id: results[leg.match_id] for leg in plan.legs if leg.match_id in results}
             if relevant:
                 self.database.update_leg_results(plan.plan_id, relevant)
                 updated_count += len(relevant)
-
-            # After the one-day retry window, treat postponed/missing matches as
-            # void so they do not block settlement indefinitely.
-            voided: dict[str, MatchResult] = {}
-            for leg in plan.legs:
-                if leg.start_at + one_day > now:
-                    continue
-                if leg.match_id in relevant:
-                    result = relevant[leg.match_id]
-                    if result.status is ResultStatus.PENDING and self._is_delayed_official_status(
-                        result.official_status
-                    ):
-                        voided[leg.match_id] = MatchResult(
-                            match_id=leg.match_id,
-                            status=ResultStatus.VOID,
-                            official_status=result.official_status or "延期超过24小时按无效处理",
-                        )
-                else:
-                    voided[leg.match_id] = MatchResult(
-                        match_id=leg.match_id,
-                        status=ResultStatus.VOID,
-                        official_status="比赛结果未公布超过24小时按无效处理",
-                    )
-            if voided:
-                self.database.update_leg_results(plan.plan_id, voided)
-                updated_count += len(voided)
 
             refreshed = self.database.get_plan(plan.plan_id)
             if refreshed is None:

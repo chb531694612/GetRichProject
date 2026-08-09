@@ -133,7 +133,7 @@ class DelayedSettlementTests(unittest.TestCase):
         return ScoreFourfoldService(self.settings, self.database, provider, self.mailer)
 
     def test_postponed_match_stays_pending_within_one_day(self):
-        """A delayed match is not voided before the one-day retry window."""
+        """A delayed match stays pending — the ticket is still valid."""
         match_id = self.matches[0].match_id
         provider = _FakeResultProvider(
             {
@@ -154,8 +154,8 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertEqual(leg.result_status, ResultStatus.PENDING)
         self.assertIn("推迟", leg.official_status)
 
-    def test_postponed_match_voided_after_one_day(self):
-        """A delayed match is voided after the one-day retry window."""
+    def test_postponed_match_stays_pending_after_one_day(self):
+        """A delayed match is NOT voided after 24h — the ticket remains valid."""
         match_id = self.matches[0].match_id
         other_results = {
             match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
@@ -170,26 +170,26 @@ class DelayedSettlementTests(unittest.TestCase):
         # Wait until every leg in the plan is past the one-day window.
         settle_at = max(match.start_at for match in self.matches) + timedelta(days=1, minutes=1)
         outcome = self._service(provider).settle(settle_at)
-        self.assertIn("完成1张计划结算", outcome.detail)
+        self.assertIn("完成0张计划结算", outcome.detail)
         plan = self.database.get_plan(self.recommendation.plan_id)
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.status, PlanStatus.WON)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
         leg = plan.legs[0]
-        self.assertEqual(leg.result_status, ResultStatus.VOID)
+        self.assertEqual(leg.result_status, ResultStatus.PENDING)
 
-    def test_missing_match_voided_after_one_day(self):
-        """A match that vanishes from the results feed is voided after one day."""
+    def test_missing_match_stays_pending_after_one_day(self):
+        """A match missing from the results feed is NOT voided — keep waiting."""
         provider = _FakeResultProvider({})
         settle_at = max(match.start_at for match in self.matches) + timedelta(days=1, minutes=1)
         outcome = self._service(provider).settle(settle_at)
-        self.assertIn("完成1张计划结算", outcome.detail)
+        self.assertIn("完成0张计划结算", outcome.detail)
         plan = self.database.get_plan(self.recommendation.plan_id)
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.status, PlanStatus.VOID)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
         for leg in plan.legs:
-            self.assertEqual(leg.result_status, ResultStatus.VOID)
+            self.assertEqual(leg.result_status, ResultStatus.PENDING)
 
-    def test_final_match_not_voided_after_one_day(self):
+    def test_final_match_settled_after_one_day(self):
         """A normal final result is settled and not treated as delayed."""
         provider = _FakeResultProvider(
             {
