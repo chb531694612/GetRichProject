@@ -221,6 +221,7 @@ def render_stored_recommendation(plan: StoredPlan) -> tuple[str, str, str]:
             score_options=(selected,),
             snapshot_fetched_at=leg.snapshot_fetched_at,
             had_options=(selected,) if plan.market is MarketType.HAD else (),
+            ttg_options=(selected,) if plan.market is MarketType.TTG else (),
         )
         legs.append(SelectedLeg(match=match, score=selected))
     recommendation = Recommendation(
@@ -398,6 +399,14 @@ def render_settlement(
             hit = result.had_label == leg.score_label
             if result.had_label:
                 actual = f"{actual}（{result.had_label}）"
+        elif plan.market is MarketType.TTG:
+            if result.home_score is None or result.away_score is None:
+                hit = False
+            else:
+                total = result.home_score + result.away_score
+                total_label = "7+" if total >= 7 else str(total)
+                hit = total_label == leg.score_label
+                actual = f"{actual}（总进球{total_label}）"
         else:
             hit = actual == leg.score_label
         verdict = "无效" if result.status.value == "void" else ("命中" if hit else "未中")

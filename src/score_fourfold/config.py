@@ -163,6 +163,7 @@ class Settings:
     qwen_api_url: str
     qwen_model: str
     ai_analysis_enabled: bool
+    settings_master_key: str
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -244,6 +245,7 @@ class Settings:
             ).strip(),
             qwen_model=os.getenv("QWEN_MODEL", "qwen3.7-max").strip(),
             ai_analysis_enabled=_bool("AI_ANALYSIS_ENABLED", False),
+            settings_master_key=os.getenv("SETTINGS_MASTER_KEY", "").strip(),
         )
         # Construct once so an invalid timezone fails at startup.
         settings.timezone

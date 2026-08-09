@@ -64,6 +64,32 @@ class DatabaseSafetyTests(unittest.TestCase):
             self.database.count_plans_for_recommendation_date(recommendation.recommendation_date), 1
         )
 
+    def test_database_atomically_honors_configured_market_limit(self):
+        matches = [make_match(index, self.now, odds="2.00") for index in range(1, 5)]
+        base = make_recommendation(self.now, matches)
+        outcomes: list[bool] = []
+        for number in range(1, 4):
+            candidate = replace(base, plan_id=f"BF4-LIMIT-{number:04d}")
+            subject, text_body, html_body = render_recommendation(candidate)
+            outcomes.append(
+                self.database.create_plan_with_mail(
+                    candidate,
+                    subject=subject,
+                    text_body=text_body,
+                    html_body=html_body,
+                    expires_at=self.now + timedelta(hours=5),
+                    market_limit=2,
+                )
+            )
+        self.assertEqual(outcomes, [True, True, False])
+        self.assertEqual(
+            self.database.count_plans_for_recommendation_market(
+                base.recommendation_date,
+                MarketType.CRS,
+            ),
+            2,
+        )
+
     def test_same_issue_date_is_allowed_on_next_recommendation_date(self):
         matches = [make_match(index, self.now, odds="2.00") for index in range(1, 5)]
         first = replace(make_recommendation(self.now, matches), business_date="2026-07-15")

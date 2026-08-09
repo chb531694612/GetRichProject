@@ -20,7 +20,8 @@ from .mail import (
     render_settlement,
 )
 from .provider import ProviderError, SportteryPageResultProvider
-from .strategy import BASE_STAKE, calculate_prize, select_accumulator, select_had_accumulator
+from .settings_store import RecommendationProfile, SettingsRepository
+from .strategy import BASE_STAKE, calculate_prize, select_market_plans
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +38,13 @@ class ScoreFourfoldService:
         provider,
         mailer: Mailer,
         clock: Callable[[], datetime] | None = None,
+        settings_repository: SettingsRepository | None = None,
     ):
         self.settings = settings
         self.database = database
         self.provider = provider
         self.mailer = mailer
+        self.settings_repository = settings_repository
         self._clock = clock or (lambda: datetime.now(settings.timezone))
         self._recommend_lock = Lock()
 
@@ -78,6 +81,24 @@ class ScoreFourfoldService:
         finally:
             self._recommend_lock.release()
 
+    def _recommendation_profiles(self) -> dict[str, RecommendationProfile]:
+        if self.settings_repository is not None:
+            profiles = self.settings_repository.recommendation_profiles()
+            if profiles:
+                return profiles
+        had_sizes = tuple(self.settings.had_pass_sizes) or (6, 5, 4)
+        return {
+            MarketType.CRS.value: RecommendationProfile("crs", True, 2, 5, 1),
+            MarketType.HAD.value: RecommendationProfile(
+                "had",
+                self.settings.had_enabled,
+                min(had_sizes),
+                max(had_sizes),
+                1,
+            ),
+            MarketType.TTG.value: RecommendationProfile("ttg", False, 2, 6, 1),
+        }
+
     def _create_market_plan(
         self,
         *,
@@ -85,57 +106,34 @@ class ScoreFourfoldService:
         matches: list,
         wall_after_fetch: datetime,
         recommendation_date: str,
-        max_crs_plans: int = 1,
+        profile: RecommendationProfile,
     ) -> JobOutcome:
         existing_count = self.database.count_plans_for_recommendation_market(
             recommendation_date, market
         )
-        market_limit = max_crs_plans if market is MarketType.CRS else 1
+        market_limit = profile.plan_count
         if existing_count >= market_limit:
             return JobOutcome(
                 "duplicate",
                 f"推荐日{recommendation_date}已有{market.label_zh}计划，未重复生成",
             )
-        if market is MarketType.CRS:
-            selections = select_accumulator(matches, wall_after_fetch, self.settings)
-            created_plans: list[str] = []
-            no_recommendation_reasons: list[str] = []
-            remaining = max(0, max_crs_plans - existing_count)
-            for selection in selections:
-                if len(created_plans) >= remaining:
-                    break
-                rec = selection.recommendation
-                if rec is None:
-                    no_recommendation_reasons.append(selection.reason)
-                    continue
-                subject, text_body, html_body = render_recommendation(rec)
-                created = self.database.create_plan_with_mail(
-                    rec,
-                    subject=subject,
-                    text_body=text_body,
-                    html_body=html_body,
-                    expires_at=self._recommendation_mail_cutoff(wall_after_fetch.date()),
-                    not_before=max(
-                        rec.created_at,
-                        self._recommendation_first_mail_at(wall_after_fetch.date()),
-                    ),
-                )
-                if created:
-                    created_plans.append(rec.plan_id)
-            if created_plans:
-                plan_list = "、".join(created_plans)
-                return JobOutcome(
-                    "created",
-                    f"已创建{len(created_plans)}张{market.label_zh}串关计划：{plan_list}",
-                )
-            if no_recommendation_reasons:
-                return JobOutcome("no-recommendation", no_recommendation_reasons[0])
-            return JobOutcome("no-recommendation", "未能生成任何比分串关计划")
-        else:
-            selection = select_had_accumulator(matches, wall_after_fetch, self.settings)
+        remaining = max(0, market_limit - existing_count)
+        selections = select_market_plans(
+            matches,
+            wall_after_fetch,
+            self.settings,
+            market=market,
+            min_pass_size=profile.min_pass_size,
+            max_pass_size=profile.max_pass_size,
+            plan_count=remaining,
+        )
+        created_plans: list[str] = []
+        no_recommendation_reasons: list[str] = []
+        for selection in selections:
             recommendation = selection.recommendation
             if recommendation is None:
-                return JobOutcome("no-recommendation", selection.reason)
+                no_recommendation_reasons.append(selection.reason)
+                continue
             subject, text_body, html_body = render_recommendation(recommendation)
             created = self.database.create_plan_with_mail(
                 recommendation,
@@ -147,17 +145,26 @@ class ScoreFourfoldService:
                     recommendation.created_at,
                     self._recommendation_first_mail_at(wall_after_fetch.date()),
                 ),
+                market_limit=market_limit,
             )
-            if not created:
-                return JobOutcome(
-                    "duplicate",
-                    f"推荐日{recommendation_date}已有{market.label_zh}计划或计划已存在",
-                )
+            if created:
+                created_plans.append(recommendation.plan_id)
+        if created_plans:
             return JobOutcome(
                 "created",
-                f"已创建{market.label_zh}{recommendation.pass_size}串1计划{recommendation.plan_id}，"
-                f"2元理论税前奖金{recommendation.gross_prize}元",
+                f"已创建{len(created_plans)}张{market.label_zh}串关计划："
+                + "、".join(created_plans),
             )
+        if self.database.count_plans_for_recommendation_market(
+            recommendation_date, market
+        ) >= market_limit:
+            return JobOutcome(
+                "duplicate",
+                f"推荐日{recommendation_date}的{market.label_zh}计划已达到{market_limit}张",
+            )
+        if no_recommendation_reasons:
+            return JobOutcome("no-recommendation", no_recommendation_reasons[0])
+        return JobOutcome("no-recommendation", f"未能生成{market.label_zh}串关计划")
 
     def _recommend_locked(self, now: datetime) -> JobOutcome:
         # ``now`` is accepted for CLI/test compatibility, but production safety
@@ -166,19 +173,22 @@ class ScoreFourfoldService:
         if not self._recommendation_window_open(wall_now):
             return JobOutcome("closed", "已超过今日推荐启动或邮件安全截止时间，未请求赔率、未生成计划")
         recommendation_date = wall_now.date().isoformat()
-        max_crs_plans = 1
-        # CRS: allow up to max_crs_plans plans per day
-        crs_pending = self.database.count_plans_for_recommendation_market(
-            recommendation_date, MarketType.CRS
-        ) < max_crs_plans
-        had_pending = (
-            self.settings.had_enabled
-            and not self.database.has_plan_for_recommendation_market(
-                recommendation_date, MarketType.HAD
+        profiles = self._recommendation_profiles()
+        pending_profiles = [
+            profile
+            for profile in profiles.values()
+            if profile.enabled
+            and self.database.count_plans_for_recommendation_market(
+                recommendation_date, MarketType(profile.market)
+            ) < profile.plan_count
+        ]
+        if not pending_profiles:
+            return JobOutcome("duplicate", f"推荐日{recommendation_date}的已启用计划均已达到配置数量")
+
+        if hasattr(self.provider, "include_ttg"):
+            self.provider.include_ttg = any(
+                profile.market == MarketType.TTG.value for profile in pending_profiles
             )
-        )
-        if not crs_pending and not had_pending:
-            return JobOutcome("duplicate", f"推荐日{recommendation_date}的比分与胜平负计划均已存在")
 
         all_matches = self.provider.get_matches()
 
@@ -189,27 +199,19 @@ class ScoreFourfoldService:
             return JobOutcome("closed", "数据返回时已超过邮件安全截止时间，未生成计划")
 
         outcomes = []
-        if crs_pending:
-            blocked = self.database.unsettled_match_ids(MarketType.CRS)
-            crs_matches = [match for match in all_matches if match.match_id not in blocked]
+        for profile in pending_profiles:
+            market = MarketType(profile.market)
+            blocked = self.database.unsettled_match_ids(market)
+            market_matches = [
+                match for match in all_matches if match.match_id not in blocked
+            ]
             outcomes.append(
                 self._create_market_plan(
-                    market=MarketType.CRS,
-                    matches=crs_matches,
+                    market=market,
+                    matches=market_matches,
                     wall_after_fetch=wall_after_fetch,
                     recommendation_date=recommendation_date,
-                    max_crs_plans=max_crs_plans,
-                )
-            )
-        if had_pending:
-            blocked = self.database.unsettled_match_ids(MarketType.HAD)
-            had_matches = [match for match in all_matches if match.match_id not in blocked]
-            outcomes.append(
-                self._create_market_plan(
-                    market=MarketType.HAD,
-                    matches=had_matches,
-                    wall_after_fetch=wall_after_fetch,
-                    recommendation_date=recommendation_date,
+                    profile=profile,
                 )
             )
         created = [item for item in outcomes if item.status == "created"]
@@ -277,6 +279,12 @@ class ScoreFourfoldService:
         if plan.market is MarketType.HAD:
             actual = cls._had_outcome_from_result(result)
             return actual is not None and actual == leg.score_label
+        if plan.market is MarketType.TTG:
+            if result.home_score is None or result.away_score is None:
+                return False
+            total = result.home_score + result.away_score
+            actual = "7+" if total >= 7 else str(total)
+            return actual == leg.score_label
         selected = cls._selected_score(leg)
         return selected == (result.home_score, result.away_score)
 

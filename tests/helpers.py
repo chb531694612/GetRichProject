@@ -62,6 +62,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         qwen_api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
         qwen_model="qwen3.7-max",
         ai_analysis_enabled=False,
+        settings_master_key="",
         ticket_image_dir=str(tmp_path / "ticket-images"),
     )
     values.update(overrides)
@@ -94,6 +95,7 @@ def make_match(
     odds: str = "7.00",
     include_other: bool = True,
     include_had: bool = True,
+    include_ttg: bool = True,
     had_home_probability: str = "0.50",
 ) -> Match:
     options = [
@@ -103,6 +105,20 @@ def make_match(
     if include_other:
         options.append(ScoreOption("s1sh", "胜其它", Decimal("4.00"), Decimal("0.30"), True))
     had_options = make_had_options(home_probability=had_home_probability) if include_had else ()
+    ttg_options = (
+        tuple(
+            ScoreOption(
+                f"s{goals}",
+                "7+" if goals == 7 else str(goals),
+                Decimal(str(3 + goals)),
+                Decimal("0.125"),
+                False,
+            )
+            for goals in range(8)
+        )
+        if include_ttg
+        else ()
+    )
     return Match(
         match_id=str(1000 + number),
         match_num=f"周二{number:03d}",
@@ -118,6 +134,10 @@ def make_match(
         had_betting_all_up=bool(had_options),
         had_supported_pass_sizes=frozenset({4, 5, 6}),
         had_odds_updated_at=now - timedelta(minutes=5) if had_options else None,
+        ttg_options=ttg_options,
+        ttg_betting_all_up=bool(ttg_options),
+        ttg_supported_pass_sizes=frozenset({2, 3, 4, 5, 6}),
+        ttg_odds_updated_at=now - timedelta(minutes=5) if ttg_options else None,
     )
 
 
@@ -134,6 +154,11 @@ def make_recommendation(
             SelectedLeg(match=match, score=match.had_options[0]) for match in matches[:size]
         )
         prefix = f"HAD{size}"
+    elif market is MarketType.TTG:
+        legs = tuple(
+            SelectedLeg(match=match, score=match.ttg_options[0]) for match in matches[:size]
+        )
+        prefix = f"TTG{size}"
     else:
         legs = tuple(
             SelectedLeg(match=match, score=match.score_options[0]) for match in matches[:size]

@@ -8,12 +8,65 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from score_fourfold.strategy import calculate_prize, select_fourfold
+from score_fourfold.domain import MarketType
+from score_fourfold.strategy import calculate_prize, select_fourfold, select_market_plans
 
 from .helpers import make_match, make_settings
 
 
 class StrategyTests(unittest.TestCase):
+    def test_configured_plan_count_uses_unique_highest_pass_combinations(self):
+        settings = make_settings(self.tmp_path, max_matches_per_league=4)
+        matches = [
+            make_match(i, self.now, league=f"联赛{i}") for i in range(1, 5)
+        ]
+        results = select_market_plans(
+            matches,
+            self.now,
+            settings,
+            market=MarketType.CRS,
+            min_pass_size=2,
+            max_pass_size=3,
+            plan_count=2,
+        )
+        recommendations = [result.recommendation for result in results]
+        self.assertEqual(len(recommendations), 2)
+        self.assertTrue(all(item is not None and item.pass_size == 3 for item in recommendations))
+        leg_sets = [frozenset(leg.match.match_id for leg in item.legs) for item in recommendations if item]
+        self.assertEqual(len(set(leg_sets)), 2)
+
+    def test_configured_plan_count_is_limited_by_available_combinations(self):
+        settings = make_settings(self.tmp_path, max_matches_per_league=4)
+        matches = [
+            make_match(i, self.now, league=f"联赛{i}") for i in range(1, 4)
+        ]
+        results = select_market_plans(
+            matches,
+            self.now,
+            settings,
+            market=MarketType.CRS,
+            min_pass_size=2,
+            max_pass_size=3,
+            plan_count=2,
+        )
+        recommendations = [result.recommendation for result in results if result.recommendation]
+        self.assertEqual(len(recommendations), 1)
+        self.assertEqual(recommendations[0].pass_size, 3)
+
+    def test_no_plan_when_minimum_pass_size_is_not_met(self):
+        result = select_market_plans(
+            [make_match(1, self.now)],
+            self.now,
+            make_settings(self.tmp_path),
+            market=MarketType.CRS,
+            min_pass_size=2,
+            max_pass_size=5,
+            plan_count=3,
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0].recommendation)
+        self.assertIn("不足最低2串1", result[0].reason)
+
     def setUp(self):
         self.tmp_path = Path("data")
         self.now = datetime(2026, 7, 14, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))

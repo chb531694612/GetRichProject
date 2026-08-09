@@ -18,8 +18,10 @@ TAX_THRESHOLD = Decimal("10000.00")
 TAX_RATE = Decimal("0.20")
 STRATEGY_VERSION = "market-poisson-hybrid-v1"
 HAD_STRATEGY_VERSION = "had-market-poisson-hybrid-v1"
+TTG_STRATEGY_VERSION = "ttg-market-poisson-hybrid-v1"
 MARKET_ONLY_STRATEGY_VERSION = "market-implied-v3"
 HAD_MARKET_ONLY_STRATEGY_VERSION = "had-market-implied-v1"
+TTG_MARKET_ONLY_STRATEGY_VERSION = "ttg-market-implied-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,15 @@ def _best_had(match: Match, settings: Settings) -> ScoreOption | None:
     return max(candidates, key=lambda option: (option.probability, -option.odds))
 
 
+def _best_ttg(match: Match) -> ScoreOption | None:
+    if len(match.ttg_options) != 8:
+        return None
+    return max(
+        match.ttg_options,
+        key=lambda option: (option.probability, -option.odds),
+    )
+
+
 def _candidate_matches(
     matches: list[Match],
     now: datetime,
@@ -107,11 +118,16 @@ def _candidate_matches(
                 continue
             odds_updated_at = match.odds_updated_at
             best = _best_score(match, settings)
-        else:
+        elif market is MarketType.HAD:
             if not match.had_betting_all_up:
                 continue
             odds_updated_at = match.had_odds_updated_at or match.odds_updated_at
             best = _best_had(match, settings)
+        else:
+            if not match.ttg_betting_all_up:
+                continue
+            odds_updated_at = match.ttg_odds_updated_at or match.odds_updated_at
+            best = _best_ttg(match)
         if odds_updated_at is None or best is None:
             continue
         odds_clock_skew = now - odds_updated_at
@@ -147,6 +163,8 @@ def _unique_candidates(
 def _supported_pass_sizes(match: Match, market: MarketType) -> frozenset[int]:
     if market is MarketType.HAD:
         return match.had_supported_pass_sizes
+    if market is MarketType.TTG:
+        return match.ttg_supported_pass_sizes
     return match.supported_pass_sizes
 
 
@@ -228,6 +246,20 @@ def _build_recommendation(
             "奖金按邮件快照计算，实际兑奖以实体票固定奖金和官方规则为准",
         ]
         reason = f"已生成一张2元胜平负{pass_size}串1基准计划"
+    elif market is MarketType.TTG:
+        plan_id = f"TTG{pass_size}-{now:%Y%m%d}-{digest}"
+        strategy_version = (
+            TTG_STRATEGY_VERSION
+            if analysis_active
+            else TTG_MARKET_ONLY_STRATEGY_VERSION
+        )
+        notes = [
+            "每场仅选择一个总进球数结果：0至6球或7+",
+            analysis_note,
+            "分析依赖赔率结构，不包含实时伤停和首发信息；它不能保证盈利",
+            "奖金按邮件快照计算，实际兑奖以实体票固定奖金和官方规则为准",
+        ]
+        reason = f"已生成一张2元进球数{pass_size}串1基准计划"
     else:
         plan_id = f"BF{pass_size}-{now:%Y%m%d}-{digest}"
         strategy_version = (
@@ -352,6 +384,82 @@ def _select_for_market(
             "和联赛集中度条件的有效串关"
         )
     return SelectionResult(None, reason, len(candidates), inspected)
+
+
+def select_market_plans(
+    matches: list[Match],
+    now: datetime,
+    settings: Settings,
+    *,
+    market: MarketType,
+    min_pass_size: int,
+    max_pass_size: int,
+    plan_count: int,
+) -> list[SelectionResult]:
+    """Generate unique plans at the highest currently available pass size."""
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    if min_pass_size < 2 or max_pass_size < min_pass_size:
+        raise ValueError("invalid pass-size range")
+    if plan_count < 1:
+        raise ValueError("plan_count must be positive")
+
+    raw_candidates = _candidate_matches(matches, now, settings, market=market)
+    if len({match.match_id for match, _ in raw_candidates}) != len(raw_candidates):
+        return [
+            SelectionResult(
+                None,
+                "数据源包含重复比赛ID，已停止本轮推荐",
+                len(raw_candidates),
+                0,
+            )
+        ]
+    candidates = _unique_candidates(raw_candidates)
+    today = now.date()
+    today_pool = [item for item in candidates if _business_day(item[0], now) == today]
+    tomorrow = today + timedelta(days=1)
+    two_day_pool = [
+        item for item in candidates if today <= _business_day(item[0], now) <= tomorrow
+    ]
+    inspected = 0
+    for pass_size in range(max_pass_size, min_pass_size - 1, -1):
+        valid_combinations = []
+        for pool in (today_pool, two_day_pool):
+            if len(pool) < pass_size:
+                continue
+            valid_combinations, count = _best_combinations(
+                pool,
+                pass_size,
+                settings,
+                market=market,
+            )
+            inspected += count
+            if valid_combinations:
+                break
+        if valid_combinations:
+            return [
+                _build_recommendation(
+                    selected,
+                    now,
+                    settings,
+                    len(candidates),
+                    inspected,
+                    market=market,
+                )
+                for selected in valid_combinations[:plan_count]
+            ]
+
+    if len(two_day_pool) < min_pass_size:
+        reason = (
+            f"今天和明天合计只有{len(two_day_pool)}场符合{market.label_zh}条件，"
+            f"不足最低{min_pass_size}串1"
+        )
+    else:
+        reason = (
+            f"两天内有{len(two_day_pool)}场{market.label_zh}候选，但没有官方支持且"
+            "符合联赛集中度条件的有效串关"
+        )
+    return [SelectionResult(None, reason, len(candidates), inspected)]
 
 
 def _select_crs_multi(

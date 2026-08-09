@@ -22,10 +22,15 @@ class PlanStatus(StrEnum):
 class MarketType(StrEnum):
     CRS = "crs"
     HAD = "had"
+    TTG = "ttg"
 
     @property
     def label_zh(self) -> str:
-        return "比分" if self is MarketType.CRS else "胜平负"
+        return {
+            MarketType.CRS: "比分",
+            MarketType.HAD: "胜平负",
+            MarketType.TTG: "进球数",
+        }[self]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +61,10 @@ class Match:
     had_betting_all_up: bool = False
     had_supported_pass_sizes: frozenset[int] = frozenset({4, 5, 6})
     had_odds_updated_at: datetime | None = None
+    ttg_options: tuple[ScoreOption, ...] = ()
+    ttg_betting_all_up: bool = False
+    ttg_supported_pass_sizes: frozenset[int] = frozenset({2, 3, 4, 5, 6})
+    ttg_odds_updated_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

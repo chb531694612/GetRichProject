@@ -242,6 +242,78 @@ class Database:
                     created_at TEXT NOT NULL,
                     finished_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS settings_meta (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    schema_version INTEGER NOT NULL,
+                    initialized_at TEXT NOT NULL,
+                    legacy_fingerprint TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS recommendation_profiles (
+                    market TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    min_pass_size INTEGER NOT NULL CHECK (min_pass_size >= 2),
+                    max_pass_size INTEGER NOT NULL CHECK (max_pass_size >= min_pass_size),
+                    plan_count INTEGER NOT NULL CHECK (plan_count BETWEEN 1 AND 20),
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS email_recipients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                    position INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    smtp_host TEXT NOT NULL,
+                    smtp_port INTEGER NOT NULL CHECK (smtp_port BETWEEN 1 AND 65535),
+                    smtp_username TEXT NOT NULL,
+                    smtp_auth_ciphertext TEXT NOT NULL DEFAULT '',
+                    smtp_auth_env TEXT NOT NULL DEFAULT '',
+                    mail_from TEXT NOT NULL,
+                    mail_dry_run INTEGER NOT NULL CHECK (mail_dry_run IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_model_configs (
+                    model_config_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    api_key_ciphertext TEXT NOT NULL DEFAULT '',
+                    api_key_env TEXT NOT NULL DEFAULT '',
+                    web_search_required INTEGER NOT NULL DEFAULT 1 CHECK (web_search_required IN (0, 1)),
+                    last_test_status TEXT NOT NULL DEFAULT 'untested',
+                    last_test_detail TEXT NOT NULL DEFAULT '',
+                    last_tested_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_runtime_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    active_model_config_id TEXT REFERENCES ai_model_configs(model_config_id),
+                    http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 1),
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    recommendation_times_json TEXT NOT NULL,
+                    recommendation_first_mail_time TEXT NOT NULL,
+                    recommendation_latest_start TEXT NOT NULL,
+                    recommendation_deadline TEXT NOT NULL,
+                    recommendation_send_buffer_minutes INTEGER NOT NULL,
+                    poll_interval_seconds INTEGER NOT NULL,
+                    result_check_delay_minutes INTEGER NOT NULL,
+                    send_no_recommendation INTEGER NOT NULL CHECK (send_no_recommendation IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._migrate(connection)
@@ -648,6 +720,7 @@ class Database:
         html_body: str,
         expires_at: datetime,
         not_before: datetime | None = None,
+        market_limit: int = 1,
     ) -> bool:
         if expires_at.tzinfo is None:
             raise ValueError("recommendation expires_at must be timezone-aware")
@@ -658,11 +731,12 @@ class Database:
                 raise ValueError("recommendation not_before must be timezone-aware")
             if not_before >= expires_at:
                 raise ValueError("recommendation not_before must be before expires_at")
+        if market_limit < 1 or market_limit > 20:
+            raise ValueError("market_limit must be between 1 and 20")
         with self.connect() as connection:
             # Serialize the count-and-insert gate across processes. Each market
             # permits one plan per recommendation day.
             connection.execute("BEGIN IMMEDIATE")
-            limit = 1
             existing = connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM plans
@@ -670,7 +744,7 @@ class Database:
                 """,
                 (recommendation.recommendation_date, recommendation.market.value),
             ).fetchone()
-            if int(existing["count"]) >= limit:
+            if int(existing["count"]) >= market_limit:
                 return False
             existing_plan = connection.execute(
                 "SELECT 1 FROM plans WHERE plan_id = ?", (recommendation.plan_id,)
@@ -772,11 +846,11 @@ class Database:
                         str(leg.score.probability),
                     ),
                 )
-                market_options = (
-                    leg.match.score_options
-                    if recommendation.market is MarketType.CRS
-                    else leg.match.had_options
-                )
+                market_options = {
+                    MarketType.CRS: leg.match.score_options,
+                    MarketType.HAD: leg.match.had_options,
+                    MarketType.TTG: leg.match.ttg_options,
+                }[recommendation.market]
                 options_by_code = {option.code: option for option in market_options}
                 options_by_code.setdefault(leg.score.code, leg.score)
                 for option in options_by_code.values():
@@ -1181,9 +1255,11 @@ class Database:
                 selected = legs.get(match_id)
                 if selected is None:
                     continue
-                market_options = (
-                    match.score_options if market is MarketType.CRS else match.had_options
-                )
+                market_options = {
+                    MarketType.CRS: match.score_options,
+                    MarketType.HAD: match.had_options,
+                    MarketType.TTG: match.ttg_options,
+                }[market]
                 options_by_code = {option.code: option for option in market_options}
                 if not options_by_code:
                     continue
@@ -1413,6 +1489,10 @@ class Database:
                     if market is MarketType.HAD:
                         actual = "h" if home > away else ("a" if home < away else "d")
                         return str(row["score_code"]).lower() == actual
+                    if market is MarketType.TTG:
+                        total = home + away
+                        actual = "7+" if total >= 7 else str(total)
+                        return str(row["score_label"]) == actual
                     code_match = re.fullmatch(r"s(\d{2})s(\d{2})", str(row["score_code"]))
                     if code_match:
                         return (int(code_match.group(1)), int(code_match.group(2))) == (home, away)
@@ -1813,6 +1893,7 @@ class Database:
                        SUM(CASE WHEN delivery_status = 'sent' AND pass_size = 4 THEN 1 ELSE 0 END) AS fourfold,
                        SUM(CASE WHEN delivery_status = 'sent' AND market = 'crs' THEN 1 ELSE 0 END) AS crs_total,
                        SUM(CASE WHEN delivery_status = 'sent' AND market = 'had' THEN 1 ELSE 0 END) AS had_total,
+                       SUM(CASE WHEN delivery_status = 'sent' AND market = 'ttg' THEN 1 ELSE 0 END) AS ttg_total,
                        SUM(CASE WHEN delivery_status = 'sent' AND market = 'had' AND pass_size = 4 THEN 1 ELSE 0 END) AS had_fourfold,
                        SUM(CASE WHEN delivery_status = 'sent' AND market = 'had' AND pass_size = 5 THEN 1 ELSE 0 END) AS had_fivefold,
                        SUM(CASE WHEN delivery_status = 'sent' AND market = 'had' AND pass_size = 6 THEN 1 ELSE 0 END) AS had_sixfold,
@@ -1845,6 +1926,7 @@ class Database:
                 "plans_fourfold": int(plan_row["fourfold"] or 0),
                 "plans_crs": int(plan_row["crs_total"] or 0),
                 "plans_had": int(plan_row["had_total"] or 0),
+                "plans_ttg": int(plan_row["ttg_total"] or 0),
                 "plans_had_fourfold": int(plan_row["had_fourfold"] or 0),
                 "plans_had_fivefold": int(plan_row["had_fivefold"] or 0),
                 "plans_had_sixfold": int(plan_row["had_sixfold"] or 0),

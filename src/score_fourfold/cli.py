@@ -19,6 +19,7 @@ from .mail import Mailer
 from .provider import build_provider
 from .scheduler import due_recommendation_slot, seconds_until_next_event, slot_job_name
 from .service import JobOutcome, ScoreFourfoldService
+from .settings_store import SettingsRepository
 from .web import DashboardApplication, DashboardServer
 
 
@@ -37,7 +38,15 @@ def _parse_now(raw: str | None, settings: Settings) -> datetime:
 def _build_service(settings: Settings) -> ScoreFourfoldService:
     database = Database(settings.database_path)
     database.initialize()
-    return ScoreFourfoldService(settings, database, build_provider(settings), Mailer(settings))
+    settings_repository = SettingsRepository(database, settings)
+    settings_repository.initialize_from_legacy()
+    return ScoreFourfoldService(
+        settings,
+        database,
+        build_provider(settings),
+        Mailer(settings),
+        settings_repository=settings_repository,
+    )
 
 
 def _run_recorded(service: ScoreFourfoldService, job_name: str, now: datetime, action) -> JobOutcome:
@@ -263,6 +272,7 @@ def _safe_settings(settings: Settings) -> dict[str, object]:
         "web_trust_proxy_headers": settings.web_trust_proxy_headers,
         "web_session_hours": settings.web_session_hours,
         "ai_analysis_enabled": settings.ai_analysis_enabled,
+        "settings_master_key_configured": bool(settings.settings_master_key),
                 "qwen_api_key_configured": bool(settings.qwen_api_key),
                 "qwen_api_url": settings.qwen_api_url,
                 "qwen_model": settings.qwen_model,

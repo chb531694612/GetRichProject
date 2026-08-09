@@ -36,7 +36,7 @@ def _build_prompt(matches: list[tuple[Any, ScoreOption]], market: MarketType) ->
     lines: list[str] = [
         "你是一名审慎的足球比赛分析师。请先联网搜索每场比赛双方球队的近期公开信息，再进行分析。",
         "",
-        f"玩法：{'比分' if market is MarketType.CRS else '胜平负'}串关",
+        f"玩法：{market.label_zh}串关",
         "",
         "请从以下几个维度分析：",
         "1. 双方近期状态、伤停、赛程密度和主客场表现；",
@@ -227,12 +227,12 @@ def _leg_options(leg: Any) -> tuple[ScoreOption, ...]:
 
 
 def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -> str:
-    pick_name = "比分" if market is MarketType.CRS else "胜平负结果"
-    pick_rule = (
-        "pick 必须是一个具体的全场比分，例如 1:0、1:1、0:2。"
-        if market is MarketType.CRS
-        else "pick 只能是 主胜、平、客胜 三者之一。"
-    )
+    pick_name = market.label_zh
+    pick_rule = {
+        MarketType.CRS: "pick 必须是一个具体的全场比分，例如 1:0、1:1、0:2。",
+        MarketType.HAD: "pick 只能是 主胜、平、客胜 三者之一。",
+        MarketType.TTG: "pick 只能是 0、1、2、3、4、5、6、7+ 八者之一。",
+    }[market]
     lines = [
         "你是一名审慎的足球比赛分析师。必须先联网搜索每场双方球队的近期状态、伤停、赛程和主客场表现。",
         f"当前玩法：{pick_name}串关。你必须覆盖每一个 match_id。{pick_rule}",
@@ -240,7 +240,7 @@ def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -
         "",
         "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要添加 JSON 以外的文字。格式必须为：",
         '{"summary":"不超过160字的总体分析","suggestions":['
-        '{"match_id":"原样返回","pick":"具体比分或胜平负结果","reason":"不超过60字"}]}',
+        '{"match_id":"原样返回","pick":"该玩法的具体结果","reason":"不超过60字"}]}',
         "",
         "基础赛程信息：",
     ]

@@ -109,6 +109,13 @@ def _leg_result(leg: StoredLeg, *, market: MarketType = MarketType.CRS) -> tuple
             outcome = "平"
         hit = outcome == leg.score_label
         return f"{actual}（{outcome}）", ("命中" if hit else "未中"), ("green" if hit else "red")
+    if market is MarketType.TTG:
+        if leg.result_home is None or leg.result_away is None:
+            return actual, "待定", "amber"
+        total = leg.result_home + leg.result_away
+        outcome = "7+" if total >= 7 else str(total)
+        hit = outcome == leg.score_label
+        return f"{actual}（总进球{outcome}）", ("命中" if hit else "未中"), ("green" if hit else "red")
     hit = actual == leg.score_label.replace("：", ":")
     return actual, ("命中" if hit else "未中"), ("green" if hit else "red")
 

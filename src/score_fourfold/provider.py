@@ -52,6 +52,7 @@ HAD_CODE_ALIASES = {
     "客胜": "a",
     "主负": "a",
 }
+TTG_LABELS = {f"s{goals}": str(goals) for goals in range(7)} | {"s7": "7+"}
 
 
 class ProviderError(RuntimeError):
@@ -233,6 +234,29 @@ def _had_options(raw: dict[str, Any]) -> tuple[ScoreOption, ...]:
     )
 
 
+def _ttg_options(raw: dict[str, Any]) -> tuple[ScoreOption, ...]:
+    quoted: list[tuple[str, str, Decimal]] = []
+    for code, label in TTG_LABELS.items():
+        odds = _decimal(raw.get(code))
+        if odds is not None:
+            quoted.append((code, label, odds))
+    if len(quoted) != 8:
+        return ()
+    overround = sum((Decimal("1") / item[2] for item in quoted), Decimal("0"))
+    if overround <= 0:
+        return ()
+    return tuple(
+        ScoreOption(
+            code=code,
+            label=label,
+            odds=odds,
+            probability=(Decimal("1") / odds) / overround,
+            is_other=False,
+        )
+        for code, label, odds in quoted
+    )
+
+
 def _pass_size(formula: Any) -> int | None:
     normalized = _str(formula).lower().replace("×", "x").replace("*", "x").replace("串", "x")
     match = re.fullmatch(r"\s*([2-8])\s*x\s*1\s*", normalized)
@@ -362,6 +386,52 @@ def parse_sporttery_had_by_match_id(
     return by_id, supported_pass_sizes
 
 
+def parse_sporttery_ttg_by_match_id(
+    payload: dict[str, Any], tz
+) -> tuple[dict[str, dict[str, Any]], frozenset[int]]:
+    """Parse total-goals markets keyed by match_id from the official calculator."""
+    value = payload.get("value", {})
+    if not isinstance(value, dict):
+        raise ProviderError("TTG odds payload has no value object")
+    supported_pass_sizes = _all_up_pass_sizes(
+        value.get("allUpList"),
+        "ttg",
+        required={2, 3, 4, 5, 6},
+    )
+    groups = value.get("matchInfoList", [])
+    if not isinstance(groups, list):
+        raise ProviderError("TTG odds payload has no value.matchInfoList list")
+    by_id: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for raw in group.get("subMatchList", []) or []:
+            if not isinstance(raw, dict) or not isinstance(raw.get("ttg"), dict):
+                continue
+            match_id = _str(raw.get("matchId"))
+            options = _ttg_options(raw["ttg"])
+            if not match_id or not options:
+                continue
+            start_at = _parse_datetime(
+                raw.get("matchDateTime"),
+                tz,
+                fallback_date=_str(raw.get("matchDate")),
+                fallback_time=_str(raw.get("matchTime")),
+            )
+            ttg_update = raw["ttg"].get("updateTime")
+            update_date = _str(raw["ttg"].get("updateDate"))
+            if update_date and ttg_update and re.fullmatch(
+                r"\d{2}:\d{2}(:\d{2})?", _str(ttg_update)
+            ):
+                ttg_update = f"{update_date} {ttg_update}"
+            by_id[match_id] = {
+                "options": options,
+                "betting_all_up": _pool_is_available_for_all_up(raw, "ttg"),
+                "odds_updated_at": _parse_update_time(ttg_update, start_at),
+            }
+    return by_id, supported_pass_sizes
+
+
 def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
     root = payload.get("data", payload)
     raw_matches = root.get("matches", []) if isinstance(root, dict) else []
@@ -372,6 +442,7 @@ def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
         markets = raw.get("markets", {})
         crs = markets.get("crs", {}) if isinstance(markets, dict) else {}
         had = markets.get("had", {}) if isinstance(markets, dict) else {}
+        ttg = markets.get("ttg", {}) if isinstance(markets, dict) else {}
         outcomes = crs.get("outcomes", raw.get("score_options", [])) if isinstance(crs, dict) else []
         options: list[ScoreOption] = []
         for outcome in outcomes or []:
@@ -450,6 +521,50 @@ def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
         else:
             order = {"h": 0, "d": 1, "a": 2}
             had_options = sorted(had_options, key=lambda item: order[item.code])
+        ttg_options: list[ScoreOption] = []
+        ttg_outcomes = ttg.get("outcomes", []) if isinstance(ttg, dict) else []
+        for outcome in ttg_outcomes or []:
+            if not isinstance(outcome, dict):
+                continue
+            raw_code = _str(
+                outcome.get("code") or outcome.get("key") or outcome.get("labelZh")
+            ).lower()
+            if raw_code in {"7", "7+"}:
+                raw_code = "s7"
+            elif raw_code.isdigit() and int(raw_code) < 7:
+                raw_code = f"s{raw_code}"
+            label = TTG_LABELS.get(raw_code)
+            odds = _decimal(outcome.get("odds"))
+            if label is None or odds is None:
+                continue
+            probability_raw = outcome.get("noVigProb") or outcome.get("probability")
+            probability = (
+                Decimal(str(probability_raw))
+                if probability_raw not in (None, "")
+                else Decimal("0")
+            )
+            ttg_options.append(
+                ScoreOption(raw_code, label, odds, probability, False)
+            )
+        if ttg_options and all(option.probability <= 0 for option in ttg_options):
+            overround = sum(
+                (Decimal("1") / option.odds for option in ttg_options),
+                Decimal("0"),
+            )
+            ttg_options = [
+                ScoreOption(
+                    option.code,
+                    option.label,
+                    option.odds,
+                    (Decimal("1") / option.odds) / overround,
+                    False,
+                )
+                for option in ttg_options
+            ]
+        if {option.code for option in ttg_options} != set(TTG_LABELS):
+            ttg_options = []
+        else:
+            ttg_options = sorted(ttg_options, key=lambda option: int(option.code[1:]))
         start_raw = raw.get("start_at") or raw.get("matchDateTime")
         if not start_raw and raw.get("start_offset_minutes") is not None:
             start_raw = datetime.now(tz) + timedelta(minutes=int(raw["start_offset_minutes"]))
@@ -475,6 +590,11 @@ def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
             for value in raw.get("had_supported_pass_sizes", (4, 5, 6))
             if int(value) in {4, 5, 6}
         ) or frozenset({4, 5, 6})
+        ttg_supported = frozenset(
+            int(value)
+            for value in raw.get("ttg_supported_pass_sizes", (2, 3, 4, 5, 6))
+            if int(value) in {2, 3, 4, 5, 6}
+        ) or frozenset({2, 3, 4, 5, 6})
         matches.append(
             Match(
                 match_id=_str(raw.get("matchId") or raw.get("match_id")),
@@ -504,6 +624,15 @@ def parse_normalized_matches(payload: dict[str, Any], tz) -> list[Match]:
                 had_supported_pass_sizes=had_supported,
                 had_odds_updated_at=_parse_update_time(
                     had.get("updateTime") if isinstance(had, dict) else raw.get("had_odds_updated_at"),
+                    start_at,
+                ),
+                ttg_options=tuple(ttg_options),
+                ttg_betting_all_up=bool(
+                    raw.get("ttgBettingAllUp", raw.get("ttg_betting_all_up", bool(ttg_options)))
+                ),
+                ttg_supported_pass_sizes=ttg_supported,
+                ttg_odds_updated_at=_parse_update_time(
+                    ttg.get("updateTime") if isinstance(ttg, dict) else raw.get("ttg_odds_updated_at"),
                     start_at,
                 ),
             )
@@ -638,6 +767,7 @@ def parse_results(payload: dict[str, Any]) -> dict[str, MatchResult]:
 class SportteryProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.include_ttg = False
 
     def _get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         import time
@@ -747,33 +877,63 @@ class SportteryProvider:
             if match.betting_all_up
             and {option.code for option in match.score_options} == EXPECTED_CRS_CODES
         ]
-        if not self.settings.had_enabled:
-            return matches
-        try:
-            had_payload = self._get_json(
-                self.settings.sporttery_odds_url, {"poolCode": "had", "channel": "c"}
-            )
-            if had_payload.get("success") is not True or _str(had_payload.get("errorCode")) != "0":
-                raise ProviderError("official HAD odds wrapper did not report success")
-            had_by_id, had_pass_sizes = parse_sporttery_had_by_match_id(
-                had_payload, self.settings.timezone
-            )
-        except ProviderError:
-            # HAD failure must not block the exact-score ticket path.
-            return matches
+        had_by_id: dict[str, dict[str, Any]] = {}
+        had_pass_sizes: frozenset[int] = frozenset()
+        if self.settings.had_enabled:
+            try:
+                had_payload = self._get_json(
+                    self.settings.sporttery_odds_url, {"poolCode": "had", "channel": "c"}
+                )
+                if had_payload.get("success") is not True or _str(had_payload.get("errorCode")) != "0":
+                    raise ProviderError("official HAD odds wrapper did not report success")
+                had_by_id, had_pass_sizes = parse_sporttery_had_by_match_id(
+                    had_payload, self.settings.timezone
+                )
+            except ProviderError:
+                # One optional market must not block the exact-score path.
+                had_by_id = {}
+
+        ttg_by_id: dict[str, dict[str, Any]] = {}
+        ttg_pass_sizes: frozenset[int] = frozenset()
+        if self.include_ttg:
+            try:
+                ttg_payload = self._get_json(
+                    self.settings.sporttery_odds_url, {"poolCode": "ttg", "channel": "c"}
+                )
+                if ttg_payload.get("success") is not True or _str(ttg_payload.get("errorCode")) != "0":
+                    raise ProviderError("official TTG odds wrapper did not report success")
+                ttg_by_id, ttg_pass_sizes = parse_sporttery_ttg_by_match_id(
+                    ttg_payload, self.settings.timezone
+                )
+            except ProviderError:
+                ttg_by_id = {}
         merged: list[Match] = []
         for match in matches:
             had = had_by_id.get(match.match_id)
-            if had is None:
-                merged.append(match)
-                continue
+            ttg = ttg_by_id.get(match.match_id)
             merged.append(
                 replace(
                     match,
-                    had_options=had["options"],
-                    had_betting_all_up=bool(had["betting_all_up"]),
-                    had_supported_pass_sizes=had_pass_sizes,
-                    had_odds_updated_at=had["odds_updated_at"],
+                    had_options=had["options"] if had else match.had_options,
+                    had_betting_all_up=(
+                        bool(had["betting_all_up"]) if had else match.had_betting_all_up
+                    ),
+                    had_supported_pass_sizes=(
+                        had_pass_sizes if had else match.had_supported_pass_sizes
+                    ),
+                    had_odds_updated_at=(
+                        had["odds_updated_at"] if had else match.had_odds_updated_at
+                    ),
+                    ttg_options=ttg["options"] if ttg else match.ttg_options,
+                    ttg_betting_all_up=(
+                        bool(ttg["betting_all_up"]) if ttg else match.ttg_betting_all_up
+                    ),
+                    ttg_supported_pass_sizes=(
+                        ttg_pass_sizes if ttg else match.ttg_supported_pass_sizes
+                    ),
+                    ttg_odds_updated_at=(
+                        ttg["odds_updated_at"] if ttg else match.ttg_odds_updated_at
+                    ),
                 )
             )
         return merged
