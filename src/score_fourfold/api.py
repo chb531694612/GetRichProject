@@ -262,6 +262,17 @@ class DashboardAPI:
             "now": self.application.now().isoformat(),
         }
 
+    def logs(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        category = query.get("category", [""])[0].strip()
+        limit_raw = query.get("limit", ["200"])[0]
+        offset_raw = query.get("offset", ["0"])[0]
+        try:
+            limit = max(1, min(500, int(limit_raw)))
+            offset = max(0, int(offset_raw))
+        except ValueError:
+            limit, offset = 200, 0
+        return self.database.query_logs(category, limit, offset)
+
     def settings(self) -> dict[str, Any]:
         if self.settings_repository is None:
             raise RuntimeError("settings repository is unavailable")

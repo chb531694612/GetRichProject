@@ -630,6 +630,7 @@ class DashboardApplication:
                 return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
             if not self.settings.qwen_api_key:
                 return ("warn", "未配置 QWEN_API_KEY")
+        self.database.add_log("ai", f"开始AI分析计划{plan_id}", f"{len(plan.legs)}场比赛, 玩法: {plan.market}")
         if self.provider is not None:
             get_matches = getattr(self.provider, "get_matches", None)
             if callable(get_matches):
@@ -639,15 +640,20 @@ class DashboardApplication:
                     refreshed_plan = self.database.get_plan(plan_id)
                     if refreshed_plan is not None:
                         plan = refreshed_plan
+                    self.database.add_log("ai", f"刷新{len(matches)}场比赛赔率数据")
                 except Exception as exc:
                     LOGGER.warning("Could not refresh options for AI plan %s: %s", plan_id, exc)
+                    self.database.add_log("ai", f"刷新赔率数据失败: {exc}")
         unavailable = [leg.match_num for leg in plan.legs if len(leg.options) < 2]
         if unavailable:
+            self.database.add_log("ai", f"AI分析中止，比赛{', '.join(unavailable)}可选项不足")
             return (
                 "warn",
                 "以下比赛没有足够的真实可选项，暂时无法生成可替换建议："
                 + "、".join(unavailable),
             )
+        model_name = getattr(ai_runtime, "model_name", None) or self.settings.qwen_model if ai_runtime else self.settings.qwen_model
+        self.database.add_log("ai", f"正在调用AI模型({model_name})...")
         try:
             analysis = analyze_plan_from_leg_data(
                 plan.legs,
@@ -655,6 +661,7 @@ class DashboardApplication:
                 self.settings,
                 runtime=ai_runtime,
             )
+            self.database.add_log("ai", f"AI返回{len(analysis.suggestions)}场推荐")
             stored = self.database.update_ai_analysis(
                 plan_id,
                 analysis.summary,
@@ -671,12 +678,16 @@ class DashboardApplication:
             )
         except AIAnalysisError as exc:
             LOGGER.warning("AI recommendation of plan %s failed: %s", plan_id, exc)
+            self.database.add_log("ai", f"AI分析失败: {exc}")
             return ("error", f"AI推荐失败：{exc}")
         except Exception as exc:
             LOGGER.exception("AI analysis of plan %s failed", plan_id)
+            self.database.add_log("ai", f"AI分析异常: {exc}")
             return ("error", f"AI分析失败：{exc}")
         if not stored:
+            self.database.add_log("ai", f"AI分析结果未保存，计划{plan_id}已不存在")
             return ("warn", f"计划 {plan_id} 已不存在，AI结果未保存")
+        self.database.add_log("ai", f"AI分析完成，结果已保存", f"计划{plan_id}, {len(analysis.suggestions)}场推荐")
         return ("ok", f"AI分析和逐场推荐已完成，请选择是否替换计划 {plan_id}")
 
     def trigger_update_leg(
@@ -1713,6 +1724,8 @@ def build_handler(application: DashboardApplication):
                     data = dashboard_api.settings()
                 elif parsed.path == "/api/v1/plan-task":
                     data = dashboard_api.plan_task(query)
+                elif parsed.path == "/api/v1/logs":
+                    data = dashboard_api.logs(query)
                 elif parsed.path.startswith("/api/v1/tasks/"):
                     task_id = parsed.path.removeprefix("/api/v1/tasks/")
                     data = dashboard_api.task(task_id)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 from .domain import (
     Match,
@@ -314,6 +314,17 @@ class Database:
                     send_no_recommendation INTEGER NOT NULL CHECK (send_no_recommendation IN (0, 1)),
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS activity_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON activity_logs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_activity_logs_category ON activity_logs(category, created_at DESC);
                 """
             )
             self._migrate(connection)
@@ -2147,3 +2158,40 @@ class Database:
                 "emails_dead": int(mail_row["dead"] or 0),
                 "emails_expired": int(mail_row["expired"] or 0),
             }
+
+    def add_log(self, category: str, message: str, detail: str = "") -> None:
+        """Record a human-readable activity log entry."""
+        now = datetime.now().isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO activity_logs (created_at, category, message, detail) VALUES (?, ?, ?, ?)",
+                (now, category, message[:500], detail[:2000]),
+            )
+
+    def query_logs(self, category: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
+        """Query activity logs, newest first."""
+        where = " WHERE category = ?" if category else ""
+        params: list[Any] = [category] if category else []
+        with self.connect() as connection:
+            count_row = connection.execute(
+                f"SELECT COUNT(*) AS n FROM activity_logs{where}", params
+            ).fetchone()
+            rows = connection.execute(
+                f"""SELECT id, created_at, category, message, detail
+                    FROM activity_logs{where}
+                    ORDER BY id DESC LIMIT ? OFFSET ?""",
+                params + [limit, offset],
+            ).fetchall()
+        return {
+            "total": int(count_row["n"]),
+            "items": [
+                {
+                    "id": int(row["id"]),
+                    "created_at": row["created_at"],
+                    "category": row["category"],
+                    "message": row["message"],
+                    "detail": row["detail"],
+                }
+                for row in rows
+            ],
+        }

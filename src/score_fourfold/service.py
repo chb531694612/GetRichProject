@@ -192,6 +192,7 @@ class ScoreFourfoldService:
         # checks always read the injected real clock so --now cannot bypass 18:00.
         wall_now = self.now()
         if not self._recommendation_window_open(wall_now):
+            self.database.add_log("recommend", "推荐窗口已关闭，未生成计划", "已超过今日推荐启动或邮件安全截止时间")
             return JobOutcome("closed", "已超过今日推荐启动或邮件安全截止时间，未请求赔率、未生成计划")
         recommendation_date = wall_now.date().isoformat()
         profiles = self._recommendation_profiles()
@@ -204,6 +205,7 @@ class ScoreFourfoldService:
             ) < profile.plan_count
         ]
         if not pending_profiles:
+            self.database.add_log("recommend", f"推荐日{recommendation_date}的已启用计划均已达到配置数量")
             return JobOutcome("duplicate", f"推荐日{recommendation_date}的已启用计划均已达到配置数量")
 
         if hasattr(self.provider, "include_ttg"):
@@ -211,12 +213,15 @@ class ScoreFourfoldService:
                 profile.market == MarketType.TTG.value for profile in pending_profiles
             )
 
+        self.database.add_log("recommend", f"开始生成{recommendation_date}推荐", f"待生成玩法: {', '.join(p.market.upper() for p in pending_profiles)}")
         all_matches = self.provider.get_matches()
+        self.database.add_log("recommend", f"数据源返回{len(all_matches)}场比赛")
 
         # The provider request can cross the deadline, so check the clock again
         # before selecting or writing anything.
         wall_after_fetch = self.now()
         if not self._recommendation_window_open(wall_after_fetch):
+            self.database.add_log("recommend", "数据返回时已超过邮件安全截止时间，未生成计划")
             return JobOutcome("closed", "数据返回时已超过邮件安全截止时间，未生成计划")
 
         outcomes = []
@@ -226,27 +231,32 @@ class ScoreFourfoldService:
             market_matches = [
                 match for match in all_matches if match.match_id not in blocked
             ]
-            outcomes.append(
-                self._create_market_plan(
-                    market=market,
-                    matches=market_matches,
-                    wall_after_fetch=wall_after_fetch,
-                    recommendation_date=recommendation_date,
-                    profile=profile,
-                )
+            outcome = self._create_market_plan(
+                market=market,
+                matches=market_matches,
+                wall_after_fetch=wall_after_fetch,
+                recommendation_date=recommendation_date,
+                profile=profile,
             )
+            self.database.add_log("recommend", f"{market.label_zh}: {outcome.detail}")
+            outcomes.append(outcome)
         created = [item for item in outcomes if item.status == "created"]
         duplicates = [item for item in outcomes if item.status == "duplicate"]
         missing = [item for item in outcomes if item.status == "no-recommendation"]
         details = "；".join(item.detail for item in outcomes)
         if created and (missing or duplicates):
+            self.database.add_log("recommend", f"推荐部分完成，新建{len(created)}张计划", details)
             return JobOutcome("partial", details)
         if created:
+            self.database.add_log("recommend", f"推荐完成，新建{len(created)}张计划", details)
             return JobOutcome("created", details)
         if duplicates and not missing:
+            self.database.add_log("recommend", "推荐完成，所有计划已存在", details)
             return JobOutcome("duplicate", details)
         if missing and duplicates:
+            self.database.add_log("recommend", "推荐部分完成，部分已存在", details)
             return JobOutcome("partial", details)
+        self.database.add_log("recommend", "推荐完成，未生成新计划", details)
         return JobOutcome("no-recommendation", details)
 
     def finalize_recommendation_day(self, now: datetime) -> JobOutcome:
@@ -386,6 +396,7 @@ class ScoreFourfoldService:
         if latest_start + delay > wall_now:
             return JobOutcome("early", f"计划 {plan_id} 尚未到赛果检查时间")
 
+        self.database.add_log("settle", f"开始结算计划{plan_id}", f"{len(plan.legs)}场比赛")
         start_date = min(leg.start_at.date() for leg in plan.legs)
         results: dict[str, MatchResult] = {}
         primary_error = ""
@@ -411,6 +422,8 @@ class ScoreFourfoldService:
                 if result is not None:
                     results[leg.match_id] = result
                     fallback_count += 1
+        if fallback_count:
+            self.database.add_log("settle", f"官网详情兜底获取{fallback_count}场赛果")
 
         relevant = {
             leg.match_id: results[leg.match_id]
@@ -423,6 +436,7 @@ class ScoreFourfoldService:
             detail = f"计划 {plan_id} 未取得任何新赛果，请稍后重试"
             if primary_error:
                 detail += "；官方赛果接口暂时不可用"
+            self.database.add_log("settle", f"计划{plan_id}未取得新赛果", detail)
             return JobOutcome("missing-results", detail)
 
         refreshed = self.database.get_plan(plan_id)
@@ -440,13 +454,16 @@ class ScoreFourfoldService:
             )
             if primary_error and not relevant:
                 detail += "；官方赛果接口暂时不可用"
+            self.database.add_log("settle", f"计划{plan_id}仍有{len(unresolved)}场未公布", detail)
             return JobOutcome("partial" if relevant else "missing-results", detail)
 
         created = self._store_settlement(refreshed, wall_now)
         final_plan = self.database.get_plan(plan_id)
         if not created or final_plan is None or final_plan.status is PlanStatus.PENDING:
+            self.database.add_log("settle", f"计划{plan_id}结算写入失败")
             return JobOutcome("error", f"计划 {plan_id} 赛果已更新，但结算写入失败")
         source_note = f"，其中官网详情兜底 {fallback_count} 场" if fallback_count else ""
+        self.database.add_log("settle", f"计划{plan_id}结算完成", f"状态: {final_plan.status.value}{source_note}")
         return JobOutcome(
             "ok",
             f"计划 {plan_id} 已更新 {len(relevant)} 场并完成结算{source_note}，状态：{final_plan.status.value}",
@@ -480,13 +497,16 @@ class ScoreFourfoldService:
                 created_at=now,
             )
         if not active_plans:
+            self.database.add_log("settle", f"结算跳过，{expired_count}张计划超过30天需人工复核")
             return JobOutcome("needs-review", f"{expired_count}张计划超过30天仍未结算，需要人工复核")
+        self.database.add_log("settle", f"开始结算{len(active_plans)}张待结算计划")
         start_date = max(
             earliest_allowed,
             min(leg.start_at.date() for plan in active_plans for leg in plan.legs),
         )
         end_date = now.date()
         results = self.provider.get_results(start_date, end_date)
+        self.database.add_log("settle", f"数据源返回{len(results)}场比赛赛果")
         settled_count = 0
         updated_count = 0
         for plan in active_plans:
@@ -502,15 +522,18 @@ class ScoreFourfoldService:
                 continue
             if self._store_settlement(refreshed, now):
                 settled_count += 1
+                self.database.add_log("settle", f"计划{plan.plan_id}结算完成", f"状态: {refreshed.status.value}")
         detail = f"更新{updated_count}条赛果，完成{settled_count}张计划结算"
         if expired_count:
             detail += f"；另有{expired_count}张超过30天需人工复核"
+        self.database.add_log("settle", f"结算完成", detail)
         return JobOutcome("ok", detail)
 
     def send_mail(self, now: datetime) -> JobOutcome:
         self.refresh_runtime_settings()
         sent, failed = flush_outbox(self.database, self.mailer, now)
         status = "ok" if failed == 0 else "partial"
+        self.database.add_log("mail", f"邮件发送完成", f"成功{sent}封，失败{failed}封")
         return JobOutcome(status, f"邮件发送{sent}封，失败{failed}封")
 
     def test_mail(self, now: datetime) -> JobOutcome:

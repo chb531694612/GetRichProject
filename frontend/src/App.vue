@@ -14,6 +14,10 @@ const loading = ref(true)
 const busy = ref('')
 const calendarOpen = ref(false)
 const settingsOpen = ref(false)
+const logsOpen = ref(false)
+const logsData = ref<any>({ items: [], total: 0 })
+const logsCategory = ref('')
+const logsLoading = ref(false)
 const settingsTab = ref('recommendations')
 const calendarDate = ref(new Date())
 const calendarStats = ref<Record<string, any>>({})
@@ -305,6 +309,23 @@ async function applyAiSuggestion(plan: any, leg: any) {
     option_code: leg.ai_suggestion.code
   }, `ai-pick-${leg.match_id}`)
 }
+const categoryLabels: Record<string, string> = { recommend: '推荐', settle: '结算', ai: 'AI分析', mail: '邮件' }
+async function loadLogs() {
+  logsLoading.value = true
+  try {
+    const query = new URLSearchParams({ limit: '200' })
+    if (logsCategory.value) query.set('category', logsCategory.value)
+    logsData.value = await apiGet(`/api/v1/logs?${query}`)
+  } catch (error) { toast((error as Error).message, 'error') }
+  logsLoading.value = false
+}
+function openLogs() {
+  logsOpen.value = true
+  loadLogs()
+}
+function formatLogTime(value: string) {
+  try { return new Date(value).toLocaleString('zh-CN', { hour12: false }) } catch { return value }
+}
 
 watch(() => filters.q, () => {
   window.clearTimeout(searchTimer)
@@ -328,6 +349,7 @@ onMounted(async () => {
     <div class="top-actions">
       <span class="online"><i />服务正常</span>
       <button class="ghost" @click="openCalendar">购彩日历</button>
+      <button class="ghost" @click="openLogs">运行日志</button>
       <button class="ghost" @click="settingsOpen = true">设置</button>
       <button v-if="bootstrap?.public_mode" class="ghost" @click="logout">退出登录</button>
     </div>
@@ -429,6 +451,24 @@ onMounted(async () => {
           <section v-else>
             <h3>时间与运行</h3><p class="hint">时间均为北京时间。最迟推送时间之后不会再发送当日推荐邮件。</p><div class="form-grid"><label class="wide">推荐生成时间（逗号分隔）<input v-model="recommendationTimesText" placeholder="14:00, 14:30" /></label><label>首封邮件时间<input v-model="settings.runtime.recommendation_first_mail_time" type="time" /></label><label>最迟生成时间<input v-model="settings.runtime.recommendation_latest_start" type="time" /></label><label>最迟推送时间<input v-model="settings.runtime.recommendation_deadline" type="time" /></label><label>推送安全缓冲（分钟）<input v-model.number="settings.runtime.recommendation_send_buffer_minutes" type="number" /></label><label>轮询间隔（秒）<input v-model.number="settings.runtime.poll_interval_seconds" type="number" min="60" /></label><label>赛果检查延迟（分钟）<input v-model.number="settings.runtime.result_check_delay_minutes" type="number" min="90" /></label><label class="switch-row wide"><input v-model="settings.runtime.send_no_recommendation" type="checkbox" />没有推荐时也发送通知</label></div><div class="form-actions"><button @click="saveRuntime">保存运行设置</button></div>
           </section>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div v-if="logsOpen" class="modal-layer" @click.self="logsOpen = false">
+    <section class="logs-modal surface">
+      <header><h2>运行日志</h2><div class="logs-filters"><select v-model="logsCategory" @change="loadLogs"><option value="">全部类别</option><option v-for="(label,key) in categoryLabels" :key="key" :value="key">{{ label }}</option></select><button class="soft" @click="loadLogs">刷新</button></div><button class="modal-close" @click="logsOpen = false">×</button></header>
+      <div class="logs-body">
+        <div v-if="logsLoading" class="logs-empty">加载中…</div>
+        <div v-else-if="!logsData.items?.length" class="logs-empty">暂无日志记录</div>
+        <div v-else class="logs-list">
+          <div v-for="item in logsData.items" :key="item.id" class="log-entry" :class="item.category">
+            <span class="log-time">{{ formatLogTime(item.created_at) }}</span>
+            <span class="log-cat">{{ categoryLabels[item.category] || item.category }}</span>
+            <span class="log-msg">{{ item.message }}</span>
+            <small v-if="item.detail">{{ item.detail }}</small>
+          </div>
         </div>
       </div>
     </section>
