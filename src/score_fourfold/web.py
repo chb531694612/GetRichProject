@@ -210,6 +210,7 @@ class DashboardApplication:
         wake_mailer: Callable[[], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         trigger_settle: Callable[[], tuple[str, str]] | None = None,
+        trigger_settle_plan: Callable[[str], tuple[str, str]] | None = None,
     ):
         self.settings = settings
         self.database = database
@@ -217,6 +218,7 @@ class DashboardApplication:
         self.provider = provider
         self.wake_mailer = wake_mailer
         self.trigger_settle = trigger_settle
+        self.trigger_settle_plan = trigger_settle_plan
         self.ticket_image_dir = Path(getattr(settings, "ticket_image_dir", "data/ticket-images"))
         self._clock = clock or (lambda: datetime.now(self.settings.timezone))
         self._secret = secret or secrets.token_bytes(32)
@@ -470,7 +472,7 @@ class DashboardApplication:
             return ("warn", f"计划 {plan_id} 不存在")
         if plan.status != PlanStatus.PENDING:
             return ("warn", f"计划 {plan_id} 已结算，无需重复更新")
-        if self.trigger_settle is None:
+        if self.trigger_settle_plan is None:
             return ("warn", "赛果手动更新未配置")
         started_at = self.now()
         with self._lock:
@@ -501,11 +503,7 @@ class DashboardApplication:
         level = "error"
         detail = f"计划 {plan_id} 的赛果更新后台执行异常。"
         try:
-            plan = self.database.get_plan(plan_id)
-            if plan is None:
-                level, detail = "warn", f"计划 {plan_id} 不存在"
-            else:
-                level, detail = self._settle_single_plan(plan)
+            level, detail = self.trigger_settle_plan(plan_id)
         except Exception:
             LOGGER.exception("background per-plan settle failed for %s", plan_id)
         finished_at = self.now()
@@ -515,78 +513,6 @@ class DashboardApplication:
                 self._analysis_tasks[f"settle-{plan_id}"] = BackgroundTask(
                     "finished", level, detail, started_at, finished_at
                 )
-
-    def _settle_single_plan(self, plan: StoredPlan) -> tuple[str, str]:
-        """Fetch results for a single plan's matches and attempt settlement."""
-        import urllib.request, urllib.error
-        from .provider import SportteryProvider, MatchResult, ProviderError
-
-        plan_id = plan.plan_id
-        now = self.now()
-        delay = timedelta(minutes=self.settings.result_check_delay_minutes)
-        max_start = max(leg.start_at for leg in plan.legs)
-        if max_start + delay > now:
-            return ("warn", f"计划 {plan_id} 的最晚比赛尚未到赛果检查时间，请稍后再试")
-
-        # Determine date range from plan's matches
-        match_dates = [leg.start_at.date() for leg in plan.legs]
-        start_date = min(match_dates)
-        end_date = now.date()
-
-        # Try to get results from the provider
-        results: dict[str, "MatchResult"] = {}
-        if self.provider is not None:
-            get_results = getattr(self.provider, "get_results", None)
-            if callable(get_results):
-                try:
-                    results = get_results(start_date, end_date)
-                except Exception as exc:
-                    LOGGER.warning("per-plan settle: provider get_results failed: %s", exc)
-
-        # Check which matches are still missing
-        missing_ids = [leg.match_id for leg in plan.legs if leg.match_id not in results]
-        if missing_ids:
-            # Try webpage fallback: fetch results with a wider date range
-            try:
-                wider_start = start_date - timedelta(days=7)
-                wider_results = get_results(wider_start, end_date) if callable(get_results) else {}
-                for mid in missing_ids:
-                    if mid in wider_results:
-                        results[mid] = wider_results[mid]
-            except Exception as exc:
-                LOGGER.warning("per-plan settle: wider range search failed: %s", exc)
-
-        # Update leg results
-        relevant = {mid: results[mid] for leg in plan.legs if (mid := leg.match_id) in results}
-        if relevant:
-            self.database.update_leg_results(plan_id, relevant)
-        else:
-            return ("warn", f"未能获取到计划 {plan_id} 任何比赛的赛果，请稍后重试或前往官网查看")
-
-        # Attempt settlement
-        refreshed = self.database.get_plan(plan_id)
-        if refreshed is None:
-            return ("warn", f"计划 {plan_id} 已不存在")
-        if refreshed.status != PlanStatus.PENDING:
-            return ("ok", f"计划 {plan_id} 已结算，状态：{refreshed.status.value}")
-
-        # Try settlement via the service's settlement logic
-        settlement = None
-        if hasattr(self, '_build_settlement') or self.trigger_settle is not None:
-            # Use the global trigger_settle which runs the full settle flow
-            # but we only care about our plan
-            try:
-                self.trigger_settle()
-            except Exception as exc:
-                LOGGER.warning("per-plan settle: global settle trigger failed: %s", exc)
-
-        refreshed = self.database.get_plan(plan_id)
-        if refreshed is not None and refreshed.status != PlanStatus.PENDING:
-            updated_count = len(relevant)
-            return ("ok", f"计划 {plan_id} 赛果已更新（{updated_count}场），已自动结算，状态：{refreshed.status.value}")
-        else:
-            still_missing = [leg.match_id for leg in (refreshed or plan).legs if leg.result_status == ResultStatus.PENDING]
-            return ("warn", f"计划 {plan_id} 已更新{len(relevant)}场赛果，但仍有{len(still_missing)}场未公布赛果，计划暂未结算")
 
     def trigger_mark_purchased(self, plan_id: str, purchased: bool) -> tuple[str, str]:
         """Mark or unmark a plan as purchased."""

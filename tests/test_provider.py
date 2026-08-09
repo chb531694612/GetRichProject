@@ -3,12 +3,15 @@ from __future__ import annotations
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.provider import (
     EXPECTED_CRS_CODES,
     OkoooProvider,
+    ProviderError,
+    SportteryPageResultProvider,
     SportteryProvider,
     parse_normalized_matches,
     parse_results,
@@ -26,6 +29,62 @@ from .helpers import make_settings
 
 
 class ProviderParsingTests(unittest.TestCase):
+    def test_official_detail_page_fallback_verifies_and_parses_exact_match(self):
+        provider = SportteryPageResultProvider(make_settings(Path("data")))
+        leg = SimpleNamespace(
+            match_id="2040698",
+            match_num="周日011",
+            business_date="2026-08-02",
+            home="奥勒松",
+            away="特罗姆瑟",
+        )
+        head = {
+            "success": True,
+            "errorCode": "0",
+            "value": {
+                "sportteryMatchId": 2040698,
+                "matchNum": "周日011",
+                "matchDateTime": "2026-08-02 23:00",
+                "homeTeamShortName": "奥勒松",
+                "awayTeamShortName": "特罗姆瑟",
+                "fullCourtGoal": "2:6",
+            },
+        }
+        bonus = {
+            "success": True,
+            "errorCode": "0",
+            "value": {"matchId": 2040698, "isCancel": 0, "sectionsNo999": "2:6"},
+        }
+        with patch.object(provider, "_get_json", side_effect=[head, bonus]):
+            result = provider.get_result_for_leg(leg)
+        assert result is not None
+        self.assertEqual((result.home_score, result.away_score), (2, 6))
+        self.assertEqual(result.official_status, "official-page:final")
+
+    def test_official_detail_page_fallback_rejects_mismatched_match(self):
+        provider = SportteryPageResultProvider(make_settings(Path("data")))
+        leg = SimpleNamespace(
+            match_id="2040698",
+            match_num="周日011",
+            business_date="2026-08-02",
+            home="奥勒松",
+            away="特罗姆瑟",
+        )
+        head = {
+            "success": True,
+            "errorCode": "0",
+            "value": {
+                "sportteryMatchId": 2040698,
+                "matchNum": "周日012",
+                "matchDateTime": "2026-08-02 23:00",
+                "homeTeamShortName": "另一队",
+                "awayTeamShortName": "特罗姆瑟",
+            },
+        }
+        with patch.object(provider, "_get_json", return_value=head):
+            with self.assertRaises(ProviderError):
+                provider.get_result_for_leg(leg)
+
     def test_okooo_html_accepts_reordered_attributes_and_single_quotes(self):
         page = """
         <div data-hname='主队' id='match_123' data-aname='客队'

@@ -19,6 +19,7 @@ from .mail import (
     render_mail_test,
     render_settlement,
 )
+from .provider import ProviderError, SportteryPageResultProvider
 from .strategy import BASE_STAKE, calculate_prize, select_accumulator, select_had_accumulator
 
 
@@ -323,6 +324,98 @@ class ScoreFourfoldService:
             leg_results=leg_results,
         )
 
+    def _store_settlement(self, plan: StoredPlan, now: datetime) -> bool:
+        settlement = self._build_settlement(plan, now)
+        if settlement is None:
+            return False
+        summary = self.database.summary()
+        current_profit = Decimal(str(summary.get("baseline_profit", "0.00")))
+        summary["baseline_profit"] = str(
+            (current_profit + settlement.net_profit).quantize(Decimal("0.00"))
+        )
+        subject, text_body, html_body = render_settlement(plan, settlement, summary)
+        return self.database.settle_plan_with_mail(
+            settlement,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+        )
+
+    def settle_plan(self, plan_id: str, now: datetime | None = None) -> JobOutcome:
+        """Update and settle exactly one plan, with an official-page fallback."""
+        wall_now = (now or self.now()).astimezone(self.settings.timezone)
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return JobOutcome("missing", f"计划 {plan_id} 不存在")
+        if plan.status is not PlanStatus.PENDING:
+            return JobOutcome("duplicate", f"计划 {plan_id} 已结算，无需重复更新")
+
+        latest_start = max(leg.start_at for leg in plan.legs)
+        delay = timedelta(minutes=self.settings.result_check_delay_minutes)
+        if latest_start + delay > wall_now:
+            return JobOutcome("early", f"计划 {plan_id} 尚未到赛果检查时间")
+
+        start_date = min(leg.start_at.date() for leg in plan.legs)
+        results: dict[str, MatchResult] = {}
+        primary_error = ""
+        try:
+            results.update(self.provider.get_results(start_date, wall_now.date()))
+        except Exception as exc:
+            primary_error = str(exc)
+
+        missing_legs = [
+            leg
+            for leg in plan.legs
+            if leg.match_id not in results
+            or results[leg.match_id].status is ResultStatus.PENDING
+        ]
+        fallback_count = 0
+        if missing_legs:
+            page_provider = SportteryPageResultProvider(self.settings)
+            for leg in missing_legs:
+                try:
+                    result = page_provider.get_result_for_leg(leg)
+                except ProviderError:
+                    continue
+                if result is not None:
+                    results[leg.match_id] = result
+                    fallback_count += 1
+
+        relevant = {
+            leg.match_id: results[leg.match_id]
+            for leg in plan.legs
+            if leg.match_id in results
+        }
+        if relevant:
+            self.database.update_leg_results(plan_id, relevant)
+
+        refreshed = self.database.get_plan(plan_id)
+        if refreshed is None:
+            return JobOutcome("missing", f"计划 {plan_id} 已不存在")
+        unresolved = [
+            leg.match_num or leg.match_id
+            for leg in refreshed.legs
+            if leg.result_status is ResultStatus.PENDING
+        ]
+        if unresolved:
+            detail = (
+                f"计划 {plan_id} 已更新 {len(relevant)} 场，仍有 {len(unresolved)} 场未公布："
+                + "、".join(unresolved)
+            )
+            if primary_error and not relevant:
+                detail += "；官方赛果接口暂时不可用"
+            return JobOutcome("partial" if relevant else "missing-results", detail)
+
+        created = self._store_settlement(refreshed, wall_now)
+        final_plan = self.database.get_plan(plan_id)
+        if not created or final_plan is None or final_plan.status is PlanStatus.PENDING:
+            return JobOutcome("error", f"计划 {plan_id} 赛果已更新，但结算写入失败")
+        source_note = f"，其中官网详情兜底 {fallback_count} 场" if fallback_count else ""
+        return JobOutcome(
+            "ok",
+            f"计划 {plan_id} 已更新 {len(relevant)} 场并完成结算{source_note}，状态：{final_plan.status.value}",
+        )
+
     def settle(self, now: datetime) -> JobOutcome:
         plans = self.database.pending_plans()
         if not plans:
@@ -368,19 +461,9 @@ class ScoreFourfoldService:
             refreshed = self.database.get_plan(plan.plan_id)
             if refreshed is None:
                 continue
-            settlement = self._build_settlement(refreshed, now)
-            if settlement is None:
+            if any(leg.result_status == ResultStatus.PENDING for leg in refreshed.legs):
                 continue
-            summary = self.database.summary()
-            current_profit = Decimal(str(summary.get("baseline_profit", "0.00")))
-            summary["baseline_profit"] = str((current_profit + settlement.net_profit).quantize(Decimal("0.00")))
-            subject, text_body, html_body = render_settlement(refreshed, settlement, summary)
-            if self.database.settle_plan_with_mail(
-                settlement,
-                subject=subject,
-                text_body=text_body,
-                html_body=html_body,
-            ):
+            if self._store_settlement(refreshed, now):
                 settled_count += 1
         detail = f"更新{updated_count}条赛果，完成{settled_count}张计划结算"
         if expired_count:

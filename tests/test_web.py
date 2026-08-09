@@ -1647,15 +1647,23 @@ class NewFeatureTests(unittest.TestCase):
     def test_queue_settle_plan_with_trigger(self):
         """With trigger_settle configured, per-plan settle should queue."""
         rec = self._create_sent_plan()
+        called: list[str] = []
+
+        def settle_one(plan_id: str) -> tuple[str, str]:
+            called.append(plan_id)
+            return ("ok", "done")
+
         app = DashboardApplication(
             self.settings,
             self.database,
             self._trigger,
             secret=b"settle-test-secret" * 2,
+            trigger_settle_plan=settle_one,
             trigger_settle=lambda: ("ok", "赛果更新完成"),
         )
         level, detail = app.queue_settle_plan(rec.plan_id)
         self.assertEqual(level, "ok")
+        self._wait_for(lambda: called == [rec.plan_id])
         self.assertIn("已提交后台", detail)
 
     def test_queue_settle_plan_already_settled(self):
@@ -1682,6 +1690,7 @@ class NewFeatureTests(unittest.TestCase):
             self.database,
             self._trigger,
             secret=b"settle-test-secret" * 2,
+            trigger_settle_plan=lambda _plan_id: ("ok", "noop"),
             trigger_settle=lambda: ("ok", "noop"),
         )
         level, detail = app.queue_settle_plan(rec.plan_id)

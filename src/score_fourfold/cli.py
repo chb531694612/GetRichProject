@@ -161,6 +161,16 @@ def _build_settle_trigger(service: ScoreFourfoldService):
     return trigger
 
 
+def _build_settle_plan_trigger(service: ScoreFourfoldService):
+    """Build a dashboard action that settles only the requested plan."""
+
+    def trigger(plan_id: str) -> tuple[str, str]:
+        outcome = service.settle_plan(plan_id, service.now())
+        return outcome.status, outcome.detail
+
+    return trigger
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="score-fourfold",
@@ -384,6 +394,7 @@ def main(argv: list[str] | None = None) -> None:
                         provider=service.provider,
                         wake_mailer=wake_event.set,
                         trigger_settle=_build_settle_trigger(service),
+                        trigger_settle_plan=_build_settle_plan_trigger(service),
                     )
                     dashboard_server = DashboardServer(settings, application)
                     dashboard_server.start()

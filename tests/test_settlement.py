@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.config import Settings
@@ -131,6 +133,81 @@ class DelayedSettlementTests(unittest.TestCase):
 
     def _service(self, provider):
         return ScoreFourfoldService(self.settings, self.database, provider, self.mailer)
+
+    def test_settle_plan_updates_only_requested_plan(self):
+        second_now = self.now + timedelta(days=1)
+        second_matches = [
+            make_match(
+                i,
+                second_now,
+                business_date="2026-07-15",
+                odds="2.00",
+            )
+            for i in range(11, 15)
+        ]
+        second = replace(
+            make_recommendation(second_now, second_matches),
+            plan_id="BF4-TEST-SECOND",
+        )
+        subject, text_body, html_body = render_recommendation(second)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                second,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=second_now + timedelta(hours=5),
+            )
+        )
+        all_matches = [*self.matches, *second_matches]
+        provider = _FakeResultProvider(
+            {
+                match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+                for match in all_matches
+            }
+        )
+
+        settle_at = max(match.start_at for match in second_matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle_plan(
+            self.recommendation.plan_id,
+            settle_at,
+        )
+
+        self.assertEqual(outcome.status, "ok")
+        first_plan = self.database.get_plan(self.recommendation.plan_id)
+        second_plan = self.database.get_plan(second.plan_id)
+        assert first_plan is not None and second_plan is not None
+        self.assertEqual(first_plan.status, PlanStatus.WON)
+        self.assertEqual(second_plan.status, PlanStatus.PENDING)
+        self.assertTrue(
+            all(leg.result_status is ResultStatus.PENDING for leg in second_plan.legs)
+        )
+
+    def test_settle_plan_uses_official_detail_fallback_for_missing_results(self):
+        provider = _FakeResultProvider({})
+
+        def page_result(leg):
+            return MatchResult(
+                leg.match_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                official_status="official-page:final",
+            )
+
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            side_effect=page_result,
+        ) as fallback:
+            outcome = self._service(provider).settle_plan(
+                self.recommendation.plan_id,
+                settle_at,
+            )
+
+        self.assertEqual(outcome.status, "ok")
+        self.assertEqual(fallback.call_count, len(self.matches))
+        self.assertIn("官网详情兜底 4 场", outcome.detail)
 
     def test_postponed_match_stays_pending_within_one_day(self):
         """A delayed match stays pending — the ticket is still valid."""

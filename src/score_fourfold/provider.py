@@ -649,7 +649,10 @@ class SportteryProvider:
         full_url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(existing), parsed.fragment)
         )
-        is_result = "MatchResult" in parsed.path
+        is_result = any(
+            marker in parsed.path
+            for marker in ("MatchResult", "MatchHead", "FixedBonus")
+        )
         referer = (
             "https://www.sporttery.cn/jc/zqsgkj/"
             if is_result
@@ -810,6 +813,101 @@ class SportteryProvider:
                     raise ProviderError("official result page count exceeded the safety limit")
                 page_no += 1
             range_start = range_end + timedelta(days=1)
+        return results
+
+
+class SportteryPageResultProvider(SportteryProvider):
+    """Read one match result through the endpoints used by the official detail page.
+
+    The normal result list and ``/jc/zqsgkj/`` use the same list API.  The
+    per-match detail page additionally calls MatchHead and FixedBonus, which
+    gives us an independent, exact-match fallback without scraping rendered
+    HTML or guessing by team names.
+    """
+
+    _HEAD_PATH = "/gateway/uniform/football/getMatchHeadV1.qry"
+    _BONUS_PATH = "/gateway/uniform/football/getFixedBonusV1.qry"
+
+    def _webapi_url(self, path: str) -> str:
+        parsed = urllib.parse.urlsplit(self.settings.sporttery_results_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ProviderError("official result URL must be an https URL")
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+    @staticmethod
+    def _normal_text(value: object) -> str:
+        return re.sub(r"\s+", "", _str(value)).casefold()
+
+    def get_result_for_leg(self, leg: Any) -> MatchResult | None:
+        """Return a verified official-page result for one stored plan leg."""
+        match_id = _str(getattr(leg, "match_id", ""))
+        if not match_id.isdigit():
+            return None
+
+        head_payload = self._get_json(
+            self._webapi_url(self._HEAD_PATH),
+            {"source": "web", "sportteryMatchId": match_id},
+        )
+        head = head_payload.get("value")
+        if not isinstance(head, dict):
+            raise ProviderError("official detail page head has no value object")
+        if _str(head.get("sportteryMatchId")) != match_id:
+            raise ProviderError("official detail page returned a different match ID")
+
+        expected_date = _str(getattr(leg, "business_date", ""))
+        actual_datetime = _str(head.get("matchDateTime"))
+        if expected_date and not actual_datetime.startswith(expected_date):
+            raise ProviderError("official detail page returned a different match date")
+
+        expected_num = self._normal_text(getattr(leg, "match_num", ""))
+        actual_num = self._normal_text(head.get("matchNum"))
+        if expected_num and actual_num and expected_num != actual_num:
+            raise ProviderError("official detail page returned a different match number")
+
+        expected_home = self._normal_text(getattr(leg, "home", ""))
+        expected_away = self._normal_text(getattr(leg, "away", ""))
+        actual_home = self._normal_text(head.get("homeTeamShortName"))
+        actual_away = self._normal_text(head.get("awayTeamShortName"))
+        if expected_home and actual_home and expected_home != actual_home:
+            raise ProviderError("official detail page returned a different home team")
+        if expected_away and actual_away and expected_away != actual_away:
+            raise ProviderError("official detail page returned a different away team")
+
+        bonus_payload = self._get_json(
+            self._webapi_url(self._BONUS_PATH),
+            {"clientCode": "3001", "matchId": match_id},
+        )
+        bonus = bonus_payload.get("value")
+        if not isinstance(bonus, dict):
+            raise ProviderError("official detail page bonus has no value object")
+        if _str(bonus.get("matchId")) != match_id:
+            raise ProviderError("official bonus page returned a different match ID")
+
+        if str(bonus.get("isCancel", "0")) == "1":
+            return MatchResult(
+                match_id=match_id,
+                status=ResultStatus.VOID,
+                official_status="official-page:cancelled",
+            )
+
+        score_text = _str(bonus.get("sectionsNo999") or head.get("fullCourtGoal"))
+        score_match = re.fullmatch(r"\s*(\d{1,2})\s*[:\-]\s*(\d{1,2})\s*", score_text)
+        if score_match is None:
+            return None
+        return MatchResult(
+            match_id=match_id,
+            status=ResultStatus.FINAL,
+            home_score=int(score_match.group(1)),
+            away_score=int(score_match.group(2)),
+            official_status="official-page:final",
+        )
+
+    def get_results_for_legs(self, legs: Any) -> dict[str, MatchResult]:
+        results: dict[str, MatchResult] = {}
+        for leg in legs:
+            result = self.get_result_for_leg(leg)
+            if result is not None:
+                results[result.match_id] = result
         return results
 
 
