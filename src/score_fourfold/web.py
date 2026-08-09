@@ -84,6 +84,8 @@ def _money(value: Decimal | None) -> str:
 
 def _leg_result(leg: StoredLeg, *, market: MarketType = MarketType.CRS) -> tuple[str, str, str]:
     if leg.result_status is ResultStatus.PENDING:
+        if any(token in leg.official_status for token in ("推迟", "延期", "延迟", "延后", "postpone", "delay", "中断")):
+            return "延期", "待定", "amber"
         return "待公布", "待定", "amber"
     if leg.result_status is ResultStatus.VOID:
         return "无效场次", "无效", "amber"

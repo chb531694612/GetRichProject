@@ -6,12 +6,13 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from score_fourfold.config import Settings
 from score_fourfold.database import Database
 from score_fourfold.domain import MatchResult, PlanStatus, ResultStatus
-from score_fourfold.mail import render_recommendation, render_settlement
+from score_fourfold.mail import Mailer, render_recommendation, render_settlement
 from score_fourfold.service import ScoreFourfoldService
 
-from .helpers import make_match, make_recommendation
+from .helpers import make_match, make_recommendation, make_settings
 
 
 class SettlementTests(unittest.TestCase):
@@ -77,6 +78,131 @@ class SettlementTests(unittest.TestCase):
     def test_pending_leg_prevents_settlement(self):
         results = [MatchResult(match.match_id, ResultStatus.FINAL, 1, 0) for match in self.matches[:3]]
         self.assertIsNone(self._refresh_after(results))
+
+
+class _FakeResultProvider:
+    def __init__(self, results: dict[str, MatchResult]):
+        self.results = results
+
+    def get_results(self, start_date, end_date):
+        return self.results
+
+    def get_matches(self):
+        return []
+
+
+class DelayedSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_path = Path("data")
+        self.database_path = self.tmp_path / f"test_settlement_delay_{self._testMethodName}.db"
+        for suffix in ("", "-wal", "-shm"):
+            (Path(f"{self.database_path}{suffix}")).unlink(missing_ok=True)
+        self.database = Database(self.database_path)
+        self.database.initialize()
+        self.now = datetime(2026, 7, 14, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.matches = [make_match(i, self.now, odds="2.00") for i in range(1, 5)]
+        self.recommendation = make_recommendation(self.now, self.matches)
+        subject, text_body, html_body = render_recommendation(self.recommendation)
+        self.database.create_plan_with_mail(
+            self.recommendation,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            expires_at=self.now + timedelta(hours=5),
+        )
+        # Settlement only processes plans whose recommendation mail has been sent.
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE plans SET delivery_status = 'sent' WHERE plan_id = ?",
+                (self.recommendation.plan_id,),
+            )
+        settings = make_settings(
+            self.tmp_path,
+            database_path=self.database_path,
+            result_check_delay_minutes=0,
+            mail_preview_dir=self.tmp_path / "mail-delay",
+        )
+        self.settings = settings
+        self.mailer = Mailer(settings)
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            (Path(f"{self.database_path}{suffix}")).unlink(missing_ok=True)
+
+    def _service(self, provider):
+        return ScoreFourfoldService(self.settings, self.database, provider, self.mailer)
+
+    def test_postponed_match_stays_pending_within_one_day(self):
+        """A delayed match is not voided before the one-day retry window."""
+        match_id = self.matches[0].match_id
+        provider = _FakeResultProvider(
+            {
+                match_id: MatchResult(
+                    match_id,
+                    ResultStatus.PENDING,
+                    official_status="比赛推迟",
+                ),
+            }
+        )
+        # Settle just after the match start but well within 24 hours.
+        settle_at = self.matches[0].start_at + timedelta(hours=2)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("更新1条赛果", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        leg = plan.legs[0]
+        self.assertEqual(leg.result_status, ResultStatus.PENDING)
+        self.assertIn("推迟", leg.official_status)
+
+    def test_postponed_match_voided_after_one_day(self):
+        """A delayed match is voided after the one-day retry window."""
+        match_id = self.matches[0].match_id
+        other_results = {
+            match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+            for match in self.matches[1:]
+        }
+        other_results[match_id] = MatchResult(
+            match_id,
+            ResultStatus.PENDING,
+            official_status="比赛推迟",
+        )
+        provider = _FakeResultProvider(other_results)
+        # Wait until every leg in the plan is past the one-day window.
+        settle_at = max(match.start_at for match in self.matches) + timedelta(days=1, minutes=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        leg = plan.legs[0]
+        self.assertEqual(leg.result_status, ResultStatus.VOID)
+
+    def test_missing_match_voided_after_one_day(self):
+        """A match that vanishes from the results feed is voided after one day."""
+        provider = _FakeResultProvider({})
+        settle_at = max(match.start_at for match in self.matches) + timedelta(days=1, minutes=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.VOID)
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.VOID)
+
+    def test_final_match_not_voided_after_one_day(self):
+        """A normal final result is settled and not treated as delayed."""
+        provider = _FakeResultProvider(
+            {
+                match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+                for match in self.matches
+            }
+        )
+        settle_at = self.matches[0].start_at + timedelta(days=1, minutes=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
 
 
 if __name__ == "__main__":

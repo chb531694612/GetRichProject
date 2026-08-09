@@ -578,14 +578,30 @@ def _result_from_record(raw: dict[str, Any]) -> MatchResult | None:
     official_result_status = _str(raw.get("matchResultStatus"))
     official_pool_status = _str(raw.get("poolStatus")).lower()
     has_uniform_status = "matchResultStatus" in raw or "poolStatus" in raw
-    if has_uniform_status and not (
-        official_result_status == "2" and official_pool_status == "payout"
-    ):
-        # The uniform results feed may publish a live score before the game is
-        # official. Only status=2 plus Payout is safe for final settlement.
-        status = ResultStatus.PENDING
-    elif any(token in lowered for token in ("cancel", "void", "invalid", "取消", "无效", "腰斩")):
+    void_tokens = ("cancel", "void", "invalid", "取消", "无效", "腰斩")
+    delay_tokens = ("postpone", "delay", "推迟", "延期", "延迟", "延后", "中断")
+    if has_uniform_status:
+        if official_pool_status in ("cancel", "void", "refund") or official_result_status in ("cancel", "void"):
+            status = ResultStatus.VOID
+        elif official_result_status == "2" and official_pool_status == "payout":
+            # The official feed may mark a match as paid out while the score
+            # text still says "void" / "invalid" (for example "无效场次").
+            if any(token in lowered for token in ("invalid", "无效")):
+                status = ResultStatus.VOID
+            else:
+                status = ResultStatus.FINAL
+        elif any(token in lowered for token in delay_tokens):
+            # Postponed matches are kept pending so settle() can wait the
+            # required one-day retry window before marking them void.
+            status = ResultStatus.PENDING
+        else:
+            # The uniform results feed may publish a live score before the game
+            # is official. Only status=2 plus Payout is safe for final settlement.
+            status = ResultStatus.PENDING
+    elif any(token in lowered for token in void_tokens):
         status = ResultStatus.VOID
+    elif any(token in lowered for token in delay_tokens):
+        status = ResultStatus.PENDING
     elif score is not None and (
         not status_text
         or any(token in lowered for token in ("final", "finished", "payout", "complete", "开奖", "结束"))
