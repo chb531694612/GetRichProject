@@ -22,13 +22,16 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from .auth import verify_password
 from .config import Settings
 from .ai_analyzer import AIAnalysisError, analyze_plan_from_leg_data
+from .api import DashboardAPI
 from .database import Database, StoredLeg, StoredPlan
 from .domain import MarketType, PlanStatus, ResultStatus
 from .mail import render_stored_recommendation
+from .settings_store import SettingsRepository
 
 
 LOGGER = logging.getLogger("score_fourfold.web")
 MAX_FORM_BYTES = 4096
+MAX_JSON_BYTES = 32768
 REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{16,100}$")
 SESSION_TOKEN = re.compile(r"^[A-Za-z0-9_-]{40,100}$")
 COOKIE_NAME = "__Host-score_session"
@@ -218,6 +221,7 @@ class DashboardApplication:
         clock: Callable[[], datetime] | None = None,
         trigger_settle: Callable[[], tuple[str, str]] | None = None,
         trigger_settle_plan: Callable[[str], tuple[str, str]] | None = None,
+        settings_repository: SettingsRepository | None = None,
     ):
         self.settings = settings
         self.database = database
@@ -226,6 +230,7 @@ class DashboardApplication:
         self.wake_mailer = wake_mailer
         self.trigger_settle = trigger_settle
         self.trigger_settle_plan = trigger_settle_plan
+        self.settings_repository = settings_repository
         self.ticket_image_dir = Path(getattr(settings, "ticket_image_dir", "data/ticket-images"))
         self._clock = clock or (lambda: datetime.now(self.settings.timezone))
         self._secret = secret or secrets.token_bytes(32)
@@ -374,10 +379,17 @@ class DashboardApplication:
         """Start one plan's AI analysis in the background and return immediately."""
         if self.database.get_plan(plan_id) is None:
             return ("warn", f"计划 {plan_id} 不存在")
-        if not self.settings.ai_analysis_enabled:
-            return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
-        if not self.settings.qwen_api_key:
-            return ("warn", "未配置 QWEN_API_KEY")
+        if self.settings_repository is not None:
+            try:
+                if self.settings_repository.active_model_runtime() is None:
+                    return ("warn", "尚未启用可用的大模型，请先在设置中保存并通过调用测试")
+            except ValueError as exc:
+                return ("warn", f"大模型配置不可用：{exc}")
+        else:
+            if not self.settings.ai_analysis_enabled:
+                return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
+            if not self.settings.qwen_api_key:
+                return ("warn", "未配置 QWEN_API_KEY")
         started_at = self.now()
         with self._lock:
             current = self._analysis_tasks.get(plan_id)
@@ -605,10 +617,19 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
-        if not self.settings.ai_analysis_enabled:
-            return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
-        if not self.settings.qwen_api_key:
-            return ("warn", "未配置 QWEN_API_KEY")
+        ai_runtime = None
+        if self.settings_repository is not None:
+            try:
+                ai_runtime = self.settings_repository.active_model_runtime()
+            except ValueError as exc:
+                return ("warn", f"大模型配置不可用：{exc}")
+            if ai_runtime is None:
+                return ("warn", "尚未启用可用的大模型，请先在设置中保存并通过调用测试")
+        else:
+            if not self.settings.ai_analysis_enabled:
+                return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
+            if not self.settings.qwen_api_key:
+                return ("warn", "未配置 QWEN_API_KEY")
         if self.provider is not None:
             get_matches = getattr(self.provider, "get_matches", None)
             if callable(get_matches):
@@ -628,7 +649,12 @@ class DashboardApplication:
                 + "、".join(unavailable),
             )
         try:
-            analysis = analyze_plan_from_leg_data(plan.legs, plan.market, self.settings)
+            analysis = analyze_plan_from_leg_data(
+                plan.legs,
+                plan.market,
+                self.settings,
+                runtime=ai_runtime,
+            )
             stored = self.database.update_ai_analysis(
                 plan_id,
                 analysis.summary,
@@ -1503,6 +1529,9 @@ def _loopback_host(raw_host: str) -> bool:
 
 
 def build_handler(application: DashboardApplication):
+    dashboard_api = DashboardAPI(application)
+    dashboard_static = Path(__file__).with_name("static") / "dashboard"
+
     class DashboardHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "ScoreDashboard"
@@ -1570,6 +1599,39 @@ def build_handler(application: DashboardApplication):
             self._headers("text/plain; charset=utf-8", 0, headers)
             self.end_headers()
 
+        def _serve_dashboard_file(self, relative_path: str) -> bool:
+            target = (dashboard_static / relative_path).resolve()
+            static_root = dashboard_static.resolve()
+            if target != static_root and static_root not in target.parents:
+                self._send(404, "<h1>404</h1>")
+                return True
+            if not target.is_file():
+                return False
+            content_type = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".svg": "image/svg+xml",
+                ".png": "image/png",
+                ".webp": "image/webp",
+            }.get(target.suffix.lower(), "application/octet-stream")
+            payload = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store" if target.suffix == ".html" else "public, max-age=31536000, immutable")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "same-origin")
+            self.end_headers()
+            self.wfile.write(payload)
+            return True
+
         def _redirect(self, message: str, level: str) -> None:
             location = "/?" + urlencode({"message": message[:800], "level": level})
             self._redirect_to(location)
@@ -1577,13 +1639,155 @@ def build_handler(application: DashboardApplication):
         def _is_ajax(self) -> bool:
             return self.headers.get("X-Requested-With") == "XMLHttpRequest"
 
-        def _json_response(self, data: dict) -> None:
+        def _json_response(self, data: dict, status: int = 200) -> None:
             body = json.dumps(data, ensure_ascii=False)
             payload = body.encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self._headers("application/json; charset=utf-8", len(payload))
             self.end_headers()
             self.wfile.write(payload)
+
+        def _read_json(self) -> dict | None:
+            if self.headers.get_all("Transfer-Encoding", []):
+                self._json_response({"level": "error", "detail": "不支持分块请求"}, 400)
+                return None
+            raw_content_type = self._single_header("Content-Type", required=True)
+            if raw_content_type is None or raw_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                self._discard_request_body()
+                self._json_response({"level": "error", "detail": "请求必须使用 JSON"}, 415)
+                return None
+            raw_length = self._single_header("Content-Length", required=True)
+            if raw_length is None or not raw_length.isascii() or not raw_length.isdecimal():
+                self._json_response({"level": "error", "detail": "请求长度无效"}, 400)
+                return None
+            length = int(raw_length)
+            if length <= 0 or length > MAX_JSON_BYTES:
+                self._json_response({"level": "error", "detail": "请求内容为空或过大"}, 413)
+                return None
+            try:
+                raw_body = self.rfile.read(length)
+                if len(raw_body) != length:
+                    raise ValueError("incomplete body")
+                value = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                self._json_response({"level": "error", "detail": "JSON 格式无效"}, 400)
+                return None
+            if not isinstance(value, dict):
+                self._json_response({"level": "error", "detail": "JSON 根节点必须是对象"}, 400)
+                return None
+            return value
+
+        def _api_session(self) -> WebSession | None:
+            if not application.public_mode:
+                return None
+            authenticated = self._session()
+            return authenticated[1] if authenticated is not None else None
+
+        def _api_get(self, parsed) -> None:
+            session = self._api_session()
+            if application.public_mode and session is None:
+                self._json_response({"level": "error", "detail": "登录已失效"}, 401)
+                return
+            query = parse_qs(parsed.query, keep_blank_values=False)
+            try:
+                if parsed.path == "/api/v1/bootstrap":
+                    data = dashboard_api.bootstrap(session.csrf_token if session else "")
+                elif parsed.path == "/api/v1/plans":
+                    data = dashboard_api.plans(query)
+                elif parsed.path == "/api/v1/calendar":
+                    data = dashboard_api.calendar(query)
+                elif parsed.path == "/api/v1/settings":
+                    data = dashboard_api.settings()
+                elif parsed.path.startswith("/api/v1/tasks/"):
+                    task_id = parsed.path.removeprefix("/api/v1/tasks/")
+                    data = dashboard_api.task(task_id)
+                    if data is None:
+                        self._json_response({"level": "error", "detail": "任务不存在"}, 404)
+                        return
+                else:
+                    self._json_response({"level": "error", "detail": "接口不存在"}, 404)
+                    return
+            except (ValueError, RuntimeError) as exc:
+                self._json_response({"level": "error", "detail": str(exc)}, 400)
+                return
+            except Exception:
+                LOGGER.exception("dashboard API GET failed: %s", parsed.path)
+                self._json_response({"level": "error", "detail": "读取数据失败"}, 500)
+                return
+            self._json_response({"level": "ok", "data": data})
+
+        def _api_post(self, path: str) -> None:
+            session = self._api_session()
+            if application.public_mode and session is None:
+                self._discard_request_body()
+                self._json_response({"level": "error", "detail": "登录已失效"}, 401)
+                return
+            supplied_csrf = self._single_header("X-CSRF-Token", required=True)
+            expected_csrf = session.csrf_token if session is not None else "ssh-loopback"
+            if supplied_csrf is None or not hmac.compare_digest(supplied_csrf, expected_csrf):
+                self._discard_request_body()
+                self._json_response({"level": "error", "detail": "操作令牌无效，请刷新页面后重试"}, 403)
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                level, detail = "ok", "操作完成"
+                data: dict[str, object] = {}
+                if path == "/api/v1/actions/recommend":
+                    request_id = str(payload.get("request_id", ""))
+                    signature = str(payload.get("signature", ""))
+                    if not application.verify_request(request_id, signature):
+                        raise ValueError("推荐操作令牌无效，请刷新页面后重试")
+                    level, detail = application.queue_recommendation(request_id)
+                elif path == "/api/v1/actions/analyze-plan":
+                    level, detail = application.queue_ai_analysis(str(payload.get("plan_id", "")))
+                elif path == "/api/v1/actions/settle-plan":
+                    level, detail = application.queue_settle_plan(str(payload.get("plan_id", "")))
+                elif path == "/api/v1/actions/delete-plan":
+                    level, detail = application.trigger_delete_plan(str(payload.get("plan_id", "")))
+                elif path == "/api/v1/actions/delete-leg":
+                    level, detail = application.trigger_delete_leg(
+                        str(payload.get("plan_id", "")), str(payload.get("match_id", ""))
+                    )
+                elif path == "/api/v1/actions/update-leg":
+                    level, detail = application.trigger_update_leg(
+                        str(payload.get("plan_id", "")),
+                        str(payload.get("match_id", "")),
+                        str(payload.get("option_code", "")),
+                    )
+                elif path == "/api/v1/actions/mark-purchased":
+                    level, detail = application.trigger_mark_purchased(
+                        str(payload.get("plan_id", "")), bool(payload.get("purchased", False))
+                    )
+                elif path.startswith("/api/v1/settings/"):
+                    section = path.removeprefix("/api/v1/settings/")
+                    if section == "models":
+                        data = dashboard_api.save_model(payload)
+                        detail = "大模型配置已保存，请执行调用测试后启用"
+                    elif section == "model-test":
+                        task = dashboard_api.queue_model_test(str(payload.get("model_config_id", "")))
+                        data = dashboard_api.serialize_task(task)
+                        detail = task.detail
+                        level = task.level
+                    elif section == "model-delete":
+                        dashboard_api.delete_model(str(payload.get("model_config_id", "")))
+                        data = dashboard_api.settings()
+                        detail = "大模型配置已删除"
+                    else:
+                        data = dashboard_api.update_settings_section(section, payload)
+                        detail = "设置已保存并立即生效"
+                else:
+                    self._json_response({"level": "error", "detail": "接口不存在"}, 404)
+                    return
+            except (ValueError, RuntimeError) as exc:
+                self._json_response({"level": "error", "detail": str(exc)}, 400)
+                return
+            except Exception:
+                LOGGER.exception("dashboard API POST failed: %s", path)
+                self._json_response({"level": "error", "detail": "操作失败，请查看服务日志"}, 500)
+                return
+            self._json_response({"level": level, "detail": detail, "data": data})
 
         def _respond_action(
             self,
@@ -1906,6 +2110,13 @@ def build_handler(application: DashboardApplication):
             if not self._request_envelope_ok():
                 self._send(403, "<h1>403</h1><p>请求地址或HTTPS代理校验失败。</p>")
                 return
+            if parsed.path.startswith("/api/v1/"):
+                self._api_get(parsed)
+                return
+            if parsed.path.startswith("/assets/"):
+                if not self._serve_dashboard_file(parsed.path.lstrip("/")):
+                    self._send(404, "<h1>404</h1>")
+                return
             # Serve ticket images
             if parsed.path.startswith("/tickets/"):
                 self._serve_ticket_image(parsed.path[len("/tickets/"):])
@@ -1916,7 +2127,7 @@ def build_handler(application: DashboardApplication):
                     return
                 self._send(200, application.render_login())
                 return
-            if parsed.path != "/":
+            if parsed.path not in {"/", "/legacy"}:
                 self._send(404, "<h1>404</h1>")
                 return
             session: WebSession | None = None
@@ -1926,6 +2137,8 @@ def build_handler(application: DashboardApplication):
                     self._redirect_to("/login")
                     return
                 _, session = authenticated
+            if parsed.path == "/" and self._serve_dashboard_file("index.html"):
+                return
             query = parse_qs(parsed.query, keep_blank_values=False)
             message = query.get("message", [""])[0]
             level = query.get("level", ["ok"])[0]
@@ -1950,6 +2163,16 @@ def build_handler(application: DashboardApplication):
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            if path.startswith("/api/v1/"):
+                if not self._request_envelope_ok() or not self._state_origin_ok():
+                    self._discard_request_body()
+                    self._json_response(
+                        {"level": "error", "detail": "请求地址、HTTPS代理或来源校验失败"},
+                        403,
+                    )
+                    return
+                self._api_post(path)
+                return
             if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/settle-plan", "/actions/mark-purchased", "/actions/upload-ticket"}:
                 self._discard_request_body()
                 self._send(404, "<h1>404</h1>", close=True)

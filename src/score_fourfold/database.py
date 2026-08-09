@@ -5,7 +5,7 @@ import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -1061,6 +1061,155 @@ class Database:
             ).fetchall()
             plans = [self._load_plan(connection, row) for row in rows]
             return plans, total
+
+    @staticmethod
+    def _filtered_plan_where(filters: dict[str, object]) -> tuple[str, list[object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        market = str(filters.get("market", "")).strip().lower()
+        if market:
+            if market not in {item.value for item in MarketType}:
+                raise ValueError("invalid market filter")
+            clauses.append("p.market = ?")
+            params.append(market)
+        status = str(filters.get("status", "")).strip().lower()
+        if status:
+            if status not in {item.value for item in PlanStatus}:
+                raise ValueError("invalid status filter")
+            clauses.append("p.status = ?")
+            params.append(status)
+        recommendation_date = str(filters.get("date", "")).strip()
+        if recommendation_date:
+            try:
+                date.fromisoformat(recommendation_date)
+            except ValueError as exc:
+                raise ValueError("invalid date filter") from exc
+            clauses.append("p.recommendation_date = ?")
+            params.append(recommendation_date)
+        purchased = filters.get("purchased")
+        if purchased is not None and purchased != "":
+            if purchased not in {True, False, 0, 1, "0", "1"}:
+                raise ValueError("invalid purchased filter")
+            clauses.append("p.purchased = ?")
+            params.append(1 if purchased in {True, 1, "1"} else 0)
+        search = str(filters.get("q", "")).strip()
+        if search:
+            clauses.append(
+                """
+                (p.plan_id LIKE ? ESCAPE '\\'
+                 OR EXISTS (
+                    SELECT 1 FROM plan_legs search_leg
+                    WHERE search_leg.plan_id = p.plan_id
+                      AND (search_leg.match_num LIKE ? ESCAPE '\\'
+                           OR search_leg.league LIKE ? ESCAPE '\\'
+                           OR search_leg.home LIKE ? ESCAPE '\\'
+                           OR search_leg.away LIKE ? ESCAPE '\\')
+                 ))
+                """
+            )
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            params.extend([pattern] * 5)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return where, params
+
+    def filtered_plans(
+        self,
+        filters: dict[str, object],
+        *,
+        page: int,
+        per_page: int,
+    ) -> tuple[list[StoredPlan], int]:
+        safe_page = max(1, page)
+        safe_per_page = max(1, min(per_page, 50))
+        offset = (safe_page - 1) * safe_per_page
+        where, params = self._filtered_plan_where(filters)
+        with self.connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) AS count FROM plans p{where}",
+                    params,
+                ).fetchone()["count"]
+            )
+            rows = connection.execute(
+                f"SELECT p.* FROM plans p{where} ORDER BY p.created_at DESC LIMIT ? OFFSET ?",
+                [*params, safe_per_page, offset],
+            ).fetchall()
+            return [self._load_plan(connection, row) for row in rows], total
+
+    def filtered_summary(self, filters: dict[str, object]) -> dict[str, int | str]:
+        where, params = self._filtered_plan_where(filters)
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN p.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                       SUM(CASE WHEN p.status = 'won' THEN 1 ELSE 0 END) AS won,
+                       SUM(CASE WHEN p.status = 'lost' THEN 1 ELSE 0 END) AS lost,
+                       SUM(CASE WHEN p.status = 'void' THEN 1 ELSE 0 END) AS voided,
+                       SUM(CASE WHEN p.purchased = 1 THEN 1 ELSE 0 END) AS purchased,
+                       COALESCE(SUM(p.stake_cents), 0) AS stake_cents,
+                       COALESCE(SUM(CASE WHEN p.status != 'pending'
+                           THEN p.settled_net_prize_cents ELSE 0 END), 0) AS return_cents,
+                       COALESCE(SUM(CASE WHEN p.status != 'pending'
+                           THEN p.net_profit_cents ELSE 0 END), 0) AS profit_cents
+                FROM plans p{where}
+                """,
+                params,
+            ).fetchone()
+        return {
+            "plans_total": int(row["total"] or 0),
+            "plans_pending": int(row["pending"] or 0),
+            "plans_won": int(row["won"] or 0),
+            "plans_lost": int(row["lost"] or 0),
+            "plans_void": int(row["voided"] or 0),
+            "plans_purchased": int(row["purchased"] or 0),
+            "stake": str(_money(row["stake_cents"] or 0)),
+            "return": str(_money(row["return_cents"] or 0)),
+            "profit": str(_money(row["profit_cents"] or 0)),
+        }
+
+    def filtered_calendar_stats(
+        self,
+        year: int,
+        month: int,
+        filters: dict[str, object],
+    ) -> dict[str, dict[str, int]]:
+        if month < 1 or month > 12 or year < 2000 or year > 2100:
+            raise ValueError("invalid calendar month")
+        calendar_filters = dict(filters)
+        calendar_filters.pop("date", None)
+        where, params = self._filtered_plan_where(calendar_filters)
+        month_clause = "strftime('%Y-%m', p.recommendation_date) = ?"
+        if where:
+            where += " AND " + month_clause
+        else:
+            where = " WHERE " + month_clause
+        params.append(f"{year:04d}-{month:02d}")
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.recommendation_date,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN p.status = 'won' THEN 1 ELSE 0 END) AS won,
+                       SUM(CASE WHEN p.status = 'lost' THEN 1 ELSE 0 END) AS lost,
+                       SUM(CASE WHEN p.status = 'void' THEN 1 ELSE 0 END) AS voided,
+                       SUM(CASE WHEN p.status = 'pending' THEN 1 ELSE 0 END) AS pending
+                FROM plans p{where}
+                GROUP BY p.recommendation_date
+                """,
+                params,
+            ).fetchall()
+        return {
+            row["recommendation_date"]: {
+                "total": int(row["total"]),
+                "won": int(row["won"] or 0),
+                "lost": int(row["lost"] or 0),
+                "void": int(row["voided"] or 0),
+                "pending": int(row["pending"] or 0),
+            }
+            for row in rows
+        }
 
     def calendar_stats(self, year: int, month: int) -> dict[str, dict[str, int]]:
         """Return daily plan statistics for a given year-month.

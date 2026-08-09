@@ -51,6 +51,16 @@ class ScoreFourfoldService:
     def now(self) -> datetime:
         return self._clock().astimezone(self.settings.timezone)
 
+    def refresh_runtime_settings(self) -> Settings:
+        if self.settings_repository is None:
+            return self.settings
+        current = self.settings_repository.effective_settings()
+        self.settings = current
+        if hasattr(self.provider, "settings"):
+            self.provider.settings = current
+        self.mailer.settings = current
+        return current
+
     def _recommendation_mail_cutoff(self, day: date) -> datetime:
         deadline = datetime.combine(day, self.settings.recommendation_deadline, tzinfo=self.settings.timezone)
         return deadline - timedelta(minutes=self.settings.recommendation_send_buffer_minutes)
@@ -71,12 +81,14 @@ class ScoreFourfoldService:
 
     def recommend(self, now: datetime) -> JobOutcome:
         with self._recommend_lock:
+            self.refresh_runtime_settings()
             return self._recommend_locked(now)
 
     def try_recommend(self, now: datetime) -> JobOutcome:
         if not self._recommend_lock.acquire(blocking=False):
             return JobOutcome("busy", "推荐任务正在执行，请稍后刷新页面查看结果")
         try:
+            self.refresh_runtime_settings()
             return self._recommend_locked(now)
         finally:
             self._recommend_lock.release()
@@ -118,6 +130,14 @@ class ScoreFourfoldService:
                 f"推荐日{recommendation_date}已有{market.label_zh}计划，未重复生成",
             )
         remaining = max(0, market_limit - existing_count)
+        ai_runtime = None
+        if self.settings_repository is not None:
+            try:
+                ai_runtime = self.settings_repository.active_model_runtime()
+            except Exception:
+                # A model or secret configuration problem must never block the
+                # core recommendation flow.
+                ai_runtime = None
         selections = select_market_plans(
             matches,
             wall_after_fetch,
@@ -126,6 +146,7 @@ class ScoreFourfoldService:
             min_pass_size=profile.min_pass_size,
             max_pass_size=profile.max_pass_size,
             plan_count=remaining,
+            ai_runtime=ai_runtime,
         )
         created_plans: list[str] = []
         no_recommendation_reasons: list[str] = []
@@ -229,6 +250,7 @@ class ScoreFourfoldService:
         return JobOutcome("no-recommendation", details)
 
     def finalize_recommendation_day(self, now: datetime) -> JobOutcome:
+        self.refresh_runtime_settings()
         wall_now = self.now()
         deadline = datetime.combine(
             wall_now.date(), self.settings.recommendation_deadline, tzinfo=self.settings.timezone
@@ -351,6 +373,7 @@ class ScoreFourfoldService:
 
     def settle_plan(self, plan_id: str, now: datetime | None = None) -> JobOutcome:
         """Update and settle exactly one plan, with an official-page fallback."""
+        self.refresh_runtime_settings()
         wall_now = (now or self.now()).astimezone(self.settings.timezone)
         plan = self.database.get_plan(plan_id)
         if plan is None:
@@ -425,6 +448,7 @@ class ScoreFourfoldService:
         )
 
     def settle(self, now: datetime) -> JobOutcome:
+        self.refresh_runtime_settings()
         plans = self.database.pending_plans()
         if not plans:
             return JobOutcome("idle", "没有待结算计划")
@@ -479,11 +503,13 @@ class ScoreFourfoldService:
         return JobOutcome("ok", detail)
 
     def send_mail(self, now: datetime) -> JobOutcome:
+        self.refresh_runtime_settings()
         sent, failed = flush_outbox(self.database, self.mailer, now)
         status = "ok" if failed == 0 else "partial"
         return JobOutcome(status, f"邮件发送{sent}封，失败{failed}封")
 
     def test_mail(self, now: datetime) -> JobOutcome:
+        self.refresh_runtime_settings()
         subject, text_body, html_body = render_mail_test(now)
         self.mailer.send(
             email_id=0,

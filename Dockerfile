@@ -1,3 +1,11 @@
+FROM node:22-alpine AS frontend
+
+WORKDIR /frontend
+COPY frontend/package.json ./
+RUN npm install --no-audit --no-fund
+COPY frontend ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,6 +24,7 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY --from=frontend /frontend/dist ./src/score_fourfold/static/dashboard
 COPY examples ./examples
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

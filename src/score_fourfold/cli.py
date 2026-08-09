@@ -405,6 +405,7 @@ def main(argv: list[str] | None = None) -> None:
                         wake_mailer=wake_event.set,
                         trigger_settle=_build_settle_trigger(service),
                         trigger_settle_plan=_build_settle_plan_trigger(service),
+                        settings_repository=service.settings_repository,
                     )
                     dashboard_server = DashboardServer(settings, application)
                     dashboard_server.start()
@@ -417,11 +418,12 @@ def main(argv: list[str] | None = None) -> None:
                     LOGGER.info("个人看板已监听 %s:%s（%s）", host, port, access_note)
 
                 while not stop_event.is_set():
-                    cycle_now = datetime.now(settings.timezone)
+                    runtime_settings = service.refresh_runtime_settings()
+                    cycle_now = datetime.now(runtime_settings.timezone)
                     slot = due_recommendation_slot(
                         cycle_now,
-                        settings.recommendation_times,
-                        settings.recommendation_latest_start,
+                        runtime_settings.recommendation_times,
+                        runtime_settings.recommendation_latest_start,
                         service.database.has_job_run,
                     )
                     recommend_job_name = (
@@ -429,7 +431,7 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     finalize_job_name = f"recommend-finalize:{cycle_now:%Y%m%d}"
                     include_finalize = (
-                        cycle_now.timetz().replace(tzinfo=None) >= settings.recommendation_deadline
+                        cycle_now.timetz().replace(tzinfo=None) >= runtime_settings.recommendation_deadline
                         and not service.database.has_job_run(finalize_job_name)
                     )
                     _run_cycle(
@@ -443,11 +445,11 @@ def main(argv: list[str] | None = None) -> None:
                     if args.once:
                         break
                     wait_seconds = seconds_until_next_event(
-                        datetime.now(settings.timezone),
-                        settings.recommendation_times,
-                        settings.recommendation_deadline,
-                        settings.poll_interval_seconds,
-                        settings.recommendation_first_mail_time,
+                        datetime.now(runtime_settings.timezone),
+                        runtime_settings.recommendation_times,
+                        runtime_settings.recommendation_deadline,
+                        runtime_settings.poll_interval_seconds,
+                        runtime_settings.recommendation_first_mail_time,
                     )
                     wake_event.wait(wait_seconds)
                     wake_event.clear()

@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 
 from .ai_analyzer import analyze_matches
+from .ai_models import AIModelRuntime
 from .analyzer import analyze_had_options, analyze_score_options, estimate_expected_goals
 from .config import Settings
 from .domain import MarketType, Match, Recommendation, ScoreOption, SelectedLeg
@@ -205,6 +206,7 @@ def _build_recommendation(
     inspected: int,
     *,
     market: MarketType,
+    ai_runtime: AIModelRuntime | None = None,
 ) -> SelectionResult:
     joint_probability, combined_odds, raw_combination = selected
     combination = tuple(sorted(raw_combination, key=lambda item: (item[0].start_at, item[0].match_num)))
@@ -279,8 +281,8 @@ def _build_recommendation(
     if len(days) > 1:
         notes.append("本计划包含两个比赛编号日期，必须在最早一场停止销售前一次性到实体终端确认并购买")
     ai_summary = ""
-    if settings.ai_analysis_enabled:
-        ai_summary = analyze_matches(combination, market, settings)
+    if settings.ai_analysis_enabled or ai_runtime is not None:
+        ai_summary = analyze_matches(combination, market, settings, ai_runtime)
     recommendation = Recommendation(
         plan_id=plan_id,
         business_date=issue_date,
@@ -395,6 +397,7 @@ def select_market_plans(
     min_pass_size: int,
     max_pass_size: int,
     plan_count: int,
+    ai_runtime: AIModelRuntime | None = None,
 ) -> list[SelectionResult]:
     """Generate unique plans at the highest currently available pass size."""
     if now.tzinfo is None:
@@ -445,6 +448,7 @@ def select_market_plans(
                     len(candidates),
                     inspected,
                     market=market,
+                    ai_runtime=ai_runtime,
                 )
                 for selected in valid_combinations[:plan_count]
             ]

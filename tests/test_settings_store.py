@@ -121,6 +121,131 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(meta, [])
         self.assertEqual([row["email"] for row in recipients], ["keep@example.com"])
 
+    def test_model_is_activated_only_after_required_web_search_test_passes(self):
+        master_key = Fernet.generate_key().decode("ascii")
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            qwen_api_key="legacy-key",
+            settings_master_key=master_key,
+        )
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        new_id = repository.save_model_config(
+            provider="qwen",
+            display_name="备用千问",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+            model_name="qwen3.7-max",
+            api_key="new-key",
+            now=self.now,
+        )
+        called: list[str] = []
+
+        def passing(runtime, _timeout):
+            called.append(runtime.config_id)
+            return "测试通过"
+
+        success, detail = repository.test_and_activate_model(
+            new_id,
+            tester=passing,
+            now=self.now,
+        )
+        self.assertTrue(success)
+        self.assertEqual(detail, "测试通过")
+        self.assertEqual(called, [new_id])
+        snapshot = repository.public_snapshot()
+        self.assertEqual(snapshot["ai"]["active_model_config_id"], new_id)
+        self.assertEqual(
+            [model["last_test_status"] for model in snapshot["ai"]["models"] if model["id"] == new_id],
+            ["passed"],
+        )
+
+    def test_failed_or_unsupported_model_test_keeps_previous_active_model(self):
+        master_key = Fernet.generate_key().decode("ascii")
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            qwen_api_key="legacy-key",
+            settings_master_key=master_key,
+        )
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        deepseek_id = repository.save_model_config(
+            provider="deepseek",
+            display_name="DeepSeek",
+            base_url="https://api.deepseek.com/chat/completions",
+            model_name="deepseek-v4-flash",
+            api_key="ds-key",
+            now=self.now,
+        )
+        success, detail = repository.test_and_activate_model(
+            deepseek_id,
+            tester=lambda *_: self.fail("unsupported provider must fail before network"),
+            now=self.now,
+        )
+        self.assertFalse(success)
+        self.assertIn("强制联网搜索", detail)
+        snapshot = repository.public_snapshot()
+        self.assertEqual(snapshot["ai"]["active_model_config_id"], "legacy-qwen")
+        failed = next(model for model in snapshot["ai"]["models"] if model["id"] == deepseek_id)
+        self.assertEqual(failed["last_test_status"], "failed")
+
+    def test_updates_business_settings_and_exposes_effective_runtime(self):
+        settings = make_settings(self.root, database_path=self.database_path)
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        repository.update_recommendation_profiles(
+            {
+                "crs": {"enabled": True, "min_pass_size": 2, "max_pass_size": 3, "plan_count": 2},
+                "had": {"enabled": False, "min_pass_size": 4, "max_pass_size": 6, "plan_count": 1},
+                "ttg": {"enabled": True, "min_pass_size": 2, "max_pass_size": 4, "plan_count": 2},
+            },
+            now=self.now,
+        )
+        repository.update_recipients(["one@example.com", "two@example.com"])
+        repository.update_runtime_settings(
+            {
+                "recommendation_times": ["09:30", "14:30"],
+                "recommendation_first_mail_time": "15:00",
+                "recommendation_latest_start": "17:30",
+                "recommendation_deadline": "18:00",
+                "recommendation_send_buffer_minutes": 10,
+                "poll_interval_seconds": 600,
+                "result_check_delay_minutes": 180,
+                "send_no_recommendation": False,
+            },
+            now=self.now,
+        )
+        effective = repository.effective_settings()
+        snapshot = repository.public_snapshot()
+        self.assertEqual(effective.mail_to, "one@example.com,two@example.com")
+        self.assertEqual([value.strftime("%H:%M") for value in effective.recommendation_times], ["09:30", "14:30"])
+        self.assertEqual(effective.poll_interval_seconds, 600)
+        self.assertEqual(effective.result_check_delay_minutes, 180)
+        self.assertFalse(effective.send_no_recommendation)
+        self.assertEqual(snapshot["profiles"]["crs"]["plan_count"], 2)
+        self.assertTrue(snapshot["profiles"]["ttg"]["enabled"])
+
+    def test_rejects_invalid_runtime_order_without_changing_existing_values(self):
+        settings = make_settings(self.root, database_path=self.database_path)
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        before = repository.public_snapshot()["runtime"]
+        with self.assertRaises(ValueError):
+            repository.update_runtime_settings(
+                {
+                    "recommendation_times": ["17:50"],
+                    "recommendation_first_mail_time": "15:00",
+                    "recommendation_latest_start": "17:45",
+                    "recommendation_deadline": "18:00",
+                    "recommendation_send_buffer_minutes": 10,
+                    "poll_interval_seconds": 600,
+                    "result_check_delay_minutes": 180,
+                    "send_no_recommendation": True,
+                }
+            )
+        self.assertEqual(repository.public_snapshot()["runtime"], before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,5 +21,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+score_fourfold = ["static/dashboard/*", "static/dashboard/assets/*"]
+
 [tool.unittest]
 start-directory = "tests"

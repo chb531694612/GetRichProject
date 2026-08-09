@@ -4,12 +4,20 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
-from datetime import datetime
+import secrets
+from dataclasses import dataclass, replace
+from datetime import datetime, time, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .ai_models import (
+    AIModelRuntime,
+    PROVIDER_BY_CODE,
+    test_model,
+    validate_runtime,
+)
 from .config import Settings
 from .database import Database
 from .domain import MarketType
@@ -303,6 +311,215 @@ class SettingsRepository:
             for row in rows
         }
 
+    def update_recommendation_profiles(
+        self,
+        values: dict[str, dict[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        expected = {item.value for item in MarketType}
+        if set(values) != expected:
+            raise ValueError("必须同时提交比分、胜平负和进球数配置")
+        profiles: list[RecommendationProfile] = []
+        for market in MarketType:
+            raw = values[market.value]
+            enabled = raw.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError(f"{market.label_zh}启用状态无效")
+            try:
+                minimum = int(raw.get("min_pass_size"))
+                maximum = int(raw.get("max_pass_size"))
+                plan_count = int(raw.get("plan_count"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{market.label_zh}串关配置必须是整数") from exc
+            if minimum < 2 or maximum > 8 or minimum > maximum:
+                raise ValueError(f"{market.label_zh}串关范围必须在2至8之间")
+            if plan_count < 1 or plan_count > 20:
+                raise ValueError(f"{market.label_zh}生成计划数必须在1至20之间")
+            profiles.append(
+                RecommendationProfile(
+                    market.value,
+                    enabled,
+                    minimum,
+                    maximum,
+                    plan_count,
+                )
+            )
+        if not any(profile.enabled for profile in profiles):
+            raise ValueError("至少启用一种推荐类型")
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for profile in profiles:
+                connection.execute(
+                    """
+                    UPDATE recommendation_profiles
+                    SET enabled = ?, min_pass_size = ?, max_pass_size = ?,
+                        plan_count = ?, updated_at = ?
+                    WHERE market = ?
+                    """,
+                    (
+                        int(profile.enabled),
+                        profile.min_pass_size,
+                        profile.max_pass_size,
+                        profile.plan_count,
+                        timestamp,
+                        profile.market,
+                    ),
+                )
+
+    def update_recipients(self, recipients: list[str]) -> None:
+        normalized = self._split_recipients(",".join(recipients))
+        if not normalized:
+            raise ValueError("至少配置一个推送邮箱")
+        if len(normalized) > 20:
+            raise ValueError("推送邮箱不能超过20个")
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM email_recipients")
+            for position, email in enumerate(normalized):
+                connection.execute(
+                    "INSERT INTO email_recipients (email, enabled, position) VALUES (?, 1, ?)",
+                    (email, position),
+                )
+
+    def update_mail_settings(
+        self,
+        values: dict[str, Any],
+        *,
+        new_auth_code: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        host = str(values.get("smtp_host", "")).strip()
+        username = str(values.get("smtp_username", "")).strip()
+        mail_from = str(values.get("mail_from", "")).strip()
+        dry_run = values.get("mail_dry_run")
+        try:
+            port = int(values.get("smtp_port"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SMTP端口必须是整数") from exc
+        if not host or len(host) > 253 or port < 1 or port > 65535:
+            raise ValueError("SMTP服务器或端口无效")
+        if not isinstance(dry_run, bool):
+            raise ValueError("邮件预览开关无效")
+        if mail_from and not EMAIL.fullmatch(mail_from.lower()):
+            raise ValueError("发件邮箱格式无效")
+        with self.database.connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM notification_settings WHERE singleton_id = 1"
+            ).fetchone()
+        if current is None:
+            raise RuntimeError("settings have not been initialized")
+        ciphertext = current["smtp_auth_ciphertext"]
+        env_name = current["smtp_auth_env"]
+        if new_auth_code:
+            if self._cipher is None:
+                raise ValueError("保存新的 SMTP 授权码前必须配置 SETTINGS_MASTER_KEY")
+            ciphertext = self._cipher.encrypt(new_auth_code.strip())
+            env_name = ""
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE notification_settings
+                SET smtp_host = ?, smtp_port = ?, smtp_username = ?,
+                    smtp_auth_ciphertext = ?, smtp_auth_env = ?, mail_from = ?,
+                    mail_dry_run = ?, updated_at = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    host,
+                    port,
+                    username,
+                    ciphertext,
+                    env_name,
+                    mail_from,
+                    int(dry_run),
+                    timestamp,
+                ),
+            )
+
+    @staticmethod
+    def _parse_clock(value: Any, field: str) -> time:
+        try:
+            parsed = time.fromisoformat(str(value))
+        except ValueError as exc:
+            raise ValueError(f"{field}必须是HH:MM格式") from exc
+        return parsed.replace(second=0, microsecond=0)
+
+    def update_runtime_settings(
+        self,
+        values: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        raw_times = values.get("recommendation_times")
+        if not isinstance(raw_times, list) or not raw_times:
+            raise ValueError("至少配置一个推荐生成时间")
+        recommendation_times = sorted(
+            {self._parse_clock(value, "推荐生成时间") for value in raw_times}
+        )
+        first_mail = self._parse_clock(
+            values.get("recommendation_first_mail_time"),
+            "首封邮件时间",
+        )
+        latest_start = self._parse_clock(
+            values.get("recommendation_latest_start"),
+            "最迟生成时间",
+        )
+        deadline = self._parse_clock(values.get("recommendation_deadline"), "最迟推送时间")
+        try:
+            buffer_minutes = int(values.get("recommendation_send_buffer_minutes"))
+            poll_seconds = int(values.get("poll_interval_seconds"))
+            result_delay = int(values.get("result_check_delay_minutes"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("运行时间配置必须是整数") from exc
+        send_no_recommendation = values.get("send_no_recommendation")
+        if not isinstance(send_no_recommendation, bool):
+            raise ValueError("无推荐通知开关无效")
+        if buffer_minutes < 0 or buffer_minutes > 120:
+            raise ValueError("邮件安全缓冲必须在0至120分钟之间")
+        if poll_seconds < 60 or poll_seconds > 86400:
+            raise ValueError("轮询间隔必须在60至86400秒之间")
+        if result_delay < 90 or result_delay > 1440:
+            raise ValueError("赛果检查延迟必须在90至1440分钟之间")
+        base = datetime(2000, 1, 1)
+        first_dt = datetime.combine(base.date(), first_mail)
+        latest_dt = datetime.combine(base.date(), latest_start)
+        deadline_dt = datetime.combine(base.date(), deadline)
+        cutoff_dt = deadline_dt - timedelta(minutes=buffer_minutes)
+        last_slot_dt = datetime.combine(base.date(), recommendation_times[-1])
+        if last_slot_dt >= latest_dt or latest_dt >= deadline_dt:
+            raise ValueError("最后生成时间必须早于最迟生成时间，且最迟生成必须早于推送截止")
+        if first_dt >= cutoff_dt or last_slot_dt >= cutoff_dt:
+            raise ValueError("首封邮件和最后生成时间必须早于邮件安全截止")
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE runtime_settings
+                SET recommendation_times_json = ?, recommendation_first_mail_time = ?,
+                    recommendation_latest_start = ?, recommendation_deadline = ?,
+                    recommendation_send_buffer_minutes = ?, poll_interval_seconds = ?,
+                    result_check_delay_minutes = ?, send_no_recommendation = ?,
+                    updated_at = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    json.dumps([self._time_text(value) for value in recommendation_times]),
+                    self._time_text(first_mail),
+                    self._time_text(latest_start),
+                    self._time_text(deadline),
+                    buffer_minutes,
+                    poll_seconds,
+                    result_delay,
+                    int(send_no_recommendation),
+                    timestamp,
+                ),
+            )
+
     def public_snapshot(self) -> dict[str, Any]:
         with self.database.connect() as connection:
             meta = connection.execute(
@@ -389,9 +606,259 @@ class SettingsRepository:
             "secret_storage_ready": self._cipher is not None,
         }
 
+    def effective_settings(self) -> Settings:
+        with self.database.connect() as connection:
+            recipients = connection.execute(
+                "SELECT email FROM email_recipients WHERE enabled = 1 ORDER BY position, id"
+            ).fetchall()
+            notification = connection.execute(
+                "SELECT * FROM notification_settings WHERE singleton_id = 1"
+            ).fetchone()
+            runtime = connection.execute(
+                "SELECT * FROM runtime_settings WHERE singleton_id = 1"
+            ).fetchone()
+            ai_runtime = connection.execute(
+                "SELECT * FROM ai_runtime_settings WHERE singleton_id = 1"
+            ).fetchone()
+        if notification is None or runtime is None or ai_runtime is None:
+            return self.legacy
+        recommendation_times = tuple(
+            self._parse_clock(value, "推荐生成时间")
+            for value in json.loads(runtime["recommendation_times_json"])
+        )
+        values: dict[str, Any] = {
+            "mail_to": ",".join(row["email"] for row in recipients),
+            "smtp_host": notification["smtp_host"],
+            "smtp_port": int(notification["smtp_port"]),
+            "smtp_username": notification["smtp_username"],
+            "smtp_auth_code": self.resolve_secret(
+                notification["smtp_auth_ciphertext"],
+                notification["smtp_auth_env"],
+            ),
+            "mail_from": notification["mail_from"],
+            "mail_dry_run": bool(notification["mail_dry_run"]),
+            "recommendation_times": recommendation_times,
+            "recommendation_first_mail_time": self._parse_clock(
+                runtime["recommendation_first_mail_time"], "首封邮件时间"
+            ),
+            "recommendation_latest_start": self._parse_clock(
+                runtime["recommendation_latest_start"], "最迟生成时间"
+            ),
+            "recommendation_deadline": self._parse_clock(
+                runtime["recommendation_deadline"], "最迟推送时间"
+            ),
+            "recommendation_send_buffer_minutes": int(
+                runtime["recommendation_send_buffer_minutes"]
+            ),
+            "poll_interval_seconds": int(runtime["poll_interval_seconds"]),
+            "result_check_delay_minutes": int(runtime["result_check_delay_minutes"]),
+            "send_no_recommendation": bool(runtime["send_no_recommendation"]),
+            "ai_analysis_enabled": bool(ai_runtime["enabled"]),
+            "ai_http_timeout_seconds": int(ai_runtime["http_timeout_seconds"]),
+        }
+        active_id = ai_runtime["active_model_config_id"]
+        if active_id:
+            model = self.model_runtime(active_id)
+            values.update(
+                qwen_api_key=model.api_key,
+                qwen_api_url=model.base_url,
+                qwen_model=model.model_name,
+            )
+        return replace(self.legacy, **values)
+
     def resolve_secret(self, ciphertext: str, env_name: str) -> str:
         if ciphertext:
             if self._cipher is None:
                 raise ValueError("SETTINGS_MASTER_KEY is required to decrypt stored secrets")
             return self._cipher.decrypt(ciphertext)
         return os.getenv(env_name, "").strip() if env_name else ""
+
+    def model_runtime(self, model_config_id: str) -> AIModelRuntime:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_model_configs WHERE model_config_id = ?",
+                (model_config_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("模型配置不存在")
+        return AIModelRuntime(
+            config_id=row["model_config_id"],
+            provider=row["provider"],
+            base_url=row["base_url"],
+            model_name=row["model_name"],
+            api_key=self.resolve_secret(
+                row["api_key_ciphertext"],
+                row["api_key_env"],
+            ),
+        )
+
+    def active_model_runtime(self) -> AIModelRuntime | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT enabled, active_model_config_id FROM ai_runtime_settings WHERE singleton_id = 1"
+            ).fetchone()
+        if row is None or not bool(row["enabled"]) or not row["active_model_config_id"]:
+            return None
+        return self.model_runtime(row["active_model_config_id"])
+
+    def save_model_config(
+        self,
+        *,
+        provider: str,
+        display_name: str,
+        base_url: str,
+        model_name: str,
+        api_key: str = "",
+        model_config_id: str = "",
+        now: datetime | None = None,
+    ) -> str:
+        provider = provider.strip().lower()
+        spec = PROVIDER_BY_CODE.get(provider)
+        if spec is None:
+            raise ValueError("不支持的大模型供应商")
+        display_name = display_name.strip() or spec.name
+        base_url = base_url.strip()
+        model_name = model_name.strip()
+        if len(display_name) > 80 or len(model_name) > 160 or len(base_url) > 500:
+            raise ValueError("模型配置字段过长")
+        config_id = model_config_id.strip() or secrets.token_urlsafe(12)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", config_id):
+            raise ValueError("模型配置 ID 无效")
+
+        existing = None
+        with self.database.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM ai_model_configs WHERE model_config_id = ?",
+                (config_id,),
+            ).fetchone()
+        if model_config_id and existing is None:
+            raise ValueError("模型配置不存在")
+
+        api_key_ciphertext = existing["api_key_ciphertext"] if existing else ""
+        api_key_env = existing["api_key_env"] if existing else ""
+        if api_key:
+            if self._cipher is None:
+                raise ValueError("保存新的 API Key 前必须配置 SETTINGS_MASTER_KEY")
+            api_key_ciphertext = self._cipher.encrypt(api_key.strip())
+            api_key_env = ""
+        runtime_key = api_key.strip() or self.resolve_secret(api_key_ciphertext, api_key_env)
+        runtime = AIModelRuntime(config_id, provider, base_url, model_name, runtime_key)
+        # Saving may include providers that cannot yet be activated, but URL,
+        # model and credential shape must still be safe and complete.
+        parsed_url = urlsplit(base_url)
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.netloc
+            or parsed_url.username
+            or parsed_url.password
+            or not model_name
+        ):
+            raise ValueError("模型 API 地址必须使用 HTTPS，且模型名不能为空")
+        if not runtime.api_key:
+            raise ValueError("API Key 未配置")
+
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO ai_model_configs
+                        (model_config_id, provider, display_name, base_url, model_name,
+                         api_key_ciphertext, api_key_env, web_search_required,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        config_id,
+                        provider,
+                        display_name,
+                        base_url,
+                        model_name,
+                        api_key_ciphertext,
+                        api_key_env,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE ai_model_configs
+                    SET provider = ?, display_name = ?, base_url = ?, model_name = ?,
+                        api_key_ciphertext = ?, api_key_env = ?,
+                        last_test_status = 'untested', last_test_detail = '',
+                        last_tested_at = NULL, updated_at = ?
+                    WHERE model_config_id = ?
+                    """,
+                    (
+                        provider,
+                        display_name,
+                        base_url,
+                        model_name,
+                        api_key_ciphertext,
+                        api_key_env,
+                        timestamp,
+                        config_id,
+                    ),
+                )
+        return config_id
+
+    def test_and_activate_model(
+        self,
+        model_config_id: str,
+        *,
+        tester=test_model,
+        now: datetime | None = None,
+    ) -> tuple[bool, str]:
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        runtime = self.model_runtime(model_config_id)
+        try:
+            validate_runtime(runtime)
+            detail = str(tester(runtime, self.legacy.ai_http_timeout_seconds))
+            success = True
+        except Exception as exc:
+            detail = str(exc)[:500] or type(exc).__name__
+            success = False
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE ai_model_configs
+                SET last_test_status = ?, last_test_detail = ?,
+                    last_tested_at = ?, updated_at = ?
+                WHERE model_config_id = ?
+                """,
+                (
+                    "passed" if success else "failed",
+                    detail,
+                    timestamp,
+                    timestamp,
+                    model_config_id,
+                ),
+            )
+            if success:
+                connection.execute(
+                    """
+                    UPDATE ai_runtime_settings
+                    SET enabled = 1, active_model_config_id = ?, updated_at = ?
+                    WHERE singleton_id = 1
+                    """,
+                    (model_config_id, timestamp),
+                )
+        return success, detail
+
+    def delete_model_config(self, model_config_id: str) -> bool:
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            runtime = connection.execute(
+                "SELECT active_model_config_id FROM ai_runtime_settings WHERE singleton_id = 1"
+            ).fetchone()
+            if runtime and runtime["active_model_config_id"] == model_config_id:
+                raise ValueError("当前启用模型不能删除，请先测试并启用另一个模型")
+            cursor = connection.execute(
+                "DELETE FROM ai_model_configs WHERE model_config_id = ?",
+                (model_config_id,),
+            )
+            return cursor.rowcount > 0

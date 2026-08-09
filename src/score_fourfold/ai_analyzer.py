@@ -8,6 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from .ai_models import AIModelError, AIModelRuntime, call_with_web_search
 from .config import Settings
 from .domain import MarketType, ScoreOption
 
@@ -176,11 +177,19 @@ def analyze_matches(
     matches: list[tuple[Any, ScoreOption]],
     market: MarketType,
     settings: Settings,
+    runtime: AIModelRuntime | None = None,
 ) -> str:
     """Safe wrapper that never raises."""
     try:
+        if runtime is not None:
+            return call_with_web_search(
+                runtime,
+                _build_prompt(matches, market),
+                timeout_seconds=settings.ai_http_timeout_seconds,
+                max_output_tokens=1024,
+            )
         return qwen_analyze(matches, market, settings)
-    except AIAnalysisError as exc:
+    except (AIAnalysisError, AIModelError) as exc:
         LOGGER.warning("AI analysis skipped: %s", exc)
         return ""
 
@@ -363,13 +372,22 @@ def analyze_plan_from_leg_data(
     legs: Sequence[Any],
     market: MarketType,
     settings: Settings,
+    runtime: AIModelRuntime | None = None,
 ) -> AIPlanAnalysis:
     """Return a validated, structured recommendation for every stored plan leg."""
     if not legs:
         raise AIAnalysisError("plan has no legs to analyze")
-    content = _qwen_response(
-        _build_plan_recommendation_prompt(legs, market),
-        settings,
-        max_tokens=1800,
-    )
+    prompt = _build_plan_recommendation_prompt(legs, market)
+    if runtime is None:
+        content = _qwen_response(prompt, settings, max_tokens=1800)
+    else:
+        try:
+            content = call_with_web_search(
+                runtime,
+                prompt,
+                timeout_seconds=settings.ai_http_timeout_seconds,
+                max_output_tokens=1800,
+            )
+        except AIModelError as exc:
+            raise AIAnalysisError(str(exc)) from exc
     return _parse_plan_analysis(content, legs, market)

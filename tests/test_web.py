@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import re
 import threading
 import time
@@ -179,6 +180,65 @@ class DashboardTests(unittest.TestCase):
         # Toast-based: message is in a hidden div with data-level
         self.assertIn('id="init-message"', page)
         self.assertIn('data-level="warn"', page)
+
+    def test_json_api_bootstrap_plans_and_recommend_without_page_reload(self):
+        self._create_plan()
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            status, headers, payload = self._request(server, "GET", "/api/v1/bootstrap")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+            bootstrap = json.loads(payload)["data"]
+            self.assertEqual(bootstrap["title"], "个人看板")
+            self.assertEqual(bootstrap["csrf_token"], "ssh-loopback")
+
+            status, _, payload = self._request(
+                server,
+                "GET",
+                "/api/v1/plans?page=1&per_page=8&market=CRS",
+            )
+            self.assertEqual(status, 200)
+            plans = json.loads(payload)["data"]
+            self.assertEqual(plans["pagination"]["total"], 1)
+            self.assertEqual(plans["summary"]["plans_total"], 1)
+            self.assertEqual(plans["items"][0]["market"], "crs")
+
+            request_payload = json.dumps(
+                bootstrap["recommendation_request"], ensure_ascii=False
+            ).encode("utf-8")
+            status, _, payload = self._request(
+                server,
+                "POST",
+                "/api/v1/actions/recommend",
+                body=request_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-CSRF-Token": "ssh-loopback",
+                },
+            )
+            self.assertEqual(status, 200)
+            response = json.loads(payload)
+            self.assertEqual(response["level"], "ok")
+            self.assertEqual(len(self.triggered), 1)
+        finally:
+            server.stop()
+
+    def test_json_api_rejects_missing_csrf(self):
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            status, _, payload = self._request(
+                server,
+                "POST",
+                "/api/v1/actions/settle-plan",
+                body=b'{"plan_id":"missing"}',
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(status, 403)
+            self.assertIn("操作令牌无效", json.loads(payload)["detail"])
+        finally:
+            server.stop()
 
     def test_ai_summary_is_rendered_in_modal_with_per_match_ai_cells(self):
         recommendation = self._create_plan()

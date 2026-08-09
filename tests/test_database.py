@@ -518,6 +518,39 @@ class PaginationAndCalendarTests(unittest.TestCase):
         stats = self.database.calendar_stats(2025, 1)
         self.assertEqual(stats, {})
 
+    def test_filtered_plans_summary_and_calendar_share_filters(self):
+        first = self._create_sent_plan(
+            plan_id="BF4-ALPHA-0001", business_date="2026-07-14", day_offset=0
+        )
+        second = self._create_sent_plan(
+            plan_id="BF4-BETA-0002", business_date="2026-07-15", day_offset=1
+        )
+        self._create_sent_plan(
+            plan_id="BF4-GAMMA-0003", business_date="2026-07-16", day_offset=2
+        )
+        self.database.set_purchased(second.plan_id, True)
+
+        plans, total = self.database.filtered_plans(
+            {"purchased": True}, page=1, per_page=10
+        )
+        summary = self.database.filtered_summary({"purchased": True})
+        calendar = self.database.filtered_calendar_stats(
+            2026, 7, {"purchased": True}
+        )
+        self.assertEqual(total, 1)
+        self.assertEqual([plan.plan_id for plan in plans], [second.plan_id])
+        self.assertEqual(summary["plans_total"], 1)
+        self.assertEqual(summary["plans_purchased"], 1)
+        self.assertEqual(set(calendar), {"2026-07-15"})
+
+        searched, searched_total = self.database.filtered_plans(
+            {"q": "ALPHA"}, page=1, per_page=10
+        )
+        self.assertEqual(searched_total, 1)
+        self.assertEqual(searched[0].plan_id, first.plan_id)
+        dated = self.database.filtered_summary({"date": "2026-07-16"})
+        self.assertEqual(dated["plans_total"], 1)
+
     def test_set_purchased_and_ticket_image_roundtrip(self):
         rec = self._create_sent_plan()
         plan = self.database.get_plan(rec.plan_id)
