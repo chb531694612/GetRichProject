@@ -366,7 +366,7 @@ onMounted(async () => {
           </header>
           <div class="money-row"><span>投注 <b>{{ money(plan.stake) }}</b></span><span>联合赔率 <b>{{ plan.combined_odds }}</b></span><span>理论奖金 <b>{{ money(plan.net_prize) }}</b></span><span v-if="plan.net_profit !== ''">净盈亏 <b :class="Number(plan.net_profit) >= 0 ? 'profit' : 'loss'">{{ money(plan.net_profit) }}</b></span></div>
           <div class="legs-wrap">
-            <table><thead><tr><th>场次 / 联赛</th><th>比赛</th><th>推荐</th><th>AI分析</th><th>SP</th><th>赛果</th><th>结算 / 调整</th></tr></thead>
+            <table><thead><tr><th>场次 / 联赛</th><th>比赛</th><th>推荐</th><th>AI分析</th><th>SP</th><th>赛果</th><th>{{ plan.status === 'pending' ? '调整' : '结算' }}</th></tr></thead>
               <tbody><tr v-for="leg in plan.legs" :key="leg.match_id">
                 <td><b>{{ leg.match_num }}</b><small>{{ leg.league }} · {{ formatTime(leg.start_at) }}</small></td>
                 <td>{{ leg.home }} <em>vs</em> {{ leg.away }}</td>
@@ -377,7 +377,7 @@ onMounted(async () => {
                 <td class="settle-cell">
                   <b :class="['verdict', leg.result.hit === true ? 'hit' : leg.result.hit === false ? 'miss' : leg.result.status]">{{ leg.result.verdict }}</b>
                   <div class="settle-actions">
-                    <button v-if="leg.ai_suggestion" class="soft" @click="applyAiSuggestion(plan, leg)">使用AI分析</button>
+                    <button v-if="leg.ai_suggestion && leg.result.status === 'pending'" class="soft" @click="applyAiSuggestion(plan, leg)">替换为AI推荐</button>
                     <template v-if="leg.result.status === 'pending'">
                       <select :value="leg.pick_code" @change="action('/api/v1/actions/update-leg',{plan_id:plan.plan_id,match_id:leg.match_id,option_code:($event.target as HTMLSelectElement).value},`update-${leg.match_id}`)"><option v-for="option in leg.options" :key="option.code" :value="option.code">{{ option.label }} · {{ option.odds }}</option></select>
                       <button class="text-danger" @click="deleteLeg(plan,leg)">删除</button>
