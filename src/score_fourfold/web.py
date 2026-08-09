@@ -534,14 +534,25 @@ class DashboardApplication:
                 )
 
     def trigger_mark_purchased(self, plan_id: str, purchased: bool) -> tuple[str, str]:
-        """Mark or unmark a plan as purchased."""
+        """Mark or unmark a plan as purchased. When marking as purchased,
+        also attempt to settle the plan so its status reflects match results."""
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
-        if self.database.set_purchased(plan_id, purchased):
-            action = "标记购买" if purchased else "取消购买标记"
-            return ("ok", f"已{action}计划 {plan_id}")
-        return ("error", f"更新计划 {plan_id} 购买标记失败")
+        if not self.database.set_purchased(plan_id, purchased):
+            return ("error", f"更新计划 {plan_id} 购买标记失败")
+        if purchased:
+            self.database.add_log("recommend", f"计划{plan_id}标记为已购买")
+            if plan.status in {PlanStatus.PENDING, PlanStatus.VOID} and self.trigger_settle_plan is not None:
+                settle_level, settle_detail = self.trigger_settle_plan(plan_id)
+                action = "标记购买"
+                if settle_level == "ok":
+                    action = "标记购买并完成结算"
+                elif settle_level in ("warn", "error"):
+                    action = f"标记购买（结算{settle_detail}）"
+                return ("ok", f"已{action}计划 {plan_id}")
+            return ("ok", f"已标记购买计划 {plan_id}")
+        return ("ok", f"已取消购买标记计划 {plan_id}")
 
     def trigger_upload_ticket(self, plan_id: str, filename: str, data: bytes) -> tuple[str, str]:
         """Save a ticket image for a plan."""
