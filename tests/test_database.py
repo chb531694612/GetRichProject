@@ -412,5 +412,110 @@ class DatabaseSafetyTests(unittest.TestCase):
                 Path(f"{legacy_path}{suffix}").unlink(missing_ok=True)
 
 
+class PaginationAndCalendarTests(unittest.TestCase):
+    """Regression tests for paginated_plans, calendar_stats, set_purchased, set_ticket_image."""
+
+    def setUp(self):
+        self.path = Path("data") / f"test_pagination_{self._testMethodName}.db"
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+        self.database = Database(self.path)
+        self.database.initialize()
+        self.now = datetime(2026, 7, 14, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+
+    def _create_sent_plan(self, *, plan_id: str = "BF4-TEST-0001", business_date: str = "2026-07-14", day_offset: int = 0):
+        now = self.now + timedelta(days=day_offset)
+        matches = [make_match(i, now, odds="2.00", business_date=business_date) for i in range(1, 5)]
+        recommendation = make_recommendation(now, matches)
+        recommendation = replace(recommendation, plan_id=plan_id, business_date=business_date)
+        subject, text_body, html_body = render_recommendation(recommendation)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                recommendation,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=now + timedelta(hours=5),
+            )
+        )
+        rows = self.database.claim_due_emails(now, limit=1)
+        self.assertEqual(len(rows), 1)
+        self.database.mark_email_sent(int(rows[0]["id"]), rows[0]["claim_token"], now)
+        return recommendation
+
+    def test_paginated_plans_returns_newest_first_with_total(self):
+        for n in range(1, 13):
+            self._create_sent_plan(
+                plan_id=f"BF4-TEST-{n:04d}",
+                business_date=f"2026-07-{n:02d}",
+                day_offset=n - 1,
+            )
+        plans, total = self.database.paginated_plans(page=1, per_page=10)
+        self.assertEqual(total, 12)
+        self.assertEqual(len(plans), 10)
+        self.assertEqual(plans[0].plan_id, "BF4-TEST-0012")
+        self.assertEqual(plans[9].plan_id, "BF4-TEST-0003")
+        plans2, total2 = self.database.paginated_plans(page=2, per_page=10)
+        self.assertEqual(total2, 12)
+        self.assertEqual(len(plans2), 2)
+        self.assertEqual(plans2[0].plan_id, "BF4-TEST-0002")
+
+    def test_paginated_plans_empty_database(self):
+        plans, total = self.database.paginated_plans(page=1)
+        self.assertEqual(total, 0)
+        self.assertEqual(plans, [])
+
+    def test_paginated_plans_clamps_per_page(self):
+        self._create_sent_plan()
+        plans, total = self.database.paginated_plans(page=1, per_page=999)
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(total, 1)
+
+    def test_calendar_stats_groups_by_date_and_status(self):
+        self._create_sent_plan(plan_id="BF4-A-0001", business_date="2026-07-14", day_offset=0)
+        self._create_sent_plan(plan_id="BF4-B-0002", business_date="2026-07-15", day_offset=1)
+        self._create_sent_plan(plan_id="BF4-C-0003", business_date="2026-07-16", day_offset=2)
+        stats = self.database.calendar_stats(2026, 7)
+        self.assertIn("2026-07-14", stats)
+        self.assertIn("2026-07-15", stats)
+        self.assertIn("2026-07-16", stats)
+        self.assertEqual(stats["2026-07-14"]["total"], 1)
+        self.assertEqual(stats["2026-07-14"]["pending"], 1)
+        self.assertEqual(stats["2026-07-15"]["total"], 1)
+        self.assertEqual(stats["2026-07-16"]["total"], 1)
+
+    def test_calendar_stats_empty_month(self):
+        stats = self.database.calendar_stats(2025, 1)
+        self.assertEqual(stats, {})
+
+    def test_set_purchased_and_ticket_image_roundtrip(self):
+        rec = self._create_sent_plan()
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertFalse(plan.purchased)
+        self.assertEqual(plan.ticket_image, "")
+
+        self.assertTrue(self.database.set_purchased(rec.plan_id, True))
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertTrue(plan.purchased)
+
+        self.assertTrue(self.database.set_ticket_image(rec.plan_id, "BF4-TEST-0001.png"))
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.ticket_image, "BF4-TEST-0001.png")
+        self.assertTrue(plan.purchased, "set_ticket_image should also mark purchased")
+
+    def test_set_purchased_nonexistent_plan(self):
+        self.assertFalse(self.database.set_purchased("NONEXISTENT", True))
+
+    def test_set_ticket_image_nonexistent_plan(self):
+        self.assertFalse(self.database.set_ticket_image("NONEXISTENT", "x.png"))
+
+
 if __name__ == "__main__":
     unittest.main()

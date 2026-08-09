@@ -115,6 +115,8 @@ QWEN_MODEL=qwen3.7-max
 
 `AI_HTTP_TIMEOUT_SECONDS` 只控制 AI Responses API 请求，默认允许等待 600 秒；比赛数据源和邮件仍使用 `HTTP_TIMEOUT_SECONDS`，避免普通网络请求长时间占用服务。
 
+看板中的“今日全部推荐”和“AI分析并推荐”使用后台任务：提交后页面立即返回，不需要保持浏览器等待。单张计划 AI 分析通常提示 1–10 分钟后刷新；今日全部推荐可能依次分析多张计划，因此提示 1–40 分钟后刷新。运行期间看板会禁用重复提交，并在推荐区域或对应计划的每场比赛上显示“生成中/分析中”。
+
 接口参数以[阿里云百炼联网搜索官方文档](https://help.aliyun.com/zh/model-studio/web-search/)为准。`QWEN_API_URL` 必须使用以 `/responses` 结尾的 Responses API 地址；如果百炼控制台为业务空间提供了专属 Base URL，请在其后追加 `/responses`。
 
 ```bash

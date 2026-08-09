@@ -62,6 +62,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         qwen_api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
         qwen_model="qwen3.7-max",
         ai_analysis_enabled=False,
+        ticket_image_dir=str(tmp_path / "ticket-images"),
     )
     values.update(overrides)
     return Settings(**values)

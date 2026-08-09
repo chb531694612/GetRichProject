@@ -150,6 +150,17 @@ def _build_manual_trigger(
     return trigger
 
 
+def _build_settle_trigger(service: ScoreFourfoldService):
+    """Build a dashboard action that manually triggers settlement."""
+
+    def trigger() -> tuple[str, str]:
+        now = service.now()
+        outcome = service.settle(now)
+        return outcome.status, outcome.detail
+
+    return trigger
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="score-fourfold",
@@ -372,6 +383,7 @@ def main(argv: list[str] | None = None) -> None:
                         _build_manual_trigger(service, wake_event),
                         provider=service.provider,
                         wake_mailer=wake_event.set,
+                        trigger_settle=_build_settle_trigger(service),
                     )
                     dashboard_server = DashboardServer(settings, application)
                     dashboard_server.start()

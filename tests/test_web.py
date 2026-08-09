@@ -1281,5 +1281,260 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         self.database.mark_email_sent(int(rows[0]["id"]), rows[0]["claim_token"], now)
 
 
+class NewFeatureTests(unittest.TestCase):
+    """Regression tests for pagination, calendar, purchase marking, ticket upload, settle."""
+
+    def setUp(self):
+        self.root = Path("data")
+        self.database_path = self.root / f"test_features_{self._testMethodName}.db"
+        self.preview = self.root / f"test_features_{self._testMethodName}_mail"
+        self._clean()
+        self.settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            mail_preview_dir=self.preview,
+            web_port=0,
+        )
+        self.database = Database(self.database_path)
+        self.database.initialize()
+        self.now = datetime(2026, 7, 15, 12, 0, tzinfo=TZ)
+        self.triggered: list[str] = []
+        self.application = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"features-test-secret" * 2,
+        )
+
+    def tearDown(self):
+        self._clean()
+
+    def _clean(self):
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+        if self.preview.exists():
+            for child in self.preview.iterdir():
+                child.unlink()
+            self.preview.rmdir()
+        ticket_dir = self.root / "ticket-images"
+        if ticket_dir.exists():
+            for child in ticket_dir.iterdir():
+                child.unlink()
+            ticket_dir.rmdir()
+
+    def _trigger(self, request_id: str) -> tuple[str, str]:
+        self.triggered.append(request_id)
+        return "created", "已创建测试计划"
+
+    def _create_sent_plan(self, *, plan_id: str = "BF4-TEST-0001", business_date: str = "2026-07-15", day_offset: int = 0):
+        now = self.now + timedelta(days=day_offset)
+        matches = [
+            make_match(i, now, business_date=business_date, odds="2.00")
+            for i in range(1, 5)
+        ]
+        recommendation = make_recommendation(now, matches)
+        recommendation = replace(recommendation, plan_id=plan_id, business_date=business_date)
+        subject, text_body, html_body = render_recommendation(recommendation)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                recommendation,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=now + timedelta(hours=5),
+            )
+        )
+        rows = self.database.claim_due_emails(now, limit=1)
+        self.assertEqual(len(rows), 1)
+        self.database.mark_email_sent(int(rows[0]["id"]), rows[0]["claim_token"], now)
+        return recommendation
+
+    # --- image magic bytes detection ---
+
+    def test_image_extension_detects_jpeg_png_gif_webp(self):
+        detect = DashboardApplication._image_extension
+        self.assertEqual(detect(b'\xff\xd8\xff\x00\x00', "photo.jpg"), "jpg")
+        self.assertEqual(detect(b'\x89PNG\r\n\x1a\n\x00\x00', "photo.png"), "png")
+        self.assertEqual(detect(b'GIF89a\x00\x00', "photo.gif"), "gif")
+        self.assertEqual(detect(b'RIFF\x00\x00\x00\x00WEBP', "photo.webp"), "webp")
+
+    def test_image_extension_rejects_non_image_data(self):
+        detect = DashboardApplication._image_extension
+        self.assertIsNone(detect(b'\x00\x01\x02\x03', "not_image.txt"))
+        self.assertIsNone(detect(b'', "empty.bin"))
+
+    def test_image_extension_fallback_to_filename(self):
+        detect = DashboardApplication._image_extension
+        self.assertEqual(detect(b'\x00\x00\x00\x00', "photo.jpeg"), "jpg")
+        self.assertEqual(detect(b'\x00\x00\x00\x00', "photo.png"), "png")
+
+    # --- purchase marking ---
+
+    def test_mark_purchased_shows_badge_and_unmark_removes_it(self):
+        rec = self._create_sent_plan()
+        level, detail = self.application.trigger_mark_purchased(rec.plan_id, True)
+        self.assertEqual(level, "ok")
+        self.assertIn("标记购买", detail)
+        page = self.application.render(csrf_token="csrf-token")
+        self.assertIn('class="badge purchase-badge"', page)
+
+        level2, _ = self.application.trigger_mark_purchased(rec.plan_id, False)
+        self.assertEqual(level2, "ok")
+        page2 = self.application.render(csrf_token="csrf-token")
+        self.assertNotIn('class="badge purchase-badge"', page2)
+
+    def test_mark_purchased_nonexistent_plan(self):
+        level, detail = self.application.trigger_mark_purchased("NONEXISTENT", True)
+        self.assertEqual(level, "warn")
+
+    # --- ticket image upload ---
+
+    def test_upload_ticket_saves_image_and_marks_purchased(self):
+        rec = self._create_sent_plan()
+        png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
+        level, detail = self.application.trigger_upload_ticket(
+            rec.plan_id, "ticket.png", png_data
+        )
+        self.assertEqual(level, "ok")
+        self.assertIn("实票图片已上传", detail)
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertTrue(plan.purchased)
+        self.assertEqual(plan.ticket_image, "BF4-TEST-0001.png")
+        saved = self.settings.ticket_image_dir
+        from pathlib import Path as P
+        self.assertTrue((P(saved) / "BF4-TEST-0001.png").exists())
+
+    def test_upload_ticket_rejects_oversized_file(self):
+        rec = self._create_sent_plan()
+        big_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * (2 * 1024 * 1024 + 1)
+        level, detail = self.application.trigger_upload_ticket(
+            rec.plan_id, "big.png", big_data
+        )
+        self.assertEqual(level, "warn")
+        self.assertIn("2MB", detail)
+
+    def test_upload_ticket_rejects_non_image(self):
+        rec = self._create_sent_plan()
+        level, detail = self.application.trigger_upload_ticket(
+            rec.plan_id, "file.txt", b'hello world'
+        )
+        self.assertEqual(level, "warn")
+        self.assertIn("JPG", detail)
+
+    def test_upload_ticket_nonexistent_plan(self):
+        level, _ = self.application.trigger_upload_ticket(
+            "NONEXISTENT", "x.png", b'\x89PNG\r\n\x1a\n'
+        )
+        self.assertEqual(level, "warn")
+
+    # --- manual settle ---
+
+    def test_queue_settle_returns_immediately_and_completes(self):
+        settle_called = threading.Event()
+        settle_result = ("ok", "赛果更新完成")
+
+        def fake_settle():
+            settle_called.set()
+            return settle_result
+
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-test-secret" * 2,
+            trigger_settle=fake_settle,
+        )
+        level, detail = app.queue_settle()
+        self.assertEqual(level, "ok")
+        self.assertIn("后台", detail)
+        self.assertTrue(settle_called.wait(2))
+        self._wait_for(
+            lambda: app.settle_task() is not None
+            and app.settle_task().status == "finished"
+        )
+        task = app.settle_task()
+        assert task is not None
+        self.assertEqual(task.level, "ok")
+        self.assertIn("赛果更新完成", task.detail)
+
+    def test_queue_settle_duplicate_while_running(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_settle():
+            started.set()
+            release.wait(2)
+            return ("ok", "done")
+
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-dup-test-secret" * 2,
+            trigger_settle=slow_settle,
+        )
+        app.queue_settle()
+        self.assertTrue(started.wait(1))
+        level2, _ = app.queue_settle()
+        self.assertEqual(level2, "warn")
+        release.set()
+
+    # --- pagination view ---
+
+    def test_list_view_shows_pagination_with_10_per_page(self):
+        for n in range(1, 13):
+            self._create_sent_plan(
+                plan_id=f"BF4-TEST-{n:04d}",
+                business_date=f"2026-07-{n:02d}",
+                day_offset=n - 1,
+            )
+        page = self.application.render(view="list", page=1, csrf_token="csrf")
+        self.assertIn("BF4-TEST-0012", page)
+        self.assertIn("BF4-TEST-0003", page)
+        self.assertNotIn("BF4-TEST-0002", page)
+        self.assertIn("pagination", page)
+        page2 = self.application.render(view="list", page=2, csrf_token="csrf")
+        self.assertIn("BF4-TEST-0002", page2)
+        self.assertIn("BF4-TEST-0001", page2)
+
+    # --- calendar view ---
+
+    def test_calendar_view_shows_daily_counts(self):
+        self._create_sent_plan(plan_id="BF4-A-0001", business_date="2026-07-14", day_offset=0)
+        self._create_sent_plan(plan_id="BF4-B-0002", business_date="2026-07-15", day_offset=1)
+        self._create_sent_plan(plan_id="BF4-C-0003", business_date="2026-07-16", day_offset=2)
+        page = self.application.render(
+            view="calendar",
+            cal_year=2026,
+            cal_month=7,
+            csrf_token="csrf",
+        )
+        self.assertIn("calendar", page)
+        self.assertIn("2026-07", page)
+
+    # --- view tabs ---
+
+    def test_view_tabs_present_in_all_views(self):
+        self._create_sent_plan()
+        for view in ("date", "list", "calendar"):
+            page = self.application.render(
+                view=view,
+                cal_year=2026,
+                cal_month=7,
+                csrf_token="csrf",
+            )
+            self.assertIn("view-tab", page)
+
+    @staticmethod
+    def _wait_for(predicate, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError("background task did not finish in time")
+
+
 if __name__ == "__main__":
     unittest.main()

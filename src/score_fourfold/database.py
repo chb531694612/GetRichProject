@@ -89,6 +89,8 @@ class StoredPlan:
     market: MarketType = MarketType.CRS
     ai_summary: str = ""
     ai_suggestions: tuple[StoredAISuggestion, ...] = ()
+    purchased: bool = False
+    ticket_image: str = ""
 
 
 class Database:
@@ -138,7 +140,9 @@ class Database:
                     net_profit_cents INTEGER,
                     strategy_version TEXT NOT NULL,
                     settled_at TEXT,
-                    ai_summary TEXT NOT NULL DEFAULT ''
+                    ai_summary TEXT NOT NULL DEFAULT '',
+                    purchased INTEGER NOT NULL DEFAULT 0,
+                    ticket_image TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_plans_business_date ON plans(business_date);
@@ -296,6 +300,11 @@ class Database:
 
         if "ai_summary" not in plan_columns:
             connection.execute("ALTER TABLE plans ADD COLUMN ai_summary TEXT NOT NULL DEFAULT ''")
+
+        if "purchased" not in plan_columns:
+            connection.execute("ALTER TABLE plans ADD COLUMN purchased INTEGER NOT NULL DEFAULT 0")
+        if "ticket_image" not in plan_columns:
+            connection.execute("ALTER TABLE plans ADD COLUMN ticket_image TEXT NOT NULL DEFAULT ''")
 
         outbox_columns = {row["name"] for row in connection.execute("PRAGMA table_info(email_outbox)")}
         for name in ("claim_token", "claimed_until", "next_attempt_at"):
@@ -963,6 +972,72 @@ class Database:
             ).fetchall()
             return [row["recommendation_date"] for row in rows]
 
+    def paginated_plans(self, page: int, per_page: int = 10) -> tuple[list[StoredPlan], int]:
+        """Return a page of plans sorted by creation time (newest first) and the total count."""
+        safe_per_page = max(1, min(per_page, 50))
+        safe_page = max(1, page)
+        offset = (safe_page - 1) * safe_per_page
+        with self.connect() as connection:
+            total = int(
+                connection.execute("SELECT COUNT(*) AS count FROM plans").fetchone()["count"]
+            )
+            rows = connection.execute(
+                "SELECT * FROM plans ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (safe_per_page, offset),
+            ).fetchall()
+            plans = [self._load_plan(connection, row) for row in rows]
+            return plans, total
+
+    def calendar_stats(self, year: int, month: int) -> dict[str, dict[str, int]]:
+        """Return daily plan statistics for a given year-month.
+
+        Returns ``{date_str: {"total": int, "won": int, "lost": int, "void": int, "pending": int}}``.
+        """
+        month_str = f"{year:04d}-{month:02d}"
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT recommendation_date,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) AS won,
+                       SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost,
+                       SUM(CASE WHEN status = 'void' THEN 1 ELSE 0 END) AS voided,
+                       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending
+                FROM plans
+                WHERE strftime('%Y-%m', recommendation_date) = ?
+                GROUP BY recommendation_date
+                """,
+                (month_str,),
+            ).fetchall()
+            return {
+                row["recommendation_date"]: {
+                    "total": int(row["total"]),
+                    "won": int(row["won"]),
+                    "lost": int(row["lost"]),
+                    "void": int(row["voided"]),
+                    "pending": int(row["pending"]),
+                }
+                for row in rows
+            }
+
+    def set_purchased(self, plan_id: str, purchased: bool) -> bool:
+        """Mark a plan as purchased or not purchased. Returns True if updated."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE plans SET purchased = ? WHERE plan_id = ?",
+                (1 if purchased else 0, plan_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_ticket_image(self, plan_id: str, image_path: str) -> bool:
+        """Save the ticket image filename for a plan. Returns True if updated."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE plans SET ticket_image = ?, purchased = 1 WHERE plan_id = ?",
+                (image_path, plan_id),
+            )
+            return cursor.rowcount > 0
+
     def _load_plan(self, connection: sqlite3.Connection, row: sqlite3.Row) -> StoredPlan:
         leg_rows = connection.execute(
             "SELECT * FROM plan_legs WHERE plan_id = ? ORDER BY position", (row["plan_id"],)
@@ -1067,6 +1142,8 @@ class Database:
             market=MarketType(row["market"] if "market" in row.keys() and row["market"] else "crs"),
             ai_summary=str(row["ai_summary"]) if "ai_summary" in row.keys() and row["ai_summary"] else "",
             ai_suggestions=ai_suggestions,
+            purchased=bool(row["purchased"]) if "purchased" in row.keys() else False,
+            ticket_image=str(row["ticket_image"]) if "ticket_image" in row.keys() and row["ticket_image"] else "",
         )
 
     def update_ai_summary(self, plan_id: str, ai_summary: str) -> bool:

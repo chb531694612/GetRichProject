@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -69,8 +70,12 @@ tr:last-child td{border-bottom:0}.empty{text-align:center;padding:50px 20px;colo
 .login-wrap{max-width:430px;margin:9vh auto 0;padding:18px}.login-card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:var(--shadow)}
 .login-card h1{margin:0 0 6px}.field{margin-top:18px}.field label{display:block;font-weight:700;margin-bottom:6px}.field input{width:100%;border:1px solid #cfd6e1;border-radius:10px;padding:11px 12px;font:inherit}.login-card button{width:100%;margin-top:22px}
 .logout{display:inline;margin-left:12px}.logout button{padding:7px 11px;background:#475467;font-size:12px}
-@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.top,.action{display:block}.action form{margin-top:14px}.plan-head{display:block}.badges{justify-content:flex-start;margin-top:8px}}
-@media(max-width:480px){.grid{grid-template-columns:1fr}.wrap{padding:18px 12px 40px}.metric .value{font-size:24px}}
+.view-tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.view-tab{padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--muted);font-weight:600;font-size:14px;text-decoration:none;cursor:pointer}.view-tab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.pagination{display:flex;gap:6px;justify-content:center;align-items:center;margin-top:20px;flex-wrap:wrap}.pagination a,.pagination span{padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:13px;text-decoration:none}.pagination span.current{background:var(--blue);color:#fff;border-color:var(--blue);font-weight:700}.pagination span.disabled{color:var(--muted);opacity:.5}
+.calendar{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}.calendar-head{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line)}.calendar-head h3{margin:0;font-size:18px}.calendar-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:0}.calendar-dow{padding:8px;text-align:center;font-size:12px;color:var(--muted);font-weight:700;border-bottom:1px solid var(--line)}.calendar-day{padding:8px 6px;min-height:80px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px}.calendar-day:nth-child(7n){border-right:0}.calendar-day.empty{background:#fafbfc}.calendar-day .day-num{font-weight:700;margin-bottom:4px}.calendar-day .day-stats{line-height:1.5}.calendar-day .day-stats a{color:var(--blue);text-decoration:none;font-weight:600}.calendar-day.today{background:#eff6ff}
+.purchase-badge{background:#ecfdf3;color:#067647}.plan-actions .ticket-thumb{max-width:200px;max-height:150px;border-radius:8px;border:1px solid var(--line);margin-top:8px;cursor:pointer}.ticket-upload-form{display:inline-flex;gap:6px;align-items:center;margin-top:4px}.ticket-upload-form input[type=file]{font-size:12px}.settle-btn{background:#475467;color:#fff;border-color:#475467}
+@media(max-width:820px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.top,.action{display:block}.action form{margin-top:14px}.plan-head{display:block}.badges{justify-content:flex-start;margin-top:8px}.calendar-day{min-height:60px}}
+@media(max-width:480px){.grid{grid-template-columns:1fr}.wrap{padding:18px 12px 40px}.metric .value{font-size:24px}.calendar-day{min-height:50px;font-size:11px}}
 """
 
 
@@ -201,12 +206,15 @@ class DashboardApplication:
         provider: object | None = None,
         wake_mailer: Callable[[], None] | None = None,
         clock: Callable[[], datetime] | None = None,
+        trigger_settle: Callable[[], tuple[str, str]] | None = None,
     ):
         self.settings = settings
         self.database = database
         self.trigger_recommendation = trigger_recommendation
         self.provider = provider
         self.wake_mailer = wake_mailer
+        self.trigger_settle = trigger_settle
+        self.ticket_image_dir = Path(getattr(settings, "ticket_image_dir", "data/ticket-images"))
         self._clock = clock or (lambda: datetime.now(self.settings.timezone))
         self._secret = secret or secrets.token_bytes(32)
         self.access_mode = getattr(settings, "web_access_mode", "ssh")
@@ -220,6 +228,7 @@ class DashboardApplication:
         self._login_failures: dict[str, list[datetime]] = {}
         self._password_workers = threading.BoundedSemaphore(2)
         self._recommendation_task: BackgroundTask | None = None
+        self._settle_task: BackgroundTask | None = None
         self._analysis_tasks: dict[str, BackgroundTask] = {}
         if self.public_mode:
             parsed_origin = _origin(self.public_origin)
@@ -400,6 +409,101 @@ class DashboardApplication:
     def recommendation_task(self) -> BackgroundTask | None:
         with self._lock:
             return self._recommendation_task
+
+    def queue_settle(self) -> tuple[str, str]:
+        """Start a manual settlement in the background and return immediately."""
+        if self.trigger_settle is None:
+            return ("warn", "赛果手动更新未配置")
+        started_at = self.now()
+        with self._lock:
+            if (
+                self._settle_task is not None
+                and self._settle_task.status == "running"
+            ):
+                return (
+                    "warn",
+                    "赛果更新正在后台执行，请勿重复提交；预计 1–5 分钟后刷新查看。",
+                )
+            self._settle_task = BackgroundTask(
+                "running",
+                "warn",
+                "正在后台更新赛果并结算计划；预计 1–5 分钟后刷新查看。",
+                started_at,
+            )
+        threading.Thread(
+            target=self._run_settle_task,
+            args=(started_at,),
+            name="manual-settle",
+            daemon=True,
+        ).start()
+        return (
+            "ok",
+            "已提交后台赛果更新，无需等待；预计 1–5 分钟后刷新查看。",
+        )
+
+    def _run_settle_task(self, started_at: datetime) -> None:
+        level = "error"
+        detail = "赛果更新后台执行异常。"
+        try:
+            level, detail = self.trigger_settle()
+        except Exception:
+            LOGGER.exception("background settle failed")
+        finished_at = self.now()
+        with self._lock:
+            current = self._settle_task
+            if current is not None and current.started_at == started_at:
+                self._settle_task = BackgroundTask(
+                    "finished", level, detail, started_at, finished_at
+                )
+
+    def settle_task(self) -> BackgroundTask | None:
+        with self._lock:
+            return self._settle_task
+
+    def trigger_mark_purchased(self, plan_id: str, purchased: bool) -> tuple[str, str]:
+        """Mark or unmark a plan as purchased."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        if self.database.set_purchased(plan_id, purchased):
+            action = "标记购买" if purchased else "取消购买标记"
+            return ("ok", f"已{action}计划 {plan_id}")
+        return ("error", f"更新计划 {plan_id} 购买标记失败")
+
+    def trigger_upload_ticket(self, plan_id: str, filename: str, data: bytes) -> tuple[str, str]:
+        """Save a ticket image for a plan."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        if len(data) > 2 * 1024 * 1024:
+            return ("warn", "图片大小不能超过 2MB")
+        ext = self._image_extension(data, filename)
+        if not ext:
+            return ("warn", "仅支持 JPG、PNG、GIF、WebP 格式的图片")
+        safe_name = f"{plan_id.replace('/', '_')}.{ext}"
+        self.ticket_image_dir.mkdir(parents=True, exist_ok=True)
+        image_path = self.ticket_image_dir / safe_name
+        image_path.write_bytes(data)
+        if self.database.set_ticket_image(plan_id, safe_name):
+            return ("ok", f"实票图片已上传并标记购买计划 {plan_id}")
+        return ("error", f"保存计划 {plan_id} 的实票图片失败")
+
+    @staticmethod
+    def _image_extension(data: bytes, filename: str) -> str | None:
+        """Determine a safe image extension from the file content via magic bytes."""
+        if len(data) >= 3 and data[:3] == b'\xff\xd8\xff':
+            return "jpg"
+        if len(data) >= 8 and data[:8] == b'\x89PNG\r\n\x1a\n':
+            return "png"
+        if len(data) >= 6 and data[:6] in (b'GIF87a', b'GIF89a'):
+            return "gif"
+        if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return "webp"
+        lowered = filename.lower()
+        for ext in ("jpg", "jpeg", "png", "gif", "webp"):
+            if lowered.endswith(f".{ext}"):
+                return "jpg" if ext == "jpeg" else ext
+        return None
 
     def analysis_task(self, plan_id: str) -> BackgroundTask | None:
         with self._lock:
@@ -659,7 +763,7 @@ class DashboardApplication:
 <div class="field"><label for="password">密码</label><input id="password" name="password" type="password" maxlength="512" autocomplete="current-password" required></div>
 <button type="submit">登录</button></form></section></main></body></html>"""
 
-    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "", date: str = "") -> str:
+    def render(self, *, message: str = "", level: str = "ok", csrf_token: str = "", date: str = "", view: str = "date", page: int = 1, cal_year: int = 0, cal_month: int = 0) -> str:
         now = datetime.now(self.settings.timezone)
         script_nonce = secrets.token_urlsafe(18)
         # SSH mode is already restricted to loopback requests and has no login
@@ -669,6 +773,24 @@ class DashboardApplication:
             csrf_token = "ssh-loopback"
         summary = self.database.summary()
         all_dates = self.database.recommendation_dates()
+
+        # ---- View: calendar ----
+        if view == "calendar":
+            return self._render_calendar(
+                message=message, level=level, csrf_token=csrf_token,
+                now=now, script_nonce=script_nonce, summary=summary,
+                all_dates=all_dates, cal_year=cal_year, cal_month=cal_month,
+            )
+
+        # ---- View: list (paginated all plans) ----
+        if view == "list":
+            return self._render_plan_list(
+                message=message, level=level, csrf_token=csrf_token,
+                now=now, script_nonce=script_nonce, summary=summary,
+                all_dates=all_dates, page=page,
+            )
+
+        # ---- View: date (default, existing behavior) ----
         if date and date in all_dates:
             selected_date = date
         elif all_dates:
@@ -727,6 +849,9 @@ class DashboardApplication:
             action_reason = "今日全部推荐正在后台生成；预计 1–40 分钟后刷新页面查看结果。"
         request_id, signature = self.new_request()
 
+        settle_task = self.settle_task()
+        settle_running = settle_task is not None and settle_task.status == "running"
+
         flash = ""
         safe_level = level if level in {"ok", "warn", "error"} else "warn"
         if message:
@@ -741,6 +866,16 @@ class DashboardApplication:
             background_result = (
                 f'<div class="flash {task_level}">后台推荐结果：'
                 f'{_e(recommendation_task.detail[:800])}</div>'
+            )
+        if settle_task is not None and settle_task.status == "finished":
+            task_level = (
+                settle_task.level
+                if settle_task.level in {"ok", "warn", "error"}
+                else "warn"
+            )
+            background_result += (
+                f'<div class="flash {task_level}">赛果更新结果：'
+                f'{_e(settle_task.detail[:800])}</div>'
             )
 
         plan_cards = "".join(self._render_plan(plan, csrf_token) for plan in plans)
@@ -769,6 +904,9 @@ class DashboardApplication:
             )
         footer_access = "已通过HTTPS加密并要求登录。" if self.public_mode else "网页仅通过SSH安全通道访问。"
 
+        view_tabs = self._render_view_tabs(view, selected_date, csrf_token)
+        settle_button = self._render_settle_button(csrf_token, settle_running)
+
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>比分串关个人看板</title>
 <style>{STYLE}</style></head><body><main class="wrap">
@@ -782,8 +920,9 @@ class DashboardApplication:
 </section>
 <section class="panel action"><div><strong>手动尝试今日推荐</strong><div class="muted small">{_e(action_reason)}</div></div>
 <form id="recommend-form" method="post" action="/actions/recommend"><input type="hidden" name="request_id" value="{_e(request_id)}">
-<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>{_e(recommend_button_text)}</button><div id="recommend-working" class="{working_class}">推荐正在后台生成（含 AI 分析），无需停留在本页；预计 1–40 分钟后刷新查看。</div></form></section>
-<div class="section-title"><div><h2>推荐记录</h2><div class="muted small">按推荐日期浏览，每天一个比分一个胜平负</div></div></div>
+<input type="hidden" name="signature" value="{_e(signature)}"><input type="hidden" name="csrf_token" value="{_e(csrf_token)}"><button id="recommend-submit" type="submit"{disabled}>{_e(recommend_button_text)}</button><div id="recommend-working" class="{working_class}">推荐正在后台生成（含 AI 分析），无需停留在本页；预计 1–40 分钟后刷新查看。</div></form>
+<div style="margin-top:10px">{settle_button}</div></section>
+{view_tabs}
 {date_nav}
 <section class="plans">{plan_cards}</section>
 <div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
@@ -796,8 +935,204 @@ function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操
 function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
 function runAIAnalysis(target){{var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){{plan.querySelectorAll('.ai-cell').forEach(function(cell){{cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'}});var status=plan.querySelector('[data-ai-status]');if(status){{status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}}}postAction('/actions/analyze-plan',{{plan_id:target.dataset.planId}})}}
 function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
+function markPurchased(pid,purchased){{var msg=purchased?'确定标记此计划为已购买？':'确定取消购买标记？';if(confirm(msg))postAction('/actions/mark-purchased',{{plan_id:pid,purchased:purchased?'1':'0'}})}}
+function triggerSettle(){{if(confirm('确定手动更新赛果吗？将在后台执行，预计1-5分钟。'))postAction('/actions/settle',{{}})}}
 var recommendForm=document.getElementById('recommend-form');if(recommendForm)recommendForm.addEventListener('submit',function(){{var button=document.getElementById('recommend-submit');var status=document.getElementById('recommend-working');if(button){{button.disabled=true;button.textContent='推荐生成中…'}}if(status)status.classList.add('visible')}})
-document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='mark-purchased')markPurchased(target.dataset.planId,target.dataset.purchased==='1');else if(action==='settle')triggerSettle();else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
+</script>
+</body></html>"""
+
+    def _render_view_tabs(self, view: str, selected_date: str, csrf_token: str) -> str:
+        date_href = f"/?date={_e(selected_date)}" if selected_date else "/"
+        tabs = [
+            ("date", "按日期", date_href),
+            ("list", "全部记录", "/?view=list"),
+            ("calendar", "日历", "/?view=calendar"),
+        ]
+        items = []
+        for tab_id, label, href in tabs:
+            cls = "view-tab active" if view == tab_id else "view-tab"
+            items.append(f'<a class="{cls}" href="{href}">{label}</a>')
+        return f'<div class="view-tabs">{"".join(items)}</div>'
+
+    def _render_settle_button(self, csrf_token: str, settle_running: bool) -> str:
+        if settle_running:
+            return '<button type="button" class="settle-btn" disabled>赛果更新中…</button>'
+        return (
+            '<button type="button" data-action="settle" class="settle-btn">手动更新赛果</button>'
+            '<span class="muted small" style="margin-left:8px">在后台获取最新赛果并结算到期计划</span>'
+        )
+
+    def _render_calendar(
+        self, *, message: str, level: str, csrf_token: str,
+        now: datetime, script_nonce: str, summary: dict,
+        all_dates: list[str], cal_year: int, cal_month: int,
+    ) -> str:
+        if cal_year <= 0 or cal_month <= 0:
+            cal_year = now.year
+            cal_month = now.month
+        prev_month = cal_month - 1 if cal_month > 1 else 12
+        prev_year = cal_year if cal_month > 1 else cal_year - 1
+        next_month = cal_month + 1 if cal_month < 12 else 1
+        next_year = cal_year if cal_month < 12 else cal_year + 1
+        stats = self.database.calendar_stats(cal_year, cal_month)
+
+        import calendar as _cal
+        cal = _cal.Calendar(firstweekday=0)  # Monday
+        weeks = cal.monthdayscalendar(cal_year, cal_month)
+        dow_names = ["一", "二", "三", "四", "五", "六", "日"]
+        dow_headers = "".join(f'<div class="calendar-dow">{name}</div>' for name in dow_names)
+
+        today_str = now.date().isoformat()
+        cells: list[str] = []
+        for week in weeks:
+            for day in week:
+                if day == 0:
+                    cells.append('<div class="calendar-day empty"></div>')
+                else:
+                    date_str = f"{cal_year:04d}-{cal_month:02d}-{day:02d}"
+                    day_stats = stats.get(date_str)
+                    is_today = date_str == today_str
+                    cls = "calendar-day today" if is_today else "calendar-day"
+                    if day_stats:
+                        s = day_stats
+                        parts = [f'<a href="/?date={date_str}">{s["total"]}张计划</a>']
+                        if s["won"]:
+                            parts.append(f'<span class="positive">中奖{s["won"]}</span>')
+                        if s["lost"]:
+                            parts.append(f'<span class="negative">未中{s["lost"]}</span>')
+                        if s["void"]:
+                            parts.append(f'<span class="muted">无效{s["void"]}</span>')
+                        if s["pending"]:
+                            parts.append(f'<span style="color:var(--amber)">待结算{s["pending"]}</span>')
+                        stats_html = '<br>'.join(parts)
+                    else:
+                        stats_html = '<span class="muted">—</span>'
+                    cells.append(
+                        f'<div class="{cls}"><div class="day-num">{day}</div>'
+                        f'<div class="day-stats">{stats_html}</div></div>'
+                    )
+        grid = f'<div class="calendar-grid">{dow_headers}{"".join(cells)}</div>'
+
+        prev_link = f'<a class="button" href="/?view=calendar&cal_year={prev_year}&cal_month={prev_month}">← {prev_year}年{prev_month}月</a>'
+        next_link = f'<a class="button" href="/?view=calendar&cal_year={next_year}&cal_month={next_month}">{next_year}年{next_month}月 →</a>'
+        month_label = f"{cal_year}年{cal_month}月"
+
+        flash = ""
+        safe_level = level if level in {"ok", "warn", "error"} else "warn"
+        if message:
+            flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+
+        view_tabs = self._render_view_tabs("calendar", "", csrf_token)
+        logout = ""
+        if self.public_mode:
+            logout = (
+                '<form class="logout" method="post" action="/logout">'
+                f'<input type="hidden" name="csrf_token" value="{_e(csrf_token)}">'
+                '<button type="submit">退出登录</button></form>'
+            )
+        footer_access = "已通过HTTPS加密并要求登录。" if self.public_mode else "网页仅通过SSH安全通道访问。"
+
+        return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>日历 — 比分串关个人看板</title>
+<style>{STYLE}</style></head><body><main class="wrap">
+{flash}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">日历视图 — 按月查看每日计划与中奖情况</div></div>
+<div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
+{view_tabs}
+<div class="calendar"><div class="calendar-head"><div>{prev_link}</div><h3>{month_label}</h3><div>{next_link}</div></div>{grid}</div>
+<div class="footer">点击日期可查看当天详细计划。{footer_access}</div>
+</main>
+<script nonce="{script_nonce}">
+function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
+</script>
+</body></html>"""
+
+    def _render_plan_list(
+        self, *, message: str, level: str, csrf_token: str,
+        now: datetime, script_nonce: str, summary: dict,
+        all_dates: list[str], page: int,
+    ) -> str:
+        per_page = 10
+        plans, total = self.database.paginated_plans(page, per_page)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if page > total_pages:
+            page = total_pages
+            plans, total = self.database.paginated_plans(page, per_page)
+
+        flash = ""
+        safe_level = level if level in {"ok", "warn", "error"} else "warn"
+        if message:
+            flash = f'<div class="flash {safe_level}">{_e(message[:800])}</div>'
+
+        settle_task = self.settle_task()
+        background_result = ""
+        if settle_task is not None and settle_task.status == "finished":
+            task_level = settle_task.level if settle_task.level in {"ok", "warn", "error"} else "warn"
+            background_result = f'<div class="flash {task_level}">赛果更新结果：{_e(settle_task.detail[:800])}</div>'
+
+        plan_cards = "".join(self._render_plan(plan, csrf_token) for plan in plans)
+        if not plan_cards:
+            plan_cards = '<div class="panel empty">还没有推荐记录。</div>'
+
+        # Pagination controls
+        pages_html: list[str] = []
+        if page > 1:
+            pages_html.append(f'<a href="/?view=list&page={page - 1}">← 上一页</a>')
+        else:
+            pages_html.append('<span class="disabled">← 上一页</span>')
+        # Show page numbers (max 7 visible)
+        start_page = max(1, page - 3)
+        end_page = min(total_pages, start_page + 6)
+        if start_page > 1:
+            pages_html.append(f'<a href="/?view=list&page=1">1</a>')
+            if start_page > 2:
+                pages_html.append('<span class="disabled">…</span>')
+        for p in range(start_page, end_page + 1):
+            if p == page:
+                pages_html.append(f'<span class="current">{p}</span>')
+            else:
+                pages_html.append(f'<a href="/?view=list&page={p}">{p}</a>')
+        if end_page < total_pages:
+            if end_page < total_pages - 1:
+                pages_html.append('<span class="disabled">…</span>')
+            pages_html.append(f'<a href="/?view=list&page={total_pages}">{total_pages}</a>')
+        if page < total_pages:
+            pages_html.append(f'<a href="/?view=list&page={page + 1}">下一页 →</a>')
+        else:
+            pages_html.append('<span class="disabled">下一页 →</span>')
+        pagination = f'<div class="pagination">{"".join(pages_html)}</div>'
+
+        view_tabs = self._render_view_tabs("list", "", csrf_token)
+        logout = ""
+        if self.public_mode:
+            logout = (
+                '<form class="logout" method="post" action="/logout">'
+                f'<input type="hidden" name="csrf_token" value="{_e(csrf_token)}">'
+                '<button type="submit">退出登录</button></form>'
+            )
+        footer_access = "已通过HTTPS加密并要求登录。" if self.public_mode else "网页仅通过SSH安全通道访问。"
+
+        return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>全部记录 — 比分串关个人看板</title>
+<style>{STYLE}</style></head><body><main class="wrap">
+{flash}{background_result}<div class="top"><div><h1>比分串关个人看板</h1><div class="muted">全部记录 — 共 {total} 张计划，每页 {per_page} 张</div></div>
+<div class="muted small">服务器时间：{_e(now.strftime('%Y-%m-%d %H:%M:%S'))}{logout}</div></div>
+{view_tabs}
+<section class="plans">{plan_cards}</section>
+{pagination}
+<div class="footer">理论奖金按推荐时固定奖金快照计算；实际返还、税额和兑奖以官方赛果及实体票为准。{footer_access}</div>
+</main>
+<script nonce="{script_nonce}">
+function openModal(id){{var e=document.getElementById(id);if(e)e.classList.add('open')}}
+function closeModal(id){{var e=document.getElementById(id);if(e){{e.classList.remove('open');window.location.hash='_'}}}}
+function postAction(path,data){{var f=document.createElement('form');f.method='POST';f.action=path;data.csrf_token={json.dumps(csrf_token)};Object.keys(data).forEach(function(k){{var i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k];f.appendChild(i)}});document.body.appendChild(f);f.submit()}}
+function delPlan(pid){{if(confirm('确定删除整张计划 '+pid+' 吗？此操作不可恢复。'))postAction('/actions/delete-plan',{{plan_id:pid}})}}
+function delLeg(pid,mid){{if(confirm('确定从 '+pid+' 中删除比赛 '+mid+' 吗？'))postAction('/actions/delete-leg',{{plan_id:pid,match_id:mid}})}}
+function runAIAnalysis(target){{var plan=target.closest('.plan');target.disabled=true;target.textContent='AI 分析中…';if(plan){{plan.querySelectorAll('.ai-cell').forEach(function(cell){{cell.innerHTML='<div class="ai-loading">本场比赛 AI 分析中，请稍候…</div>'}});var status=plan.querySelector('[data-ai-status]');if(status){{status.textContent='AI 正在联网分析，最长可能需要约 10 分钟，请勿重复点击。';status.classList.add('visible')}}}}postAction('/actions/analyze-plan',{{plan_id:target.dataset.planId}})}}
+function updateLeg(target,optionCode){{if(!optionCode)return;if(confirm('确定将这场推荐修改为 '+target.dataset.optionLabel+' 吗？计划赔率和奖金会自动重算。'))postAction('/actions/update-leg',{{plan_id:target.dataset.planId,match_id:target.dataset.matchId,option_code:optionCode}})}}
+function markPurchased(pid,purchased){{var msg=purchased?'确定标记此计划为已购买？':'确定取消购买标记？';if(confirm(msg))postAction('/actions/mark-purchased',{{plan_id:pid,purchased:purchased?'1':'0'}})}}
+function triggerSettle(){{if(confirm('确定手动更新赛果吗？将在后台执行，预计1-5分钟。'))postAction('/actions/settle',{{}})}}
+document.addEventListener('click',function(event){{var target=event.target.closest('[data-action]');if(!target)return;event.preventDefault();var action=target.dataset.action;if(action==='delete-plan')delPlan(target.dataset.planId);else if(action==='delete-leg')delLeg(target.dataset.planId,target.dataset.matchId);else if(action==='analyze-plan')runAIAnalysis(target);else if(action==='replace-ai')updateLeg(target,target.dataset.optionCode);else if(action==='save-leg'){{var select=document.getElementById(target.dataset.selectId);if(select){{target.dataset.optionLabel=select.options[select.selectedIndex].text;updateLeg(target,select.value)}}}}else if(action==='mark-purchased')markPurchased(target.dataset.planId,target.dataset.purchased==='1');else if(action==='settle')triggerSettle();else if(action==='open-modal')openModal(target.dataset.modalId);else if(action==='close-modal')closeModal(target.dataset.modalId)}})
 </script>
 </body></html>"""
 
@@ -850,6 +1185,36 @@ document.addEventListener('click',function(event){{var target=event.target.close
                 f' <span class="flash {result_class}" style="padding:5px 9px;margin:0">'
                 f'后台分析结果：{_e(analysis_task.detail[:500])}</span>'
             )
+
+        # Purchase marking and ticket image controls
+        purchase_badge = ""
+        purchase_btns = ""
+        if csrf_token and plan.delivery_status == "sent":
+            if plan.purchased:
+                purchase_badge = '<span class="badge purchase-badge">已购买</span>'
+                purchase_btns = (
+                    f'<button type="button" data-action="mark-purchased" data-plan-id="{_e(pid)}" '
+                    f'data-purchased="0" class="btn-sm">取消购买标记</button>'
+                )
+            else:
+                purchase_btns = (
+                    f'<button type="button" data-action="mark-purchased" data-plan-id="{_e(pid)}" '
+                    f'data-purchased="1" class="btn-sm" style="background:var(--green);color:#fff;border-color:var(--green)">标记购买</button>'
+                )
+            # Ticket image upload form (multipart)
+            purchase_btns += (
+                f'<form class="ticket-upload-form" method="post" action="/actions/upload-ticket" '
+                f'enctype="multipart/form-data">'
+                f'<input type="hidden" name="csrf_token" value="{_e(csrf_token)}">'
+                f'<input type="hidden" name="plan_id" value="{_e(pid)}">'
+                '<input type="file" name="ticket_image" accept="image/jpeg,image/png,image/gif,image/webp" required>'
+                '<button type="submit" class="btn-sm">上传实票</button></form>'
+            )
+            if plan.ticket_image:
+                purchase_btns += (
+                    f'<img class="ticket-thumb" src="/tickets/{_e(plan.ticket_image)}" '
+                    f'alt="实票图片" loading="lazy">'
+                )
 
         if plan.delivery_status != "sent":
             return f"""<article class="plan"><div class="plan-head"><div>
@@ -938,13 +1303,13 @@ document.addEventListener('click',function(event){{var target=event.target.close
 <div class="plan-title">{_e(plan.recommendation_date)} · {_e(market_label)}{plan.pass_size}串1</div>
 <div class="muted small">{_e(pid)} · 生成于 {_e(plan.created_at.strftime('%Y-%m-%d %H:%M:%S'))} · 最晚比赛编号日期 {_e(plan.issue_date)}</div></div>
 <div class="badges"><span class="badge {delivery_class}">{_e(delivery_text)}</span><span class="badge {status_class}">{_e(status_text)}</span>
-{('<span class="badge amber">跨两个比赛编号日期</span>' if cross_day else '')}</div></div>
+{('<span class="badge amber">跨两个比赛编号日期</span>' if cross_day else '')}{purchase_badge}</div></div>
 <div class="plan-money"><div><span class="muted small">2元理论税前返还</span><strong>{_money(plan.gross_prize)}</strong></div>
 <div><span class="muted small">实际税后返还</span><strong>{actual_return}</strong></div>
 <div><span class="muted small">本期净盈亏</span><strong>{profit}</strong></div></div>
 <div class="table-wrap"><table><thead><tr><th>编号/联赛</th><th>开赛时间</th><th>对阵</th><th>{_e(pick_header)}</th><th>赛果</th><th>结果</th><th>AI逐场推荐</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
-<div class="plan-actions" style="padding:8px 20px">{ai_btn} {del_btn}</div>{ai_modal}</article>"""
+<div class="plan-actions" style="padding:8px 20px">{ai_btn} {del_btn} {purchase_btns}</div>{ai_modal}</article>"""
 
 
 class LimitedThreadingHTTPServer(ThreadingHTTPServer):
@@ -998,10 +1363,11 @@ def build_handler(application: DashboardApplication):
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
             script_policy = f"; script-src 'nonce-{script_nonce}'" if script_nonce else ""
+            img_policy = "; img-src 'self'" if script_nonce else ""
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-                f"frame-ancestors 'none'; base-uri 'none'{script_policy}",
+                f"frame-ancestors 'none'; base-uri 'none'{script_policy}{img_policy}",
             )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
@@ -1226,6 +1592,120 @@ def build_handler(application: DashboardApplication):
                 return None
             return {name: form[name][0] for name in names}
 
+        def _serve_ticket_image(self, filename: str) -> None:
+            """Serve a ticket image file from the configured directory."""
+            safe_pattern = re.compile(r"^[A-Za-z0-9_\-]+\.(jpg|png|gif|webp)$")
+            if not safe_pattern.fullmatch(filename):
+                self._send(404, "<h1>404</h1>")
+                return
+            image_path = application.ticket_image_dir / filename
+            if not image_path.is_file():
+                self._send(404, "<h1>404</h1>")
+                return
+            ext = filename.rsplit(".", 1)[-1].lower()
+            content_types = {
+                "jpg": "image/jpeg",
+                "png": "image/png",
+                "gif": "image/gif",
+                "webp": "image/webp",
+            }
+            content_type = content_types.get(ext, "application/octet-stream")
+            try:
+                data = image_path.read_bytes()
+            except OSError:
+                self._send(404, "<h1>404</h1>")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _read_multipart_form(self) -> dict[str, object] | None:
+            """Parse a multipart/form-data body for file uploads.
+
+            Returns a dict mapping field names to either ``str`` (text fields) or
+            ``tuple[str, bytes]`` (filename, file data). Returns ``None`` on error.
+            """
+            raw_content_type = self._single_header("Content-Type", required=True)
+            if raw_content_type is None:
+                self._discard_request_body()
+                self._send(400, "<h1>400</h1>", close=True)
+                return None
+            content_type = raw_content_type.split(";", 1)[0].strip().lower()
+            if content_type != "multipart/form-data":
+                self._discard_request_body()
+                self._send(415, "<h1>415</h1>", close=True)
+                return None
+            # Extract boundary
+            boundary = None
+            for part in raw_content_type.split(";")[1:]:
+                part = part.strip()
+                if part.startswith("boundary="):
+                    boundary = part[len("boundary="):]
+                    if len(boundary) >= 2 and boundary[0] == '"' and boundary[-1] == '"':
+                        boundary = boundary[1:-1]
+                    break
+            if not boundary:
+                self._send(400, "<h1>400</h1>", close=True)
+                return None
+            raw_length = self._single_header("Content-Length", required=True)
+            if raw_length is None or not raw_length.isascii() or not raw_length.isdecimal():
+                self._send(400, "<h1>400</h1>", close=True)
+                return None
+            try:
+                length = int(raw_length)
+            except ValueError:
+                self._send(400, "<h1>400</h1>", close=True)
+                return None
+            max_upload = 3 * 1024 * 1024  # 3MB
+            if length <= 0 or length > max_upload:
+                self._send(413, "<h1>413</h1>", close=True)
+                return None
+            try:
+                body = self.rfile.read(length)
+            except OSError:
+                self._send(400, "<h1>400</h1>", close=True)
+                return None
+            boundary_bytes = ("--" + boundary).encode("ascii")
+            fields: dict[str, object] = {}
+            segments = body.split(boundary_bytes)
+            for segment in segments:
+                if not segment or segment == b"--" or segment == b"--\r\n":
+                    continue
+                if segment.startswith(b"\r\n"):
+                    segment = segment[2:]
+                if segment.endswith(b"\r\n"):
+                    segment = segment[:-2]
+                if not segment:
+                    continue
+                header_end = segment.find(b"\r\n\r\n")
+                if header_end == -1:
+                    continue
+                header_text = segment[:header_end].decode("utf-8", errors="replace")
+                content = segment[header_end + 4:]
+                name = None
+                filename = None
+                for line in header_text.split("\r\n"):
+                    lower = line.lower()
+                    if lower.startswith("content-disposition:"):
+                        name_match = re.search(r'name="([^"]*)"', line)
+                        if name_match:
+                            name = name_match.group(1)
+                        file_match = re.search(r'filename="([^"]*)"', line)
+                        if file_match:
+                            filename = file_match.group(1)
+                if name is None:
+                    continue
+                if filename is not None:
+                    fields[name] = (filename, content)
+                else:
+                    fields[name] = content.decode("utf-8", errors="replace")
+            return fields
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
             if parsed.path == "/healthz":
@@ -1233,6 +1713,10 @@ def build_handler(application: DashboardApplication):
                 return
             if not self._request_envelope_ok():
                 self._send(403, "<h1>403</h1><p>请求地址或HTTPS代理校验失败。</p>")
+                return
+            # Serve ticket images
+            if parsed.path.startswith("/tickets/"):
+                self._serve_ticket_image(parsed.path[len("/tickets/"):])
                 return
             if parsed.path == "/login" and application.public_mode:
                 if self._session() is not None:
@@ -1254,6 +1738,10 @@ def build_handler(application: DashboardApplication):
             message = query.get("message", [""])[0]
             level = query.get("level", ["ok"])[0]
             date = query.get("date", [""])[0]
+            view = query.get("view", ["date"])[0]
+            page = int(query.get("page", ["1"])[0]) if query.get("page", ["1"])[0].isdigit() else 1
+            cal_year = int(query.get("cal_year", ["0"])[0]) if query.get("cal_year", ["0"])[0].isdigit() else 0
+            cal_month = int(query.get("cal_month", ["0"])[0]) if query.get("cal_month", ["0"])[0].isdigit() else 0
             self._send(
                 200,
                 application.render(
@@ -1261,12 +1749,16 @@ def build_handler(application: DashboardApplication):
                     level=level,
                     csrf_token=session.csrf_token if session is not None else "",
                     date=date,
+                    view=view,
+                    page=page,
+                    cal_year=cal_year,
+                    cal_month=cal_month,
                 ),
             )
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
-            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg"}:
+            if path not in {"/login", "/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/mark-purchased", "/actions/upload-ticket"}:
                 self._discard_request_body()
                 self._send(404, "<h1>404</h1>", close=True)
                 return
@@ -1283,7 +1775,7 @@ def build_handler(application: DashboardApplication):
             session: WebSession | None = None
             if application.public_mode:
                 authenticated = self._session()
-                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg"}:
+                if path in {"/logout", "/actions/recommend", "/actions/delete-plan", "/actions/delete-leg", "/actions/analyze-plan", "/actions/update-leg", "/actions/settle", "/actions/mark-purchased", "/actions/upload-ticket"}:
                     if authenticated is None:
                         self._discard_request_body()
                         self._redirect_to("/login")
@@ -1360,6 +1852,67 @@ def build_handler(application: DashboardApplication):
                 )
                 self._redirect(detail, level)
                 return
+
+            # ---- handles /actions/settle ----
+            if path == "/actions/settle":
+                form = self._read_form()
+                if form is None:
+                    return
+                values = self._form_values(form, {"csrf_token"})
+                if values is None:
+                    return
+                if session is not None:
+                    csrf = values.get("csrf_token", "")
+                    if not application.verify_session_csrf(session, csrf):
+                        self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
+                        return
+                level, detail = application.queue_settle()
+                self._redirect(detail, level)
+                return
+
+            # ---- handles /actions/mark-purchased ----
+            if path == "/actions/mark-purchased":
+                form = self._read_form()
+                if form is None:
+                    return
+                values = self._form_values(form, {"plan_id", "purchased", "csrf_token"})
+                if values is None:
+                    return
+                if session is not None:
+                    csrf = values.get("csrf_token", "")
+                    if not application.verify_session_csrf(session, csrf):
+                        self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
+                        return
+                purchased = values["purchased"] in {"1", "true", "yes"}
+                level, detail = application.trigger_mark_purchased(values["plan_id"], purchased)
+                self._redirect(detail, level)
+                return
+
+            # ---- handles /actions/upload-ticket (multipart) ----
+            if path == "/actions/upload-ticket":
+                fields = self._read_multipart_form()
+                if fields is None:
+                    return
+                csrf_val = fields.get("csrf_token", "")
+                if not isinstance(csrf_val, str):
+                    csrf_val = ""
+                if session is not None:
+                    if not application.verify_session_csrf(session, csrf_val):
+                        self._send(403, "<h1>403</h1><p>操作令牌无效，请刷新页面后重试。</p>")
+                        return
+                plan_id_val = fields.get("plan_id", "")
+                if not isinstance(plan_id_val, str) or not plan_id_val:
+                    self._send(400, "<h1>400</h1>", close=True)
+                    return
+                file_field = fields.get("ticket_image")
+                if not isinstance(file_field, tuple) or len(file_field) != 2:
+                    self._send(400, "<h1>400</h1>", close=True)
+                    return
+                filename, file_data = file_field
+                level, detail = application.trigger_upload_ticket(plan_id_val, str(filename), file_data)
+                self._redirect(detail, level)
+                return
+
             if path == "/login" and not application.public_mode:
                 self._discard_request_body()
                 self._send(404, "<h1>404</h1>", close=True)

@@ -158,6 +158,7 @@ class Settings:
     mail_from: str
     mail_dry_run: bool
     mail_preview_dir: Path
+    ticket_image_dir: Path
     qwen_api_key: str
     qwen_api_url: str
     qwen_model: str
@@ -235,6 +236,7 @@ class Settings:
             mail_from=os.getenv("MAIL_FROM", "").strip(),
             mail_dry_run=_bool("MAIL_DRY_RUN", True),
             mail_preview_dir=_path(os.getenv("MAIL_PREVIEW_DIR", "data/mail-preview")),
+            ticket_image_dir=_path(os.getenv("TICKET_IMAGE_DIR", "data/ticket-images")),
             qwen_api_key=os.getenv("QWEN_API_KEY", "").strip(),
             qwen_api_url=os.getenv(
                 "QWEN_API_URL",
