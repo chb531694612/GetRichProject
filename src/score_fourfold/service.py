@@ -533,8 +533,12 @@ class ScoreFourfoldService:
         self.refresh_runtime_settings()
         sent, failed = flush_outbox(self.database, self.mailer, now)
         status = "ok" if failed == 0 else "partial"
-        self.database.add_log("mail", f"邮件发送完成", f"成功{sent}封，失败{failed}封")
-        return JobOutcome(status, f"邮件发送{sent}封，失败{failed}封")
+        if sent or failed:
+            self.database.add_log("mail", f"邮件发送完成", f"成功{sent}封，失败{failed}封")
+            detail = f"邮件发送{sent}封，失败{failed}封"
+        else:
+            detail = "无待发邮件"
+        return JobOutcome(status, detail)
 
     def test_mail(self, now: datetime) -> JobOutcome:
         self.refresh_runtime_settings()

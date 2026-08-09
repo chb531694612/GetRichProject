@@ -81,7 +81,7 @@ class FullFlowTests(unittest.TestCase):
         recommendation_outcome = service.recommend(now)
         self.assertEqual(recommendation_outcome.status, "created")
         early = service.send_mail(now)
-        self.assertIn("0", early.detail)
+        self.assertIn("无待发", early.detail)
         self.assertFalse((tmp_path / "000001.html").exists())
         clock_value[0] = now.replace(hour=15)
         sent = service.send_mail(now)

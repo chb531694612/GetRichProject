@@ -98,7 +98,10 @@ def _run_cycle(
         errors.append(error)
     else:
         outcomes.append(outcome)
-        LOGGER.info("send-mail: %s", outcome.detail)
+        if outcome.detail == "无待发邮件":
+            LOGGER.debug("send-mail: %s", outcome.detail)
+        else:
+            LOGGER.info("send-mail: %s", outcome.detail)
     return outcomes, errors
 
 
