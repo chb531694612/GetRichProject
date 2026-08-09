@@ -116,6 +116,13 @@ async function recommend() {
   bootstrap.value = await apiGet('/api/v1/bootstrap')
 }
 
+async function logout() {
+  try {
+    await apiPost('/api/v1/logout', {})
+    window.location.assign('/login')
+  } catch (error) { toast((error as Error).message, 'error') }
+}
+
 async function deletePlan(plan: any) {
   if (!window.confirm(`确定删除计划 ${plan.plan_id}？此操作不能撤销。`)) return
   await action('/api/v1/actions/delete-plan', { plan_id: plan.plan_id }, `delete-${plan.plan_id}`)
@@ -247,6 +254,7 @@ onMounted(async () => {
       <span class="online"><i />服务正常</span>
       <button class="ghost" @click="openCalendar">购彩日历</button>
       <button class="ghost" @click="settingsOpen = true">设置</button>
+      <button v-if="bootstrap?.public_mode" class="ghost" @click="logout">退出登录</button>
     </div>
   </header>
 

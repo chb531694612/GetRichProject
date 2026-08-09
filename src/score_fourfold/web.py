@@ -1531,6 +1531,9 @@ def _loopback_host(raw_host: str) -> bool:
 def build_handler(application: DashboardApplication):
     dashboard_api = DashboardAPI(application)
     dashboard_static = Path(__file__).with_name("static") / "dashboard"
+    development_static = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if not dashboard_static.is_dir() and development_static.is_dir():
+        dashboard_static = development_static
 
     class DashboardHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1639,11 +1642,21 @@ def build_handler(application: DashboardApplication):
         def _is_ajax(self) -> bool:
             return self.headers.get("X-Requested-With") == "XMLHttpRequest"
 
-        def _json_response(self, data: dict, status: int = 200) -> None:
+        def _json_response(
+            self,
+            data: dict,
+            status: int = 200,
+            *,
+            extra_headers: tuple[tuple[str, str], ...] = (),
+        ) -> None:
             body = json.dumps(data, ensure_ascii=False)
             payload = body.encode("utf-8")
             self.send_response(status)
-            self._headers("application/json; charset=utf-8", len(payload))
+            self._headers(
+                "application/json; charset=utf-8",
+                len(payload),
+                extra_headers,
+            )
             self.end_headers()
             self.wfile.write(payload)
 
@@ -1717,7 +1730,9 @@ def build_handler(application: DashboardApplication):
             self._json_response({"level": "ok", "data": data})
 
         def _api_post(self, path: str) -> None:
-            session = self._api_session()
+            authenticated = self._session() if application.public_mode else None
+            token = authenticated[0] if authenticated is not None else ""
+            session = authenticated[1] if authenticated is not None else None
             if application.public_mode and session is None:
                 self._discard_request_body()
                 self._json_response({"level": "error", "detail": "登录已失效"}, 401)
@@ -1730,6 +1745,16 @@ def build_handler(application: DashboardApplication):
                 return
             payload = self._read_json()
             if payload is None:
+                return
+            if path == "/api/v1/logout":
+                if not application.public_mode:
+                    self._json_response({"level": "error", "detail": "当前模式无需退出登录"}, 400)
+                    return
+                application.revoke_session(token)
+                self._json_response(
+                    {"level": "ok", "detail": "已安全退出", "data": {}},
+                    extra_headers=(("Set-Cookie", application.session_cookie("", delete=True)),),
+                )
                 return
             try:
                 level, detail = "ok", "操作完成"

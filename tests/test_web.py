@@ -204,6 +204,16 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(plans["summary"]["plans_total"], 1)
             self.assertEqual(plans["items"][0]["market"], "crs")
 
+            status, _, payload = self._request(
+                server,
+                "GET",
+                "/api/v1/plans?page=99&per_page=8&market=CRS",
+            )
+            self.assertEqual(status, 200)
+            clamped = json.loads(payload)["data"]
+            self.assertEqual(clamped["pagination"]["page"], 1)
+            self.assertEqual(len(clamped["items"]), 1)
+
             request_payload = json.dumps(
                 bootstrap["recommendation_request"], ensure_ascii=False
             ).encode("utf-8")
@@ -534,9 +544,19 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("text/html", headers["content-type"])
             self.assertEqual(headers["cache-control"], "no-store")
-            self.assertIn("default-src 'none'", headers["content-security-policy"])
+            self.assertIn("script-src 'self'", headers["content-security-policy"])
             self.assertEqual(headers["x-frame-options"], "DENY")
-            self.assertIn("比分串关个人看板", payload.decode("utf-8"))
+            page = payload.decode("utf-8")
+            self.assertIn("<title>个人看板</title>", page)
+            asset_match = re.search(r'src="(/assets/[^"]+\.js)"', page)
+            self.assertIsNotNone(asset_match)
+            assert asset_match is not None
+            asset_status, asset_headers, asset_body = self._request(
+                server, "GET", asset_match.group(1)
+            )
+            self.assertEqual(asset_status, 200)
+            self.assertIn("text/javascript", asset_headers["content-type"])
+            self.assertGreater(len(asset_body), 1000)
 
             status, _, _ = self._request(server, "GET", "/actions/recommend")
             self.assertEqual(status, 404)
@@ -1051,15 +1071,9 @@ class PublicDashboardSecurityTests(unittest.TestCase):
             headers=self._public_headers(Cookie=new_cookie),
         )
         self.assertEqual(status, 200)
-        self.assertIn("退出登录", payload.decode("utf-8"))
         page = payload.decode("utf-8")
-        nonce = re.search(r'<script nonce="([A-Za-z0-9_-]+)">', page)
-        self.assertIsNotNone(nonce)
-        assert nonce is not None
-        self.assertIn(
-            f"script-src 'nonce-{nonce.group(1)}'",
-            page_headers["content-security-policy"],
-        )
+        self.assertIn("<title>个人看板</title>", page)
+        self.assertIn("script-src 'self'", page_headers["content-security-policy"])
         self.assertNotIn('href="javascript:', page)
 
     def test_logout_requires_csrf_and_invalidates_old_cookie(self):
@@ -1107,6 +1121,32 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 303)
         self.assertEqual(headers["location"], "/login")
+
+    def test_vue_api_logout_requires_csrf_and_clears_session_cookie(self):
+        status, headers, _ = self._login()
+        self.assertEqual(status, 303)
+        cookie = self._cookie_from(headers)
+        token = cookie.split("=", 1)[1]
+        session = self.application.get_session(token)
+        assert session is not None
+
+        status, response_headers, payload = self._request(
+            "POST",
+            "/api/v1/logout",
+            body=b"{}",
+            headers=self._public_headers(
+                **{
+                    "Content-Type": "application/json",
+                    "Cookie": cookie,
+                    "X-CSRF-Token": session.csrf_token,
+                }
+            ),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["level"], "ok")
+        self.assertIn("Max-Age=0", response_headers["set-cookie"])
+        self.assertIsNone(self.application.get_session(token))
 
     def test_recommend_requires_session_csrf_host_and_origin(self):
         status, headers, home = self._login()

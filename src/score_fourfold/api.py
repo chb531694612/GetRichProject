@@ -150,10 +150,17 @@ class DashboardAPI:
         )
         safe_per_page = max(1, min(per_page, 50))
         pages = max(1, math.ceil(total / safe_per_page))
+        safe_page = min(max(1, page), pages)
+        if safe_page != page:
+            plans, _ = self.database.filtered_plans(
+                filters,
+                page=safe_page,
+                per_page=safe_per_page,
+            )
         return {
             "items": [serialize_plan(plan) for plan in plans],
             "pagination": {
-                "page": min(max(1, page), pages),
+                "page": safe_page,
                 "per_page": safe_per_page,
                 "total": total,
                 "pages": pages,
