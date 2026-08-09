@@ -534,24 +534,19 @@ class DashboardApplication:
                 )
 
     def trigger_mark_purchased(self, plan_id: str, purchased: bool) -> tuple[str, str]:
-        """Mark or unmark a plan as purchased. When marking as purchased,
-        also attempt to settle the plan so its status reflects match results."""
+        """Mark or unmark a plan as purchased. Purchased pending plans are
+        locked from leg adjustments until purchase is cancelled."""
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
         if not self.database.set_purchased(plan_id, purchased):
             return ("error", f"更新计划 {plan_id} 购买标记失败")
         if purchased:
-            self.database.add_log("recommend", f"计划{plan_id}标记为已购买")
-            if plan.status in {PlanStatus.PENDING, PlanStatus.VOID} and self.trigger_settle_plan is not None:
-                settle_level, settle_detail = self.trigger_settle_plan(plan_id)
-                action = "标记购买"
-                if settle_level == "ok":
-                    action = "标记购买并完成结算"
-                elif settle_level in ("warn", "error"):
-                    action = f"标记购买（结算{settle_detail}）"
-                return ("ok", f"已{action}计划 {plan_id}")
-            return ("ok", f"已标记购买计划 {plan_id}")
+            self.database.add_log("recommend", f"计划{plan_id}标记为已购买，已锁定调整")
+            return ("ok", f"已标记购买计划 {plan_id}，场次调整已锁定")
+        if plan.status in {PlanStatus.PENDING, PlanStatus.VOID}:
+            self.database.add_log("recommend", f"计划{plan_id}取消购买，恢复可调整")
+            return ("ok", f"已取消购买标记计划 {plan_id}，场次调整已恢复")
         return ("ok", f"已取消购买标记计划 {plan_id}")
 
     def trigger_upload_ticket(self, plan_id: str, filename: str, data: bytes) -> tuple[str, str]:
@@ -614,6 +609,8 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
+        if plan.purchased and plan.status in {PlanStatus.PENDING, PlanStatus.VOID}:
+            return ("warn", f"计划 {plan_id} 已标记购买，场次调整已锁定，请先取消购买标记")
         if len(plan.legs) <= 1:
             return ("warn", "计划只剩一场比赛，请使用删除整张计划")
         deleted = self.database.delete_plan_leg(plan_id, match_id)
@@ -711,6 +708,8 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
+        if plan.purchased and plan.status in {PlanStatus.PENDING, PlanStatus.VOID}:
+            return ("warn", f"计划 {plan_id} 已标记购买，场次调整已锁定，请先取消购买标记")
         leg = next((item for item in plan.legs if item.match_id == match_id), None)
         if leg is None:
             return ("warn", f"未找到比赛 {match_id}")
