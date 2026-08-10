@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import hmac
 import html
@@ -1568,10 +1569,13 @@ def build_handler(application: DashboardApplication):
             extra_headers: tuple[tuple[str, str], ...] = (),
             *,
             script_nonce: str = "",
+            vary_encoding: bool = False,
         ) -> None:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
+            if vary_encoding:
+                self.send_header("Vary", "Accept-Encoding")
             script_policy = f"; script-src 'nonce-{script_nonce}'" if script_nonce else ""
             img_policy = "; img-src 'self'" if script_nonce else ""
             self.send_header(
@@ -1588,6 +1592,18 @@ def build_handler(application: DashboardApplication):
             for key, value in extra_headers:
                 self.send_header(key, value)
 
+        def _accepts_gzip(self) -> bool:
+            encoding = self.headers.get("Accept-Encoding", "")
+            return "gzip" in [part.strip().lower() for part in encoding.split(",")]
+
+        def _gzip_payload(self, payload: bytes, min_length: int = 1024) -> tuple[bytes, tuple[tuple[str, str], ...], bool]:
+            if len(payload) < min_length or not self._accepts_gzip():
+                return payload, (), False
+            compressed = gzip.compress(payload, compresslevel=6)
+            if len(compressed) >= len(payload):
+                return payload, (), False
+            return compressed, (("Content-Encoding", "gzip"),), True
+
         def _send(
             self,
             status: int,
@@ -1598,13 +1614,20 @@ def build_handler(application: DashboardApplication):
             close: bool = False,
         ) -> None:
             payload = body.encode("utf-8")
+            payload, encoding_headers, varied = self._gzip_payload(payload)
             nonce_match = re.search(r'<script nonce="([A-Za-z0-9_-]{16,64})">', body)
             script_nonce = nonce_match.group(1) if nonce_match else ""
             self.send_response(status)
             if close:
                 extra_headers += (("Connection", "close"),)
                 self.close_connection = True
-            self._headers(content_type, len(payload), extra_headers, script_nonce=script_nonce)
+            self._headers(
+                content_type,
+                len(payload),
+                extra_headers + encoding_headers,
+                script_nonce=script_nonce,
+                vary_encoding=varied,
+            )
             self.end_headers()
             self.wfile.write(payload)
 
@@ -1640,10 +1663,19 @@ def build_handler(application: DashboardApplication):
                 ".webp": "image/webp",
             }.get(target.suffix.lower(), "application/octet-stream")
             payload = target.read_bytes()
+            compressible = content_type.startswith(("text/", "application/javascript", "application/json")) or content_type == "image/svg+xml"
+            if compressible:
+                payload, encoding_headers, varied = self._gzip_payload(payload)
+            else:
+                encoding_headers, varied = (), False
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store" if target.suffix == ".html" else "public, max-age=31536000, immutable")
+            for key, value in encoding_headers:
+                self.send_header(key, value)
+            if varied:
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; "
@@ -1672,11 +1704,13 @@ def build_handler(application: DashboardApplication):
         ) -> None:
             body = json.dumps(data, ensure_ascii=False)
             payload = body.encode("utf-8")
+            payload, encoding_headers, varied = self._gzip_payload(payload)
             self.send_response(status)
             self._headers(
                 "application/json; charset=utf-8",
                 len(payload),
-                extra_headers,
+                extra_headers + encoding_headers,
+                vary_encoding=varied,
             )
             self.end_headers()
             self.wfile.write(payload)

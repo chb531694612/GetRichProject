@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import http.client
 import json
 import re
@@ -100,14 +101,18 @@ class DashboardTests(unittest.TestCase):
             time.sleep(0.01)
         raise AssertionError("background task did not finish in time")
 
-    def _create_plan(self, *, secret_team: str | None = None):
+    def _create_plan(self, *, secret_team: str | None = None, index: int = 0):
+        business_date = f"2026-07-{15 + index:02d}"
+        created_at = self.now + timedelta(days=index)
         matches = [
-            make_match(i, self.now, business_date="2026-07-15", odds="2.00")
+            make_match(i, created_at, business_date=business_date, odds="2.00")
             for i in range(1, 5)
         ]
         if secret_team is not None:
             matches[0] = replace(matches[0], home=secret_team)
-        recommendation = make_recommendation(self.now, matches)
+        recommendation = make_recommendation(created_at, matches)
+        if index:
+            recommendation = replace(recommendation, plan_id=f"BF4-TEST-{1000 + index}")
         subject, text_body, html_body = render_recommendation(recommendation)
         self.assertTrue(
             self.database.create_plan_with_mail(
@@ -115,7 +120,7 @@ class DashboardTests(unittest.TestCase):
                 subject=subject,
                 text_body=text_body,
                 html_body=html_body,
-                expires_at=self.now + timedelta(hours=5),
+                expires_at=created_at + timedelta(hours=5),
             )
         )
         return recommendation
@@ -270,6 +275,69 @@ class DashboardTests(unittest.TestCase):
             )
             self.assertEqual(status, 403)
             self.assertIn("操作令牌无效", json.loads(payload)["detail"])
+        finally:
+            server.stop()
+
+    def test_json_api_compresses_response_with_gzip_when_accepted(self):
+        for i in range(5):
+            self._create_plan(index=i)
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            status, headers, payload = self._request(
+                server,
+                "GET",
+                "/api/v1/plans?page=1&per_page=8",
+                headers={"Accept-Encoding": "gzip"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("content-encoding"), "gzip")
+            self.assertEqual(headers.get("vary"), "Accept-Encoding")
+            self.assertGreater(len(payload), 0)
+            decompressed = gzip.decompress(payload)
+            data = json.loads(decompressed)["data"]
+            self.assertEqual(data["pagination"]["total"], 5)
+        finally:
+            server.stop()
+
+    def test_json_api_sends_uncompressed_response_without_gzip_acceptance(self):
+        for i in range(5):
+            self._create_plan(index=i)
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            status, headers, payload = self._request(
+                server,
+                "GET",
+                "/api/v1/plans?page=1&per_page=8",
+            )
+            self.assertEqual(status, 200)
+            self.assertNotIn("content-encoding", headers)
+            data = json.loads(payload)["data"]
+            self.assertEqual(data["pagination"]["total"], 5)
+        finally:
+            server.stop()
+
+    def test_static_text_assets_are_gzipped_when_accepted(self):
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            _, _, html_payload = self._request(server, "GET", "/")
+            css_match = re.search(rb'href="(/assets/[^"]+\.css)"', html_payload)
+            self.assertIsNotNone(css_match, "index.html should reference a CSS asset")
+            css_path = css_match.group(1).decode()
+            status, headers, payload = self._request(
+                server,
+                "GET",
+                css_path,
+                headers={"Accept-Encoding": "gzip"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("content-encoding"), "gzip")
+            self.assertEqual(headers.get("vary"), "Accept-Encoding")
+            self.assertGreater(len(payload), 0)
+            decompressed = gzip.decompress(payload)
+            self.assertGreater(len(decompressed), 1024)
         finally:
             server.stop()
 
