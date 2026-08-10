@@ -230,6 +230,7 @@ async function deletePlan(plan: any) {
 
 const ticketFileInput = ref<HTMLInputElement | null>(null)
 const pendingUploadPlan = ref<any>(null)
+const ticketZoomUrl = ref<string>('')
 function pickTicket(plan: any) {
   pendingUploadPlan.value = plan
   ticketFileInput.value?.click()
@@ -477,11 +478,22 @@ onMounted(async () => {
             </table>
           </div>
           <footer class="plan-actions">
-            <div><button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button><button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button><button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button><button class="soft" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">上传实票</button></div>
+            <div class="action-bar">
+              <button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button>
+              <button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button>
+              <button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button>
+              <button class="soft" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">上传实票</button>
+            </div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
             <div v-if="plan.ticket_image_url" class="ticket-box">
-              <img class="ticket-thumb" :src="plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票图片`" loading="lazy" />
-              <button class="text-danger" @click="deleteTicket(plan)">移除实票</button>
+              <img class="ticket-thumb" :src="plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票图片`" loading="lazy" @click="ticketZoomUrl = plan.ticket_image_url" />
+              <div class="ticket-meta">
+                <span class="ticket-label">实票凭证</span>
+                <div class="ticket-ops">
+                  <button class="link" @click="ticketZoomUrl = plan.ticket_image_url">放大查看</button>
+                  <button class="text-danger" @click="deleteTicket(plan)">移除实票</button>
+                </div>
+              </div>
             </div>
           </footer>
           <details v-if="plan.ai_summary" class="ai-summary"><summary>查看 AI 总体分析</summary><p>{{ plan.ai_summary }}</p></details>
@@ -555,6 +567,11 @@ onMounted(async () => {
         </div>
       </div>
     </section>
+  </div>
+
+  <div v-if="ticketZoomUrl" class="modal-layer zoom-layer" @click.self="ticketZoomUrl = ''">
+    <img class="zoom-img" :src="ticketZoomUrl" alt="实票大图" />
+    <button class="modal-close zoom-close" @click="ticketZoomUrl = ''">×</button>
   </div>
 
   <input ref="ticketFileInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp" hidden @change="uploadTicket" />
