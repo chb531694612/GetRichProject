@@ -10,6 +10,8 @@ const result = ref<any>({ items: [], pagination: { page: 1, pages: 1, total: 0 }
 const settings = ref<any>(null)
 const filters = reactive<Filters>({ market: '', status: '', purchased: '', date: '', q: '' })
 const page = ref(1)
+const perPage = ref(8)
+const jumpPage = ref<number | ''>('')
 const loading = ref(true)
 const busy = ref('')
 const calendarOpen = ref(false)
@@ -29,10 +31,45 @@ const profileLabels: Record<string, string> = { crs: '比分', had: '胜平负',
 const statusLabels: Record<string, string> = { pending: '待结算', won: '已中奖', lost: '未中奖', void: '已取消' }
 
 const queryString = computed(() => {
-  const query = new URLSearchParams({ page: String(page.value), per_page: '8' })
+  const query = new URLSearchParams({ page: String(page.value), per_page: String(perPage.value) })
   Object.entries(filters).forEach(([key, value]) => value && query.set(key, value))
   return query.toString()
 })
+
+const perPageOptions = [8, 16, 32, 50]
+const paginationStart = computed(() => {
+  const total = result.value.pagination.total || 0
+  if (total === 0) return 0
+  return (result.value.pagination.page - 1) * (result.value.pagination.per_page || perPage.value) + 1
+})
+const paginationEnd = computed(() => {
+  const total = result.value.pagination.total || 0
+  return Math.min(result.value.pagination.page * (result.value.pagination.per_page || perPage.value), total)
+})
+const visiblePages = computed(() => {
+  const current = result.value.pagination.page || 1
+  const total = result.value.pagination.pages || 1
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1)
+  if (current <= 4) return [1, 2, 3, 4, 5, '…', total]
+  if (current >= total - 3) return [1, '…', total - 4, total - 3, total - 2, total - 1, total]
+  return [1, '…', current - 1, current, current + 1, '…', total]
+})
+
+function goToPage(target: number) {
+  const pages = result.value.pagination.pages || 1
+  page.value = Math.min(Math.max(1, target), pages)
+  loadPlans()
+}
+
+function jumpToPage() {
+  const target = Number(jumpPage.value)
+  if (!Number.isFinite(target) || target < 1) {
+    toast('请输入有效页码', 'warn')
+    return
+  }
+  goToPage(target)
+  jumpPage.value = ''
+}
 
 const summary = computed(() => result.value.summary || {})
 const calendarTitle = computed(() => `${calendarDate.value.getFullYear()}年${calendarDate.value.getMonth() + 1}月`)
@@ -62,6 +99,7 @@ async function loadPlans(reset = false) {
   try {
     result.value = await apiGet(`/api/v1/plans?${queryString.value}`)
     page.value = result.value.pagination.page
+    perPage.value = result.value.pagination.per_page || perPage.value
   } catch (error) {
     toast((error as Error).message, 'error')
   } finally {
@@ -416,7 +454,19 @@ onMounted(async () => {
           <details v-if="plan.ai_summary" class="ai-summary"><summary>查看 AI 总体分析</summary><p>{{ plan.ai_summary }}</p></details>
         </article>
       </div>
-      <nav class="pagination"><button :disabled="page <= 1" @click="page--; loadPlans()">上一页</button><span>第 {{ result.pagination.page }} / {{ result.pagination.pages }} 页</span><button :disabled="page >= result.pagination.pages" @click="page++; loadPlans()">下一页</button></nav>
+      <nav class="pagination">
+        <span class="pagination-info">{{ paginationStart }} - {{ paginationEnd }} 共 {{ result.pagination.total || 0 }} 张</span>
+        <button class="page-prev" :disabled="page <= 1" @click="page--; loadPlans()">上一页</button>
+        <template v-for="(item, index) in visiblePages" :key="`${item}-${index}`">
+          <button v-if="typeof item === 'number'" class="page-number" :class="{ active: item === page }" @click="goToPage(item)">{{ item }}</button>
+          <span v-else class="page-ellipsis">{{ item }}</span>
+        </template>
+        <button class="page-next" :disabled="page >= result.pagination.pages" @click="page++; loadPlans()">下一页</button>
+        <select v-model="perPage" class="per-page" @change="loadPlans(true)">
+          <option v-for="size in perPageOptions" :key="size" :value="size">{{ size }}条/页</option>
+        </select>
+        <label class="page-jump">跳至 <input v-model.number="jumpPage" type="number" min="1" @keyup.enter="jumpToPage" /> 页</label>
+      </nav>
     </section>
   </main>
 
