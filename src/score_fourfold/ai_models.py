@@ -115,7 +115,7 @@ def call_with_web_search(
         "input": [
             {
                 "role": "system",
-                "content": "必须先联网检索公开资料，再严格按用户要求输出。",
+                "content": "你是一名严谨的足球比赛信息分析师。必须先联网检索公开资料，综合战绩、交锋、伤停、赛程和社区观点进行交叉验证，严禁敷衍了事或给出空泛结论。严格按用户要求输出。",
             },
             {"role": "user", "content": prompt},
         ],

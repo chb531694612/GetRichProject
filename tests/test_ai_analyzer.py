@@ -130,6 +130,8 @@ class AIAnalyzerTests(unittest.TestCase):
         prompt = payload["input"][1]["content"]
         self.assertIn("周二001", prompt)
         self.assertIn("主队 vs 客队", prompt)
+        self.assertIn("历史交锋", prompt)
+        self.assertIn("讨论区", prompt)
         self.assertNotIn("SECRET-PICK", prompt)
         self.assertNotIn("9.99", prompt)
         self.assertNotIn("0.12345", prompt)
@@ -183,6 +185,8 @@ class AIAnalyzerTests(unittest.TestCase):
         prompt = request_payload["input"][1]["content"]
         self.assertIn("match_id=1001", prompt)
         self.assertIn("比赛日期=2026-07-22", prompt)
+        self.assertIn("历史交锋", prompt)
+        self.assertIn("讨论区", prompt)
         self.assertNotIn("option_code", prompt)
         self.assertNotIn("SP", prompt)
         self.assertNotIn("5.00", prompt)

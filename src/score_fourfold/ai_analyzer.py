@@ -35,14 +35,21 @@ class AIPlanAnalysis:
 
 def _build_prompt(matches: list[tuple[Any, ScoreOption]], market: MarketType) -> str:
     lines: list[str] = [
-        "你是一名审慎的足球比赛分析师。请先联网搜索每场比赛双方球队的近期公开信息，再进行分析。",
+        "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
+        "请先对每场比赛逐一联网搜索，务必综合以下信息源进行交叉验证：",
+        "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
+        "- 双方历史交锋记录（H2H）及主客场差异；",
+        "- 球队伤停、停赛、轮换情况和关键球员 availability；",
+        "- 近期赛程密度、体能状况及是否多线作战；",
+        "- 主客场表现差异、主场优势程度；",
+        "- 足球讨论区、球迷社区和专业媒体的主流观点与分歧。",
         "",
         f"玩法：{market.label_zh}串关",
         "",
-        "请从以下几个维度分析：",
-        "1. 双方近期状态、伤停、赛程密度和主客场表现；",
-        "2. 可能影响结果的不确定因素和信息时效风险；",
-        "3. 给出一段不超过120字的中文总体判断。",
+        "分析要求：",
+        "1. 每场比赛必须引用至少 2 条具体搜索到的事实依据（如近期战绩、交锋数据、伤停信息），不得使用'双方实力接近''比赛难分胜负'等空泛套话；",
+        "2. 明确指出影响结果的关键变量和信息时效风险；",
+        "3. 给出一段不超过300字的中文总体判断，须体现实质性分析而非泛泛而谈。",
         "",
         "系统只提供以下基础赛程信息：",
     ]
@@ -56,6 +63,7 @@ def _build_prompt(matches: list[tuple[Any, ScoreOption]], market: MarketType) ->
     lines.append("")
     lines.append("不要讨论或猜测任何赔率、SP值、概率，也不要声称系统已经选择了某个结果。")
     lines.append("请用中文输出分析结果，不要列出具体投注金额，不要建议用户加大投入。")
+    lines.append("分析必须基于联网搜索到的具体信息，禁止仅凭常识或猜测给出笼统结论。")
     return "\n".join(lines)
 
 
@@ -67,7 +75,7 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         "input": [
             {
                 "role": "system",
-                "content": "你是一名足球比赛信息分析师。必须先联网检索近期公开资料，并严格按用户要求输出。",
+                "content": "你是一名严谨的足球比赛信息分析师。必须先联网检索近期公开资料，综合战绩、交锋、伤停、赛程和社区观点进行交叉验证，严禁敷衍了事或给出空泛结论。严格按用户要求输出。",
             },
             {"role": "user", "content": prompt},
         ],
@@ -161,7 +169,7 @@ def qwen_analyze(
     settings: Settings,
 ) -> str:
     """Call Qwen with mandatory web search to analyze selected matches."""
-    return _qwen_response(_build_prompt(matches, market), settings, max_tokens=1024)
+    return _qwen_response(_build_prompt(matches, market), settings, max_tokens=2048)
 
 
 def probe_qwen(settings: Settings) -> str:
@@ -186,7 +194,7 @@ def analyze_matches(
                 runtime,
                 _build_prompt(matches, market),
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=1024,
+                max_output_tokens=2048,
             )
         return qwen_analyze(matches, market, settings)
     except (AIAnalysisError, AIModelError) as exc:
@@ -243,13 +251,21 @@ def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -
         MarketType.TTG: "pick 只能是 0、1、2、3、4、5、6、7+ 八者之一。",
     }[market]
     lines = [
-        "你是一名审慎的足球比赛分析师。必须先联网搜索每场双方球队的近期状态、伤停、赛程和主客场表现。",
+        "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
+        "必须先对每场比赛逐一联网搜索，综合以下信息源进行交叉验证后再给出判断：",
+        "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
+        "- 双方历史交锋记录（H2H）及主客场差异；",
+        "- 球队伤停、停赛、轮换情况和关键球员 availability；",
+        "- 近期赛程密度、体能状况及是否多线作战；",
+        "- 主客场表现差异、主场优势程度；",
+        "- 足球讨论区、球迷社区和专业媒体的主流观点与分歧。",
+        "",
         f"当前玩法：{pick_name}串关。你必须覆盖每一个 match_id。{pick_rule}",
         "系统不会向你提供赔率、概率、候选项或当前推荐；请不要讨论、猜测或反推这些信息。",
         "",
         "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要添加 JSON 以外的文字。格式必须为：",
-        '{"summary":"不超过160字的总体分析","suggestions":['
-        '{"match_id":"原样返回","pick":"该玩法的具体结果","reason":"不超过60字"}]}',
+        '{"summary":"不超过300字的总体分析，须引用具体战绩和交锋数据","suggestions":['
+        '{"match_id":"原样返回","pick":"该玩法的具体结果","reason":"不超过100字，须引用至少2条具体搜索到的事实依据"}]}',
         "",
         "基础赛程信息：",
     ]
@@ -262,8 +278,9 @@ def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -
     lines.extend(
         [
             "",
-            "summary 应说明主要风险和联网资料的时效性。每场必须恰好返回一条建议；reason 简述球队信息依据。",
-            "分析仅供辅助参考，不构成投注建议，不要建议增加投入。",
+            "summary 须说明主要风险、关键信息依据和联网资料的时效性，禁止使用空泛套话。",
+            "每场 reason 必须引用至少 2 条具体搜索到的事实（如近期战绩、交锋数据、伤停信息），不得使用'双方实力接近'等笼统表述。",
+            "每场必须恰好返回一条建议；分析仅供辅助参考，不构成投注建议，不要建议增加投入。",
         ]
     )
     return "\n".join(lines)
@@ -379,14 +396,14 @@ def analyze_plan_from_leg_data(
         raise AIAnalysisError("plan has no legs to analyze")
     prompt = _build_plan_recommendation_prompt(legs, market)
     if runtime is None:
-        content = _qwen_response(prompt, settings, max_tokens=1800)
+        content = _qwen_response(prompt, settings, max_tokens=2400)
     else:
         try:
             content = call_with_web_search(
                 runtime,
                 prompt,
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=1800,
+                max_output_tokens=2400,
             )
         except AIModelError as exc:
             raise AIAnalysisError(str(exc)) from exc
