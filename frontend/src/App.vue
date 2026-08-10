@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { apiGet, apiPost, setCsrfToken } from './api'
+import { apiGet, apiPost, apiUpload, setCsrfToken } from './api'
 
 type Toast = { id: number; level: string; text: string }
 type Filters = { market: string; status: string; purchased: string; date: string; q: string }
@@ -228,6 +228,35 @@ async function deletePlan(plan: any) {
   await action('/api/v1/actions/delete-plan', { plan_id: plan.plan_id }, `delete-${plan.plan_id}`)
 }
 
+const ticketFileInput = ref<HTMLInputElement | null>(null)
+const pendingUploadPlan = ref<any>(null)
+function pickTicket(plan: any) {
+  pendingUploadPlan.value = plan
+  ticketFileInput.value?.click()
+}
+async function uploadTicket(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  const plan = pendingUploadPlan.value
+  input.value = ''
+  pendingUploadPlan.value = null
+  if (!file || !plan) return
+  busy.value = `ticket-${plan.plan_id}`
+  try {
+    const response = await apiUpload<any>('/api/v1/actions/upload-ticket', file, plan.plan_id)
+    toast(response.detail || '实票已上传', response.level)
+    if (response.data?.plan) applyActionData(response.data, plan.plan_id)
+  } catch (error) {
+    toast((error as Error).message, 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+async function deleteTicket(plan: any) {
+  if (!window.confirm(`确定移除计划 ${plan.plan_id} 的实票图片？`)) return
+  await action('/api/v1/actions/delete-ticket', { plan_id: plan.plan_id }, `delticket-${plan.plan_id}`)
+}
+
 async function deleteLeg(plan: any, leg: any) {
   if (!window.confirm(`确定从计划中删除 ${leg.match_num}？`)) return
   await action('/api/v1/actions/delete-leg', { plan_id: plan.plan_id, match_id: leg.match_id }, `leg-${leg.match_id}`)
@@ -448,8 +477,12 @@ onMounted(async () => {
             </table>
           </div>
           <footer class="plan-actions">
-            <div><button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button><button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button><button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button></div>
+            <div><button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button><button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button><button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button><button class="soft" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">上传实票</button></div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
+            <div v-if="plan.ticket_image_url" class="ticket-box">
+              <img class="ticket-thumb" :src="plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票图片`" loading="lazy" />
+              <button class="text-danger" @click="deleteTicket(plan)">移除实票</button>
+            </div>
           </footer>
           <details v-if="plan.ai_summary" class="ai-summary"><summary>查看 AI 总体分析</summary><p>{{ plan.ai_summary }}</p></details>
         </article>
@@ -524,5 +557,6 @@ onMounted(async () => {
     </section>
   </div>
 
+  <input ref="ticketFileInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp" hidden @change="uploadTicket" />
   <div class="toasts"><div v-for="item in toasts" :key="item.id" :class="['toast',item.level]">{{ item.text }}</div></div>
 </template>

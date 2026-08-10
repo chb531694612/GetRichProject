@@ -1272,6 +1272,19 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    def clear_ticket_image(self, plan_id: str) -> bool:
+        """Remove the ticket image filename for a plan. Returns True if updated.
+
+        Intentionally keeps the ``purchased`` flag untouched so removing a bad
+        photo does not silently unmark a plan the user already bought.
+        """
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE plans SET ticket_image = '' WHERE plan_id = ?",
+                (plan_id,),
+            )
+            return cursor.rowcount > 0
+
     def _load_plans(
         self,
         connection: sqlite3.Connection,

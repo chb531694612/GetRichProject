@@ -1626,6 +1626,80 @@ class NewFeatureTests(unittest.TestCase):
         )
         self.assertEqual(level, "warn")
 
+    # --- REST API ticket upload / delete (regression for the Vue frontend gap) ---
+
+    def test_api_upload_ticket_saves_image_and_marks_purchased(self):
+        from score_fourfold.api import DashboardAPI
+        rec = self._create_sent_plan()
+        png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
+        api = DashboardAPI(self.application)
+        level, detail = api.upload_ticket(rec.plan_id, "ticket.png", png_data)
+        self.assertEqual(level, "ok")
+        self.assertIn("实票图片已上传", detail)
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertTrue(plan.purchased)
+        self.assertEqual(plan.ticket_image, f"{rec.plan_id}.png")
+        self.assertTrue((Path(self.settings.ticket_image_dir) / f"{rec.plan_id}.png").exists())
+
+    def test_api_delete_ticket_clears_image_keeps_purchase(self):
+        from score_fourfold.api import DashboardAPI
+        rec = self._create_sent_plan()
+        png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.png", png_data)
+        api = DashboardAPI(self.application)
+        level, detail = api.delete_ticket(rec.plan_id)
+        self.assertEqual(level, "ok")
+        self.assertIn("已移除", detail)
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.ticket_image, "", "删除实票应清空 ticket_image")
+        self.assertTrue(plan.purchased, "删除实票不应取消购买标记")
+
+    def test_api_delete_ticket_without_image_returns_warn(self):
+        from score_fourfold.api import DashboardAPI
+        rec = self._create_sent_plan()
+        api = DashboardAPI(self.application)
+        level, detail = api.delete_ticket(rec.plan_id)
+        self.assertEqual(level, "warn")
+        self.assertIn("没有实票图片", detail)
+
+    def test_rest_upload_ticket_endpoint_accepts_multipart(self):
+        rec = self._create_sent_plan()
+        png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
+        boundary = "----testboundary"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="plan_id"\r\n\r\n{rec.plan_id}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="ticket_image"; filename="ticket.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8") + png_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.address[1], timeout=5)
+            connection.request(
+                "POST", "/api/v1/actions/upload-ticket",
+                body=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "X-CSRF-Token": "ssh-loopback",
+                },
+            )
+            response = connection.getresponse()
+            status = response.status
+            payload = response.read()
+            connection.close()
+        finally:
+            server.stop()
+        self.assertEqual(status, 200)
+        body_json = json.loads(payload)
+        self.assertEqual(body_json["level"], "ok")
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.ticket_image, f"{rec.plan_id}.png")
+
     # --- manual settle ---
 
     def test_queue_settle_returns_immediately_and_completes(self):

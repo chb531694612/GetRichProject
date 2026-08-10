@@ -1802,6 +1802,9 @@ def build_handler(application: DashboardApplication):
                 self._discard_request_body()
                 self._json_response({"level": "error", "detail": "操作令牌无效，请刷新页面后重试"}, 403)
                 return
+            if path == "/api/v1/actions/upload-ticket":
+                self._api_post_upload_ticket()
+                return
             payload = self._read_json()
             if payload is None:
                 return
@@ -1844,6 +1847,8 @@ def build_handler(application: DashboardApplication):
                     level, detail = application.trigger_mark_purchased(
                         str(payload.get("plan_id", "")), bool(payload.get("purchased", False))
                     )
+                elif path == "/api/v1/actions/delete-ticket":
+                    level, detail = dashboard_api.delete_ticket(str(payload.get("plan_id", "")))
                 elif path.startswith("/api/v1/settings/"):
                     section = path.removeprefix("/api/v1/settings/")
                     if section == "models":
@@ -1882,6 +1887,32 @@ def build_handler(application: DashboardApplication):
                 LOGGER.exception("dashboard API POST failed: %s", path)
                 self._json_response({"level": "error", "detail": "操作失败，请查看服务日志"}, 500)
                 return
+            self._json_response({"level": level, "detail": detail, "data": data})
+
+        def _api_post_upload_ticket(self) -> None:
+            """Handle multipart upload for ``/api/v1/actions/upload-ticket``.
+
+            CSRF is already validated via the ``X-CSRF-Token`` header in
+            ``_api_post`` before this runs, so only the multipart body and the
+            plan/ticket fields need to be checked here.
+            """
+            fields = self._read_multipart_form()
+            if fields is None:
+                return
+            plan_id_val = fields.get("plan_id", "")
+            if not isinstance(plan_id_val, str) or not plan_id_val:
+                self._json_response({"level": "error", "detail": "缺少计划编号"}, 400)
+                return
+            file_field = fields.get("ticket_image")
+            if not isinstance(file_field, tuple) or len(file_field) != 2:
+                self._json_response({"level": "error", "detail": "未收到图片文件"}, 400)
+                return
+            filename, file_data = file_field
+            level, detail = application.trigger_upload_ticket(plan_id_val, str(filename), file_data)
+            data: dict[str, object] = {"summary": dashboard_api.summary_from_values({})}
+            plan = application.database.get_plan(plan_id_val)
+            if plan is not None:
+                data["plan"] = serialize_plan(plan)
             self._json_response({"level": level, "detail": detail, "data": data})
 
         def _respond_action(
