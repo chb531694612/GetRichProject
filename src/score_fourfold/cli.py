@@ -377,6 +377,9 @@ def main(argv: list[str] | None = None) -> None:
                         "complete_selling_had_matches": sum(
                             match.had_betting_all_up and len(match.had_options) == 3 for match in matches
                         ),
+                        "complete_selling_ttg_matches": sum(
+                            match.ttg_betting_all_up and len(match.ttg_options) == 8 for match in matches
+                        ),
                         "results": len(results),
                         "result_statuses": counts,
                     },
