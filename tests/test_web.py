@@ -208,6 +208,9 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(plans["pagination"]["total"], 1)
             self.assertEqual(plans["summary"]["plans_total"], 1)
             self.assertEqual(plans["items"][0]["market"], "crs")
+            leg = plans["items"][0]["legs"][0]
+            self.assertEqual(leg["original_pick_code"], leg["pick_code"])
+            self.assertEqual(leg["original_pick_label"], leg["pick_label"])
 
             status, _, payload = self._request(
                 server,

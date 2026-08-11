@@ -217,6 +217,9 @@ class DatabaseSafetyTests(unittest.TestCase):
         assert analyzed is not None
         self.assertEqual(len(analyzed.ai_suggestions), 4)
         first = analyzed.legs[0]
+        self.assertEqual(first.original_score_code, first.score_code)
+        self.assertEqual(first.original_score_label, first.score_label)
+        original_label = first.score_label
 
         self.assertTrue(
             self.database.update_plan_leg_option(
@@ -232,6 +235,8 @@ class DatabaseSafetyTests(unittest.TestCase):
         self.assertEqual(updated.ai_summary, "结构化总体分析")
         self.assertEqual(len(updated.ai_suggestions), 3)
         self.assertNotIn(first.match_id, {item.match_id for item in updated.ai_suggestions})
+        self.assertEqual(updated.legs[0].original_score_code, first.score_code)
+        self.assertEqual(updated.legs[0].original_score_label, original_label)
         self.assertFalse(
             self.database.update_plan_leg_option(
                 recommendation.plan_id, first.match_id, "invented-option"

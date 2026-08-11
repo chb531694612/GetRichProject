@@ -51,6 +51,8 @@ class StoredLeg:
     result_away: int | None
     official_status: str
     options: tuple[ScoreOption, ...] = ()
+    original_score_code: str = ""
+    original_score_label: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +172,8 @@ class Database:
                     snapshot_fetched_at TEXT,
                     score_code TEXT NOT NULL,
                     score_label TEXT NOT NULL,
+                    original_score_code TEXT NOT NULL DEFAULT '',
+                    original_score_label TEXT NOT NULL DEFAULT '',
                     odds TEXT NOT NULL,
                     probability TEXT NOT NULL,
                     result_status TEXT NOT NULL DEFAULT 'pending',
@@ -415,6 +419,19 @@ class Database:
         leg_columns = {row["name"] for row in connection.execute("PRAGMA table_info(plan_legs)")}
         if "snapshot_fetched_at" not in leg_columns:
             connection.execute("ALTER TABLE plan_legs ADD COLUMN snapshot_fetched_at TEXT")
+        if "original_score_code" not in leg_columns:
+            connection.execute("ALTER TABLE plan_legs ADD COLUMN original_score_code TEXT NOT NULL DEFAULT ''")
+        if "original_score_label" not in leg_columns:
+            connection.execute("ALTER TABLE plan_legs ADD COLUMN original_score_label TEXT NOT NULL DEFAULT ''")
+        # Backfill original pick for existing legs that do not yet have one.
+        connection.execute(
+            """
+            UPDATE plan_legs
+            SET original_score_code = score_code,
+                original_score_label = score_label
+            WHERE original_score_code = '' OR original_score_code IS NULL
+            """
+        )
         # Existing plans did not keep the full option snapshot. Preserve at
         # least their selected option; a later manual AI run can refresh the
         # remaining choices from the configured provider.
@@ -836,8 +853,9 @@ class Database:
                     INSERT INTO plan_legs
                         (plan_id, position, match_id, match_num, business_date, league,
                          home, away, start_at, odds_updated_at, score_code, score_label,
-                         snapshot_fetched_at, odds, probability)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         original_score_code, original_score_label, snapshot_fetched_at,
+                         odds, probability)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         recommendation.plan_id,
@@ -850,6 +868,8 @@ class Database:
                         leg.match.away,
                         leg.match.start_at.isoformat(),
                         leg.match.odds_updated_at.isoformat() if leg.match.odds_updated_at else None,
+                        leg.score.code,
+                        leg.score.label,
                         leg.score.code,
                         leg.score.label,
                         leg.match.snapshot_fetched_at.isoformat() if leg.match.snapshot_fetched_at else None,
@@ -1396,6 +1416,8 @@ class Database:
                 result_away=leg["result_away"],
                 official_status=leg["official_status"],
                 options=tuple(options_by_match.get(str(leg["match_id"]), ())),
+                original_score_code=leg["original_score_code"] or "",
+                original_score_label=leg["original_score_label"] or "",
             )
             for leg in leg_rows
         )
@@ -1643,6 +1665,20 @@ class Database:
             ).fetchone()
             if option is None:
                 return False
+            # Preserve the very first pick before any replacement.
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET original_score_code = CASE
+                        WHEN original_score_code = '' OR original_score_code IS NULL
+                        THEN score_code ELSE original_score_code END,
+                    original_score_label = CASE
+                        WHEN original_score_label = '' OR original_score_label IS NULL
+                        THEN score_label ELSE original_score_label END
+                WHERE plan_id = ? AND match_id = ?
+                """,
+                (plan_id, match_id),
+            )
             cursor = connection.execute(
                 """
                 UPDATE plan_legs

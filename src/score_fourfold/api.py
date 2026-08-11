@@ -115,6 +115,8 @@ def serialize_plan(plan: StoredPlan) -> dict[str, Any]:
                 "start_at": leg.start_at.isoformat(),
                 "pick_code": leg.score_code,
                 "pick_label": leg.score_label,
+                "original_pick_code": leg.original_score_code,
+                "original_pick_label": leg.original_score_label,
                 "odds": str(leg.odds),
                 "probability": str(leg.probability),
                 "official_status": leg.official_status,
