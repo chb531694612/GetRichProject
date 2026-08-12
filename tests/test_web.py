@@ -693,7 +693,8 @@ class DashboardTests(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_plan_changes_refresh_first_mail_then_queue_revision_after_send(self):
+    def test_plan_changes_no_longer_auto_refresh_mail_push_is_manual(self):
+        """update_leg no longer auto-refreshes mail; push is now manual."""
         recommendation = self._create_plan()
         clock_value = [self.now]
         wake_calls: list[bool] = []
@@ -706,57 +707,40 @@ class DashboardTests(unittest.TestCase):
             clock=lambda: clock_value[0],
         )
         first_leg = recommendation.legs[0]
+        # Count mails before update_leg (initial recommendation mail from _create_plan)
+        with self.database.connect() as connection:
+            before = connection.execute(
+                "SELECT COUNT(*) AS count FROM email_outbox"
+            ).fetchone()["count"]
 
+        # update_leg should NOT create new mail
         level, detail = application.trigger_update_leg(
             recommendation.plan_id, first_leg.match.match_id, "s01s01"
         )
         self.assertEqual(level, "ok")
-        self.assertIn("首封推荐邮件已同步更新", detail)
+        self.assertIn("推送邮件", detail)
+        with self.database.connect() as connection:
+            after = connection.execute(
+                "SELECT COUNT(*) AS count FROM email_outbox"
+            ).fetchone()["count"]
+        self.assertEqual(after, before, "update_leg should not create new mail")
+
+        # manual push should refresh the existing recommendation mail
+        wake_calls.clear()
+        level, detail = application.trigger_push_mail(recommendation.plan_id)
+        self.assertEqual(level, "ok")
+        self.assertIn("推荐邮件", detail)
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT kind, status, next_attempt_at, text_body FROM email_outbox ORDER BY id"
+                "SELECT kind, status, text_body FROM email_outbox ORDER BY id"
             ).fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["status"], "pending")
-        self.assertEqual(
-            datetime.fromisoformat(rows[0]["next_attempt_at"]),
-            datetime(2026, 7, 15, 15, 0, tzinfo=TZ),
+        self.assertEqual(len(rows), before, "push_mail should refresh existing, not add new")
+        self.assertEqual(rows[-1]["status"], "pending")
+        self.assertTrue(
+            any("1:1" in (r["text_body"] or "") for r in rows),
+            "mail body should contain updated score after push",
         )
-        self.assertIn("1:1", rows[0]["text_body"])
-
-        sent_at = datetime(2026, 7, 15, 15, 0, tzinfo=TZ)
-        claimed = self.database.claim_due_emails(sent_at, limit=1)
-        self.assertEqual(len(claimed), 1)
-        self.database.mark_email_sent(
-            int(claimed[0]["id"]), claimed[0]["claim_token"], sent_at
-        )
-        clock_value[0] = sent_at + timedelta(minutes=5)
-        level, detail = application.trigger_update_leg(
-            recommendation.plan_id, first_leg.match.match_id, "s01s00"
-        )
-        self.assertEqual(level, "ok")
-        self.assertIn("最新版推荐邮件已重新排队", detail)
-        with self.database.connect() as connection:
-            update = connection.execute(
-                """
-                SELECT kind, status, subject FROM email_outbox
-                WHERE kind = 'recommendation-update'
-                """
-            ).fetchone()
-        self.assertIsNotNone(update)
-        self.assertEqual(update["status"], "pending")
-        self.assertTrue(update["subject"].startswith("[更新]"))
-
-        level, _ = application.trigger_update_leg(
-            recommendation.plan_id, first_leg.match.match_id, "s01s01"
-        )
-        self.assertEqual(level, "ok")
-        with self.database.connect() as connection:
-            update_count = connection.execute(
-                "SELECT COUNT(*) AS count FROM email_outbox WHERE kind = 'recommendation-update'"
-            ).fetchone()["count"]
-        self.assertEqual(update_count, 1)
-        self.assertEqual(len(wake_calls), 3)
+        self.assertTrue(wake_calls, "wake_mailer should be called on manual push")
 
     def test_post_requires_loopback_host_same_origin_and_valid_signature(self):
         server = DashboardServer(self.settings, self.application)

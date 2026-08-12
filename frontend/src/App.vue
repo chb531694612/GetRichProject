@@ -492,6 +492,7 @@ onMounted(async () => {
               <button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button>
               <button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button>
               <button class="soft" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">上传实票</button>
+              <button class="soft" :disabled="busy === `push-${plan.plan_id}`" @click="action('/api/v1/actions/push-mail',{plan_id:plan.plan_id},`push-${plan.plan_id}`)">推送邮件</button>
             </div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
             <div v-if="plan.ticket_image_url" class="ticket-box">

@@ -1038,6 +1038,76 @@ class Database:
             )
             return "queued"
 
+    def ensure_recommendation_mail(
+        self,
+        plan_id: str,
+        *,
+        subject: str,
+        text_body: str,
+        html_body: str,
+        changed_at: datetime,
+        first_send_at: datetime,
+        expires_at: datetime,
+    ) -> str:
+        """Always create or refresh a recommendation mail regardless of prior delivery status.
+
+        Like refresh_recommendation_mail but does not check whether the original was
+        already sent.  Useful for manual push from the dashboard.
+        Returns ``refreshed``, ``queued``, ``expired``, or ``missing``."""
+        if any(value.tzinfo is None for value in (changed_at, first_send_at, expires_at)):
+            raise ValueError("recommendation mail times must be timezone-aware")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+            if exists is None:
+                return "missing"
+            if changed_at >= expires_at:
+                return "expired"
+            # Replace any existing pending recommendation or update
+            original = connection.execute(
+                "SELECT id, status FROM email_outbox WHERE dedupe_key = ?",
+                (f"recommendation:{plan_id}",),
+            ).fetchone()
+            if original is not None:
+                if original["status"] == "pending":
+                    not_before = max(changed_at, first_send_at)
+                    connection.execute(
+                        """
+                        UPDATE email_outbox
+                        SET subject = ?, text_body = ?, html_body = ?, attempts = 0,
+                            last_error = '', claim_token = NULL, claimed_until = NULL,
+                            next_attempt_at = ?, expires_at = ?
+                        WHERE id = ?
+                        """,
+                        (subject, text_body, html_body,
+                         not_before.isoformat(), expires_at.isoformat(),
+                         int(original["id"])),
+                    )
+                    return "refreshed"
+                # Original was already sent/expired – delete stale update records
+                connection.execute(
+                    "DELETE FROM email_outbox WHERE kind = 'recommendation-update'"
+                    " AND dedupe_key LIKE ?",
+                    (f"recommendation-update:{plan_id}:%",),
+                )
+            # Always queue a fresh recommendation
+            not_before = max(changed_at, first_send_at)
+            self._insert_outbox(
+                connection,
+                dedupe_key=f"recommendation:{plan_id}",
+                kind="recommendation",
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                created_at=changed_at,
+                priority=110,
+                expires_at=expires_at,
+                not_before=not_before,
+            )
+            return "queued"
+
     def pending_plans(self) -> list[StoredPlan]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -1936,6 +2006,46 @@ class Database:
                 html_body=html_body,
                 created_at=settlement.settled_at,
             )
+            return True
+
+    def settle_plan_only(self, settlement: Settlement) -> bool:
+        """Update plan status and leg results for settlement — without queuing a mail."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE plans
+                SET status = ?, settled_at = ?, settled_gross_prize_cents = ?, settled_tax_cents = ?,
+                    settled_net_prize_cents = ?, net_profit_cents = ?
+                WHERE plan_id = ? AND status IN ('pending', 'void')
+                """,
+                (
+                    settlement.status.value,
+                    settlement.settled_at.isoformat(),
+                    _cents(settlement.gross_prize),
+                    _cents(settlement.tax),
+                    _cents(settlement.net_prize),
+                    _cents(settlement.net_profit),
+                    settlement.plan_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return False
+            for result in settlement.leg_results:
+                connection.execute(
+                    """
+                    UPDATE plan_legs
+                    SET result_status = ?, result_home = ?, result_away = ?, official_status = ?
+                    WHERE plan_id = ? AND match_id = ?
+                    """,
+                    (
+                        result.status.value,
+                        result.home_score,
+                        result.away_score,
+                        result.official_status,
+                        settlement.plan_id,
+                        result.match_id,
+                    ),
+                )
             return True
 
     def claim_due_emails(

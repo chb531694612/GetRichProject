@@ -719,11 +719,53 @@ class DashboardApplication:
             return ("warn", "该推荐选项不存在或已经失效，请重新运行AI分析刷新选项")
         if not self.database.update_plan_leg_option(plan_id, match_id, option_code):
             return ("error", f"修改比赛 {match_id} 的推荐失败")
-        mail_detail = self._refresh_mail_after_plan_change(plan_id)
+        # 不再自动刷新邮件；用户可在页面上手动推送
         return (
             "ok",
-            f"已将比赛 {leg.match_num} 的推荐修改为 {option.label}，赔率和奖金已重新计算{mail_detail}",
+            '已将比赛 {0} 的推荐修改为 {1}，赔率和奖金已重新计算。如需邮件推送请点击页面上的「推送邮件」按钮。'.format(leg.match_num, option.label),
         )
+
+    def trigger_push_mail(self, plan_id: str) -> tuple[str, str]:
+        """Manual push of the recommendation email for a plan."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            self.database.add_log("mail", f"手动推送失败，计划{plan_id}不存在")
+            return ("warn", f"计划 {plan_id} 不存在")
+        subject, text_body, html_body = render_stored_recommendation(plan)
+        changed_at = self.now()
+        recommendation_day = datetime.fromisoformat(plan.recommendation_date).date()
+        first_send_at = datetime.combine(
+            recommendation_day,
+            self.settings.recommendation_first_mail_time,
+            tzinfo=self.settings.timezone,
+        )
+        deadline = datetime.combine(
+            recommendation_day,
+            self.settings.recommendation_deadline,
+            tzinfo=self.settings.timezone,
+        )
+        expires_at = deadline - timedelta(
+            minutes=self.settings.recommendation_send_buffer_minutes
+        )
+        result = self.database.ensure_recommendation_mail(
+            plan_id,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            changed_at=changed_at,
+            first_send_at=first_send_at,
+            expires_at=expires_at,
+        )
+        if result in {"refreshed", "queued"} and self.wake_mailer is not None:
+            self.wake_mailer()
+        self.database.add_log("mail", f"手动推送计划{plan_id}", result)
+        labels = {
+            "refreshed": "推荐邮件已更新，等待发送",
+            "queued": "推荐邮件已排队发送",
+            "expired": "已超过当天邮件截止时间，无法推送",
+            "missing": "计划不存在",
+        }
+        return ("ok" if result in {"refreshed", "queued"} else "warn", labels.get(result, result))
 
     def new_login_token(self) -> str:
         issued_at = int(self.now().timestamp())
@@ -1847,6 +1889,8 @@ def build_handler(application: DashboardApplication):
                     level, detail = application.trigger_mark_purchased(
                         str(payload.get("plan_id", "")), bool(payload.get("purchased", False))
                     )
+                elif path == "/api/v1/actions/push-mail":
+                    level, detail = application.trigger_push_mail(str(payload.get("plan_id", "")))
                 elif path == "/api/v1/actions/delete-ticket":
                     level, detail = dashboard_api.delete_ticket(str(payload.get("plan_id", "")))
                 elif path.startswith("/api/v1/settings/"):

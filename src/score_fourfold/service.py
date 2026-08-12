@@ -429,7 +429,11 @@ class ScoreFourfoldService:
         summary["baseline_profit"] = str(
             (current_profit + settlement.net_profit).quantize(Decimal("0.00"))
         )
+        # Only send settlement notification email for winning plans.
+        # Lost and void plans are still stored but no email is queued.
         subject, text_body, html_body = render_settlement(plan, settlement, summary)
+        if settlement.status is not PlanStatus.WON:
+            return self.database.settle_plan_only(settlement)
         return self.database.settle_plan_with_mail(
             settlement,
             subject=subject,
