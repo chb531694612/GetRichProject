@@ -369,6 +369,14 @@ function formatResult(market: string, result: any) {
   if (market === 'ttg') return `${result.outcome}球（${score}）`
   return result.market_result
 }
+// CRS（比分）玩法的取值为完整比分如"2-0"，其后追加"球"以便和胜平负的"3/1/0"区分；
+// HAD 取值是胜平负代码、TTG 取值已带"球"字，均保持原样。
+function pickWithBall(value: string | null | undefined, market: string) {
+  if (!value) return value
+  if (market !== 'crs') return value
+  if (/球$/.test(value)) return value
+  return `${value}球`
+}
 async function applyAiSuggestion(plan: any, leg: any) {
   if (!leg.ai_suggestion) return
   await action('/api/v1/actions/update-leg', {
@@ -460,9 +468,9 @@ onMounted(async () => {
               <tbody><tr v-for="leg in plan.legs" :key="leg.match_id">
                 <td><b>{{ leg.match_num }}</b><small>{{ leg.league }} · {{ formatTime(leg.start_at) }}</small></td>
                 <td>{{ leg.home }} <em>vs</em> {{ leg.away }}</td>
-                <td><span class="pick">{{ leg.pick_label }}</span></td>
-                <td><span v-if="leg.original_pick_label" class="pick original">{{ leg.original_pick_label }}</span><span v-else class="muted">-</span></td>
-                <td><span v-if="leg.ai_suggestion" class="ai-suggestion">{{ leg.ai_suggestion.label }}</span><span v-else class="muted">-</span></td>
+                <td><span class="pick">{{ pickWithBall(leg.pick_label, plan.market) }}</span></td>
+                <td><span v-if="leg.original_pick_label" class="pick original">{{ pickWithBall(leg.original_pick_label, plan.market) }}</span><span v-else class="muted">-</span></td>
+                <td><span v-if="leg.ai_suggestion" class="ai-suggestion">{{ pickWithBall(leg.ai_suggestion.label, plan.market) }}</span><span v-else class="muted">-</span></td>
                 <td>{{ leg.odds }}</td>
                 <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ formatResult(plan.market, leg.result) }}</span></td>
                 <td class="settle-cell">
