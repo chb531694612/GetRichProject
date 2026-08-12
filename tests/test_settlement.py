@@ -405,6 +405,37 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.status, PlanStatus.WON)
 
+    def test_incremental_leg_update_when_plan_not_due(self):
+        """Plans not yet due for full settlement still get individual leg
+        results updated incrementally each settlement cycle."""
+        provider = _FakeResultProvider(
+            {
+                match.match_id: MatchResult(
+                    match.match_id, ResultStatus.FINAL, 1, 0,
+                )
+                for match in self.matches
+            }
+        )
+        self.settings = replace(self.settings, result_check_delay_minutes=150)
+        # Settle at a time *before* the plan becomes due.
+        # max(start_at) = now + 3.4 h; delay = 2.5 h → due at now + 5.9 h.
+        # settle_at = now + 4 h is after matches finish but before the
+        # delay expires, so the plan is NOT due.
+        settle_at = self.now + timedelta(hours=4)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("更新4条赛果", outcome.detail)
+        self.assertIn("完成0张计划结算", outcome.detail)
+        self.assertIn("尚未到整体结算时间", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        # Individual leg results should have been written.
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.FINAL,
+                             f"leg {leg.position} should be FINAL")
+            self.assertEqual(leg.result_home, 1)
+            self.assertEqual(leg.result_away, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

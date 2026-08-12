@@ -555,8 +555,6 @@ class ScoreFourfoldService:
             return JobOutcome("idle", "没有待结算计划")
         delay = timedelta(minutes=self.settings.result_check_delay_minutes)
         due_plans = [plan for plan in plans if max(leg.start_at for leg in plan.legs) + delay <= now]
-        if not due_plans:
-            return JobOutcome("idle", "待结算计划尚未到赛果检查时间")
         earliest_allowed = now.date() - timedelta(days=29)
         active_plans = [
             plan for plan in due_plans if max(leg.start_at.date() for leg in plan.legs) >= earliest_allowed
@@ -575,13 +573,19 @@ class ScoreFourfoldService:
                 html_body=html_body,
                 created_at=now,
             )
-        if not active_plans:
+        if not active_plans and not [p for p in plans if p.plan_id not in {e.plan_id for e in expired_plans}]:
             self.database.add_log("settle", f"结算跳过，{expired_count}张计划超过30天需人工复核")
             return JobOutcome("needs-review", f"{expired_count}张计划超过30天仍未结算，需要人工复核")
-        self.database.add_log("settle", f"开始结算{len(active_plans)}张待结算计划")
+        expired_ids = {p.plan_id for p in expired_plans}
+        plans_to_check = [p for p in plans if p.plan_id not in expired_ids]
+        due_label = f"；{len(active_plans)}张已达结算时间" if active_plans else ""
+        self.database.add_log(
+            "settle",
+            f"开始刷新{len(plans_to_check)}张计划赛果{due_label}",
+        )
         start_date = max(
             earliest_allowed,
-            min(leg.start_at.date() for plan in active_plans for leg in plan.legs),
+            min(leg.start_at.date() for plan in plans_to_check for leg in plan.legs),
         )
         end_date = now.date()
         results = self.provider.get_results(start_date, end_date)
@@ -601,7 +605,7 @@ class ScoreFourfoldService:
                 ))
         settled_count = 0
         updated_count = 0
-        for plan in active_plans:
+        for plan in plans_to_check:
             relevant = {leg.match_id: results[leg.match_id] for leg in plan.legs if leg.match_id in results}
             # Fallback: match by team name when match_id is not found (e.g. data source changed ID format).
             unmatched = [leg for leg in plan.legs if leg.match_id not in relevant]
@@ -627,6 +631,9 @@ class ScoreFourfoldService:
                 self.database.update_leg_results(plan.plan_id, relevant)
                 updated_count += len(relevant)
 
+            # Only attempt full settlement for active (due) plans.
+            if plan.plan_id not in active_ids:
+                continue
             refreshed = self.database.get_plan(plan.plan_id)
             if refreshed is None:
                 continue
@@ -636,6 +643,8 @@ class ScoreFourfoldService:
                 settled_count += 1
                 self.database.add_log("settle", f"计划{plan.plan_id}结算完成", f"状态: {refreshed.status.value}")
         detail = f"更新{updated_count}条赛果，完成{settled_count}张计划结算"
+        if not active_plans and updated_count:
+            detail += "（尚未到整体结算时间）"
         if expired_count:
             detail += f"；另有{expired_count}张超过30天需人工复核"
         self.database.add_log("settle", f"结算完成", detail)
