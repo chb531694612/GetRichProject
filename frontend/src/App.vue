@@ -369,11 +369,12 @@ function formatResult(market: string, result: any) {
   if (market === 'ttg') return `${result.outcome}球（${score}）`
   return result.market_result
 }
-// CRS（比分）玩法的取值为完整比分如"2-0"，其后追加"球"以便和胜平负的"3/1/0"区分；
-// HAD 取值是胜平负代码、TTG 取值已带"球"字，均保持原样。
+// 只有 TTG（进球数）玩法的取值是纯数字如"2"，需要追加"球"字以便和胜平负的
+// "3/1/0" 区分；CRS（比分）的取值已经是"2:0"形式自带冒号分隔，HAD 的"3/1/0"
+// 是胜平负代码，二者均不追加。
 function pickWithBall(value: string | null | undefined, market: string) {
   if (!value) return value
-  if (market !== 'crs') return value
+  if (market !== 'ttg') return value
   if (/球$/.test(value)) return value
   return `${value}球`
 }
