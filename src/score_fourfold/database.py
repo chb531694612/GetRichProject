@@ -1049,6 +1049,23 @@ class Database:
             ).fetchall()
             return self._load_plans(connection, rows)
 
+    def settled_plans_with_pending_legs(self, from_date: date, to_date: date) -> list[StoredPlan]:
+        """Return non-PENDING plans whose legs still have unresolved results."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT p.* FROM plans p
+                INNER JOIN plan_legs l ON l.plan_id = p.plan_id
+                WHERE p.status NOT IN ('pending', 'void')
+                  AND p.business_date >= ?
+                  AND p.business_date <= ?
+                  AND l.result_status = 'pending'
+                ORDER BY p.created_at
+                """,
+                (from_date.isoformat(), to_date.isoformat()),
+            ).fetchall()
+            return self._load_plans(connection, rows)
+
     def get_plan(self, plan_id: str) -> StoredPlan | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()

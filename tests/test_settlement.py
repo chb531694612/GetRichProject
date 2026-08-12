@@ -468,6 +468,40 @@ class DelayedSettlementTests(unittest.TestCase):
             self.assertEqual(leg.result_home, 1)
             self.assertEqual(leg.result_away, 0)
 
+    def test_settled_plans_pending_legs_get_updated_when_results_come(self):
+        """After a plan is settled early as LOST, remaining PENDING legs
+        should still be filled in when results become available later."""
+        settle_at = self.matches[-1].start_at + timedelta(hours=1)
+        # First cycle: only leg 0 has a loss, triggering early LOST settlement.
+        provider1 = _FakeResultProvider(
+            {self.matches[0].match_id: MatchResult(self.matches[0].match_id, ResultStatus.FINAL, 0, 0)}
+        )
+        outcome1 = self._service(provider1).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome1.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.LOST)
+        # Legs 1-3 should still be PENDING.
+        self.assertEqual(plan.legs[0].result_status, ResultStatus.FINAL)
+        for i in (1, 2, 3):
+            self.assertEqual(plan.legs[i].result_status, ResultStatus.PENDING)
+
+        # Second cycle: results for remaining legs appear.
+        provider2 = _FakeResultProvider(
+            {
+                self.matches[i].match_id: MatchResult(self.matches[i].match_id, ResultStatus.FINAL, 1, 0)
+                for i in (1, 2, 3)
+            }
+        )
+        outcome2 = self._service(provider2).settle(settle_at + timedelta(minutes=5))
+        self.assertIn("更新3条赛果", outcome2.detail)
+        self.assertIn("完成0张计划结算", outcome2.detail)
+        # All legs should now have results even though the plan was already settled.
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.FINAL)
+
 
 if __name__ == "__main__":
     unittest.main()

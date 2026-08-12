@@ -447,11 +447,6 @@ class ScoreFourfoldService:
         if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}:
             return JobOutcome("duplicate", f"计划 {plan_id} 已结算，无需重复更新")
 
-        latest_start = max(leg.start_at for leg in plan.legs)
-        delay = timedelta(minutes=self.settings.result_check_delay_minutes)
-        if latest_start + delay > wall_now:
-            return JobOutcome("early", f"计划 {plan_id} 尚未到赛果检查时间")
-
         self.database.add_log("settle", f"开始结算计划{plan_id}", f"{len(plan.legs)}场比赛")
         start_date = min(leg.start_at.date() for leg in plan.legs)
         results: dict[str, MatchResult] = {}
@@ -533,6 +528,16 @@ class ScoreFourfoldService:
         refreshed = self.database.get_plan(plan_id)
         if refreshed is None:
             return JobOutcome("missing", f"计划 {plan_id} 已不存在")
+        # Try settlement even when some legs are still PENDING — early loss
+        # detection in _build_settlement may settle the plan as LOST immediately.
+        created = self._store_settlement(refreshed, wall_now)
+        if created:
+            final_plan = self.database.get_plan(plan_id)
+            if final_plan is not None and final_plan.status is not PlanStatus.PENDING:
+                source_note = f"，其中官网详情兜底 {fallback_count} 场" if fallback_count else ""
+                early = "（提前loss结算）" if any(leg.result_status == ResultStatus.PENDING for leg in refreshed.legs) else ""
+                self.database.add_log("settle", f"计划{plan_id}结算完成{early}", f"状态: {final_plan.status.value}{source_note}")
+                return JobOutcome("ok", f"计划 {plan_id} 已更新 {len(relevant)} 场并完成结算{source_note}，状态：{final_plan.status.value}")
         unresolved = [
             leg.match_num or leg.match_id
             for leg in refreshed.legs
@@ -547,27 +552,24 @@ class ScoreFourfoldService:
                 detail += "；官方赛果接口暂时不可用"
             self.database.add_log("settle", f"计划{plan_id}仍有{len(unresolved)}场未公布", detail)
             return JobOutcome("partial" if relevant else "missing-results", detail)
-
-        created = self._store_settlement(refreshed, wall_now)
-        final_plan = self.database.get_plan(plan_id)
-        if not created or final_plan is None or final_plan.status is PlanStatus.PENDING:
-            self.database.add_log("settle", f"计划{plan_id}结算写入失败")
-            return JobOutcome("error", f"计划 {plan_id} 赛果已更新，但结算写入失败")
-        source_note = f"，其中官网详情兜底 {fallback_count} 场" if fallback_count else ""
-        self.database.add_log("settle", f"计划{plan_id}结算完成", f"状态: {final_plan.status.value}{source_note}")
-        return JobOutcome(
-            "ok",
-            f"计划 {plan_id} 已更新 {len(relevant)} 场并完成结算{source_note}，状态：{final_plan.status.value}",
-        )
+        self.database.add_log("settle", f"计划{plan_id}结算写入失败")
+        return JobOutcome("error", f"计划 {plan_id} 赛果已更新，但结算写入失败")
 
     def settle(self, now: datetime) -> JobOutcome:
         self.refresh_runtime_settings()
         plans = self.database.pending_plans()
+        earliest_allowed = now.date() - timedelta(days=29)
         if not plans:
-            return JobOutcome("idle", "没有待结算计划")
+            # Still fetch results if there are recently-settled plans
+            # with PENDING legs that haven't been filled in yet.
+            current_date = now.date()
+            has_stale = bool(self.database.settled_plans_with_pending_legs(earliest_allowed, current_date))
+            if not has_stale:
+                return JobOutcome("idle", "没有待结算计划")
+            # Let the results-fetch path below pick up those stale legs.
+            plans = []
         delay = timedelta(minutes=self.settings.result_check_delay_minutes)
         due_plans = [plan for plan in plans if max(leg.start_at for leg in plan.legs) + delay <= now]
-        earliest_allowed = now.date() - timedelta(days=29)
         active_plans = [
             plan for plan in due_plans if max(leg.start_at.date() for leg in plan.legs) >= earliest_allowed
         ]
@@ -586,22 +588,36 @@ class ScoreFourfoldService:
                 created_at=now,
             )
         if not active_plans and not [p for p in plans if p.plan_id not in {e.plan_id for e in expired_plans}]:
-            self.database.add_log("settle", f"结算跳过，{expired_count}张计划超过30天需人工复核")
-            return JobOutcome("needs-review", f"{expired_count}张计划超过30天仍未结算，需要人工复核")
+            has_stale = bool(self.database.settled_plans_with_pending_legs(earliest_allowed, now.date()))
+            if not has_stale:
+                self.database.add_log("settle", f"结算跳过，{expired_count}张计划超过30天需人工复核")
+                return JobOutcome("needs-review", f"{expired_count}张计划超过30天仍未结算，需要人工复核")
         expired_ids = {p.plan_id for p in expired_plans}
         plans_to_check = [p for p in plans if p.plan_id not in expired_ids]
-        due_label = f"；{len(active_plans)}张已达结算时间" if active_plans else ""
-        self.database.add_log(
-            "settle",
-            f"开始刷新{len(plans_to_check)}张计划赛果{due_label}",
-        )
-        start_date = max(
-            earliest_allowed,
-            min(leg.start_at.date() for plan in plans_to_check for leg in plan.legs),
-        )
+        if plans_to_check:
+            start_date = max(
+                earliest_allowed,
+                min(leg.start_at.date() for plan in plans_to_check for leg in plan.legs),
+            )
+        else:
+            # No pending plans — only settled plans with stale legs to update.
+            start_date = earliest_allowed
         end_date = now.date()
         results = self.provider.get_results(start_date, end_date)
         self.database.add_log("settle", f"数据源返回{len(results)}场比赛赛果")
+        # Also update legs in recently-settled plans that still have PENDING results.
+        past_plans = self.database.settled_plans_with_pending_legs(start_date, end_date)
+        existing_ids = {p.plan_id for p in plans_to_check}
+        for pp in past_plans:
+            if pp.plan_id not in existing_ids:
+                plans_to_check.append(pp)
+        if plans_to_check:
+            due_label = f"；{len(active_plans)}张已达结算时间" if active_plans else ""
+            stale_label = f"；{len(past_plans)}张已结算计划待补赛果" if past_plans else ""
+            self.database.add_log(
+                "settle",
+                f"开始刷新{len(plans_to_check)}张计划赛果{due_label}{stale_label}",
+            )
         # Build indices for fallback matching when match_id formats differ.
         team_index: dict[tuple[str, str], str] = {}
         partial_index: list[tuple[str, str, str, str]] = []
@@ -642,6 +658,12 @@ class ScoreFourfoldService:
             if relevant:
                 self.database.update_leg_results(plan.plan_id, relevant)
                 updated_count += len(relevant)
+
+            # Only attempt settlement for plans that are still PENDING.
+            # Already-settled plans (e.g. early-loss) only get their
+            # remaining leg results filled in here.
+            if plan.status != PlanStatus.PENDING:
+                continue
 
             # Attempt settlement after updating leg results.
             # _build_settlement handles early-loss (even with PENDING legs
