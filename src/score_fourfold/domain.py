@@ -74,6 +74,9 @@ class MatchResult:
     home_score: int | None = None
     away_score: int | None = None
     official_status: str = ""
+    home_team: str = ""
+    away_team: str = ""
+    match_num: str = ""
 
     @property
     def score_label(self) -> str | None:

@@ -1857,6 +1857,15 @@ class Database:
                     ),
                 )
 
+    def update_leg_match_id(self, plan_id: str, old_match_id: str, new_match_id: str) -> bool:
+        """Migrate a plan leg's match_id to a new value (e.g. when the data source changed ID format)."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE plan_legs SET match_id = ? WHERE plan_id = ? AND match_id = ?",
+                (new_match_id, plan_id, old_match_id),
+            )
+            return cursor.rowcount > 0
+
     def settle_plan_with_mail(
         self,
         settlement: Settlement,

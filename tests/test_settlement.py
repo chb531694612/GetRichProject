@@ -321,6 +321,90 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.status, PlanStatus.WON)
 
+    def test_team_name_fallback_settles_when_match_id_format_differs(self):
+        """When the data source changes match_id format, settle by team name."""
+        # Results use completely different match_ids but same team names.
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=match.home,
+                away_team=match.away,
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        # Verify match_ids were migrated to the new format.
+        for leg in plan.legs:
+            self.assertTrue(leg.match_id.startswith("NEW-"))
+        # Verify the team-name fallback was logged.
+        with self.database.connect() as conn:
+            logs = conn.execute(
+                "SELECT message FROM activity_logs WHERE message LIKE '%队名兜底%'"
+            ).fetchall()
+        self.assertTrue(len(logs) > 0)
+
+    def test_partial_team_name_fallback_with_match_num(self):
+        """Match by one team name + match_num when transliterations differ."""
+        results: dict[str, MatchResult] = {}
+        for i, match in enumerate(self.matches):
+            new_id = f"NEW-{match.match_id}"
+            # Alter the home team name for one leg (like 沙巴巴库 vs 萨巴赫).
+            home = f"不同队名{match.home}" if i == 1 else match.home
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=home,
+                away_team=match.away,
+                match_num=match.match_num,
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+
+    def test_settle_plan_team_name_fallback(self):
+        """settle_plan also falls back to team-name matching."""
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=match.home,
+                away_team=match.away,
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        # Mock page provider to avoid real network calls; return None so team-name fallback kicks in.
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ):
+            outcome = self._service(provider).settle_plan(
+                self.recommendation.plan_id,
+                settle_at,
+            )
+        self.assertEqual(outcome.status, "ok")
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+
 
 if __name__ == "__main__":
     unittest.main()

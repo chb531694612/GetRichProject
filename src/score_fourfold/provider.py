@@ -748,6 +748,9 @@ def _result_from_record(raw: dict[str, Any]) -> MatchResult | None:
         home_score=score[0] if score else None,
         away_score=score[1] if score else None,
         official_status=status_text,
+        home_team=_str(raw.get("allHomeTeam") or raw.get("homeTeam") or raw.get("home_team")),
+        away_team=_str(raw.get("allAwayTeam") or raw.get("awayTeam") or raw.get("away_team")),
+        match_num=_str(raw.get("matchNumStr") or raw.get("matchNum")),
     )
 
 

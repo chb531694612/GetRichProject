@@ -320,6 +320,50 @@ class ScoreFourfoldService:
         selected = cls._selected_score(leg)
         return selected == (result.home_score, result.away_score)
 
+    @staticmethod
+    def _normalize_team(name: str) -> str:
+        """Normalize a team name for fuzzy matching (remove spaces, trim, casefold)."""
+        return re.sub(r"\s+", "", name).strip().casefold()
+
+    @staticmethod
+    def _match_num_digits(match_num: str) -> str:
+        """Extract the numeric part from a match number (e.g. '周二004' -> '004')."""
+        return re.sub(r"\D", "", match_num)
+
+    @classmethod
+    def _match_by_team(
+        cls,
+        leg_home: str,
+        leg_away: str,
+        leg_match_num: str,
+        team_index: dict[tuple[str, str], str],
+        partial_index: list[tuple[str, str, str, str]],
+    ) -> str | None:
+        """Find a result match_id by team name, with a partial-match fallback.
+
+        * Full match: both home and away team names match.
+        * Partial match: one team name matches AND the numeric part of the
+          match number matches.  This handles transliteration differences
+          like 沙巴巴库 vs 萨巴赫.
+        """
+        norm_home = cls._normalize_team(leg_home)
+        norm_away = cls._normalize_team(leg_away)
+        full_key = (norm_home, norm_away)
+        if full_key in team_index:
+            return team_index[full_key]
+        leg_digits = cls._match_num_digits(leg_match_num)
+        if not leg_digits:
+            return None
+        for res_home, res_away, res_num, res_mid in partial_index:
+            if res_mid in team_index.values() and team_index.get(full_key):
+                continue
+            num_match = leg_digits == res_num and bool(res_num)
+            home_match = norm_home and norm_home == res_home
+            away_match = norm_away and norm_away == res_away
+            if (home_match or away_match) and num_match:
+                return res_mid
+        return None
+
     @classmethod
     def _build_settlement(cls, plan: StoredPlan, now: datetime) -> Settlement | None:
         if any(leg.result_status == ResultStatus.PENDING for leg in plan.legs):
@@ -417,7 +461,7 @@ class ScoreFourfoldService:
             for leg in missing_legs:
                 try:
                     result = page_provider.get_result_for_leg(leg)
-                except ProviderError:
+                except Exception:
                     continue
                 if result is not None:
                     results[leg.match_id] = result
@@ -425,11 +469,46 @@ class ScoreFourfoldService:
         if fallback_count:
             self.database.add_log("settle", f"官网详情兜底获取{fallback_count}场赛果")
 
-        relevant = {
-            leg.match_id: results[leg.match_id]
-            for leg in plan.legs
-            if leg.match_id in results
-        }
+        # Fallback: match by team name when match_id is not found (e.g. data source changed ID format).
+        team_index: dict[tuple[str, str], str] = {}
+        partial_index: list[tuple[str, str, str, str]] = []
+        for mid, res in results.items():
+            if res.home_team and res.away_team:
+                key = (self._normalize_team(res.home_team), self._normalize_team(res.away_team))
+                team_index.setdefault(key, mid)
+                partial_index.append((
+                    self._normalize_team(res.home_team),
+                    self._normalize_team(res.away_team),
+                    self._match_num_digits(res.match_num),
+                    mid,
+                ))
+        migrated = 0
+        leg_id_map: dict[str, str] = {}  # old_match_id -> new_match_id
+        for leg in plan.legs:
+            if leg.match_id in results and results[leg.match_id].status not in {ResultStatus.PENDING, ResultStatus.VOID}:
+                continue
+            if not leg.home or not leg.away:
+                continue
+            matched_mid = self._match_by_team(
+                leg.home, leg.away, leg.match_num, team_index, partial_index,
+            )
+            if matched_mid and matched_mid in results:
+                if leg.match_id != matched_mid:
+                    self.database.update_leg_match_id(plan_id, leg.match_id, matched_mid)
+                    leg_id_map[leg.match_id] = matched_mid
+                    migrated += 1
+        if migrated:
+            self.database.add_log(
+                "settle",
+                f"计划{plan_id}按队名兜底匹配{migrated}场赛果",
+                "match_id格式不一致，已更新为新ID",
+            )
+
+        relevant: dict[str, MatchResult] = {}
+        for leg in plan.legs:
+            effective_id = leg_id_map.get(leg.match_id, leg.match_id)
+            if effective_id in results:
+                relevant[effective_id] = results[effective_id]
         if relevant:
             self.database.update_leg_results(plan_id, relevant)
         else:
@@ -507,10 +586,43 @@ class ScoreFourfoldService:
         end_date = now.date()
         results = self.provider.get_results(start_date, end_date)
         self.database.add_log("settle", f"数据源返回{len(results)}场比赛赛果")
+        # Build indices for fallback matching when match_id formats differ.
+        team_index: dict[tuple[str, str], str] = {}
+        partial_index: list[tuple[str, str, str, str]] = []
+        for mid, res in results.items():
+            if res.home_team and res.away_team:
+                key = (self._normalize_team(res.home_team), self._normalize_team(res.away_team))
+                team_index.setdefault(key, mid)
+                partial_index.append((
+                    self._normalize_team(res.home_team),
+                    self._normalize_team(res.away_team),
+                    self._match_num_digits(res.match_num),
+                    mid,
+                ))
         settled_count = 0
         updated_count = 0
         for plan in active_plans:
             relevant = {leg.match_id: results[leg.match_id] for leg in plan.legs if leg.match_id in results}
+            # Fallback: match by team name when match_id is not found (e.g. data source changed ID format).
+            unmatched = [leg for leg in plan.legs if leg.match_id not in relevant]
+            migrated = 0
+            for leg in unmatched:
+                if not leg.home or not leg.away:
+                    continue
+                matched_mid = self._match_by_team(
+                    leg.home, leg.away, leg.match_num, team_index, partial_index,
+                )
+                if matched_mid and matched_mid in results:
+                    self.database.update_leg_match_id(plan.plan_id, leg.match_id, matched_mid)
+                    leg_match_id = matched_mid
+                    relevant[leg_match_id] = results[matched_mid]
+                    migrated += 1
+            if migrated:
+                self.database.add_log(
+                    "settle",
+                    f"计划{plan.plan_id}按队名兜底匹配{migrated}场赛果",
+                    "match_id格式不一致，已更新为新ID",
+                )
             if relevant:
                 self.database.update_leg_results(plan.plan_id, relevant)
                 updated_count += len(relevant)
