@@ -78,8 +78,40 @@ class SettlementTests(unittest.TestCase):
         self.assertIn("模拟净收益", text_body)
 
     def test_pending_leg_prevents_settlement(self):
+        """When some legs are still PENDING and no loss detected, don't settle."""
         results = [MatchResult(match.match_id, ResultStatus.FINAL, 1, 0) for match in self.matches[:3]]
         self.assertIsNone(self._refresh_after(results))
+
+    def test_early_loss_settles_with_some_legs_still_pending(self):
+        """When any leg already missed the prediction the whole ticket is lost,
+        even if other legs are still PENDING."""
+        # Leg 0 predicted 1:0, actual 0:0 → loss
+        results = [
+            MatchResult(self.matches[0].match_id, ResultStatus.FINAL, 0, 0),
+        ]
+        settlement = self._refresh_after(results)
+        self.assertIsNotNone(settlement)
+        self.assertEqual(settlement.status, PlanStatus.LOST)
+        self.assertEqual(settlement.net_profit, Decimal("-2.00"))
+
+    def test_early_loss_from_any_position_settles_immediately(self):
+        """Loss on a middle leg (not the first) also triggers immediate LOST."""
+        results = [
+            MatchResult(self.matches[1].match_id, ResultStatus.FINAL, 0, 0),
+        ]
+        settlement = self._refresh_after(results)
+        self.assertIsNotNone(settlement)
+        self.assertEqual(settlement.status, PlanStatus.LOST)
+
+    def test_no_early_loss_when_final_legs_all_hit_and_others_pending(self):
+        """If every FINAL leg is a hit, wait for remaining PENDING legs."""
+        results = [
+            MatchResult(self.matches[0].match_id, ResultStatus.FINAL, 1, 0),  # hit
+            MatchResult(self.matches[2].match_id, ResultStatus.FINAL, 1, 0),  # hit
+        ]
+        plan = self._refresh_after(results)
+        # Legs 1 and 3 still PENDING, no loss detected → wait
+        self.assertIsNone(plan)
 
 
 class _FakeResultProvider:

@@ -366,8 +366,6 @@ class ScoreFourfoldService:
 
     @classmethod
     def _build_settlement(cls, plan: StoredPlan, now: datetime) -> Settlement | None:
-        if any(leg.result_status == ResultStatus.PENDING for leg in plan.legs):
-            return None
         leg_results = tuple(
             MatchResult(
                 match_id=leg.match_id,
@@ -378,15 +376,28 @@ class ScoreFourfoldService:
             )
             for leg in plan.legs
         )
+        # Early loss: if any leg already has a FINAL result that missed the
+        # prediction the whole ticket is lost regardless of remaining PENDING legs.
         lost = any(
             result.status == ResultStatus.FINAL and not cls._leg_hit(plan, leg, result)
             for leg, result in zip(plan.legs, leg_results, strict=True)
         )
-        active_legs = sum(result.status == ResultStatus.FINAL for result in leg_results)
         if lost:
-            status = PlanStatus.LOST
-            gross = tax = net = Decimal("0.00")
-        elif active_legs == 0:
+            return Settlement(
+                plan_id=plan.plan_id,
+                status=PlanStatus.LOST,
+                settled_at=now,
+                gross_prize=Decimal("0.00"),
+                tax=Decimal("0.00"),
+                net_prize=Decimal("0.00"),
+                net_profit=-BASE_STAKE,
+                leg_results=leg_results,
+            )
+        # No loss yet — wait until every leg has a non-PENDING result.
+        if any(leg.result_status == ResultStatus.PENDING for leg in plan.legs):
+            return None
+        active_legs = sum(result.status == ResultStatus.FINAL for result in leg_results)
+        if active_legs == 0:
             status = PlanStatus.VOID
             gross = net = BASE_STAKE
             tax = Decimal("0.00")
@@ -408,8 +419,9 @@ class ScoreFourfoldService:
             leg_results=leg_results,
         )
 
-    def _store_settlement(self, plan: StoredPlan, now: datetime) -> bool:
-        settlement = self._build_settlement(plan, now)
+    def _store_settlement(self, plan: StoredPlan, now: datetime, settlement: Settlement | None = None) -> bool:
+        if settlement is None:
+            settlement = self._build_settlement(plan, now)
         if settlement is None:
             return False
         summary = self.database.summary()
@@ -631,19 +643,27 @@ class ScoreFourfoldService:
                 self.database.update_leg_results(plan.plan_id, relevant)
                 updated_count += len(relevant)
 
-            # Only attempt full settlement for active (due) plans.
-            if plan.plan_id not in active_ids:
-                continue
+            # Attempt settlement after updating leg results.
+            # _build_settlement handles early-loss (even with PENDING legs
+            # remaining).  Non-due plans may only settle as LOST; WON / VOID
+            # still require all matches to pass the delay threshold.
             refreshed = self.database.get_plan(plan.plan_id)
             if refreshed is None:
                 continue
-            if any(leg.result_status == ResultStatus.PENDING for leg in refreshed.legs):
+            settlement = self._build_settlement(refreshed, now)
+            if settlement is None:
                 continue
-            if self._store_settlement(refreshed, now):
+            if plan.plan_id not in active_ids and settlement.status != PlanStatus.LOST:
+                continue
+            if self._store_settlement(refreshed, now, settlement):
                 settled_count += 1
-                self.database.add_log("settle", f"计划{plan.plan_id}结算完成", f"状态: {refreshed.status.value}")
+                self.database.add_log(
+                    "settle",
+                    f"计划{plan.plan_id}结算完成",
+                    f"状态: {settlement.status.value}",
+                )
         detail = f"更新{updated_count}条赛果，完成{settled_count}张计划结算"
-        if not active_plans and updated_count:
+        if not active_plans and settled_count == 0 and updated_count:
             detail += "（尚未到整体结算时间）"
         if expired_count:
             detail += f"；另有{expired_count}张超过30天需人工复核"
