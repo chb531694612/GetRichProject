@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { apiGet, apiPost, apiUpload, setCsrfToken } from './api'
 
 type Toast = { id: number; level: string; text: string }
@@ -232,16 +232,16 @@ const ticketFileInput = ref<HTMLInputElement | null>(null)
 const pendingUploadPlan = ref<any>(null)
 const ticketZoomUrl = ref<string>('')
 function pickTicket(plan: any) {
+  if (pendingUploadPlan.value === plan) {
+    // 已处于等待粘贴状态，再次点击改为选择文件
+    pendingUploadPlan.value = null
+    ticketFileInput.value?.click()
+    return
+  }
   pendingUploadPlan.value = plan
-  ticketFileInput.value?.click()
+  toast(`已就绪：请直接按 Ctrl+V 粘贴 ${plan.plan_id} 的实票截图，或再次点击按钮选择文件`, 'info')
 }
-async function uploadTicket(event: Event) {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  const plan = pendingUploadPlan.value
-  input.value = ''
-  pendingUploadPlan.value = null
-  if (!file || !plan) return
+async function uploadTicketFile(file: File, plan: any) {
   busy.value = `ticket-${plan.plan_id}`
   try {
     const response = await apiUpload<any>('/api/v1/actions/upload-ticket', file, plan.plan_id)
@@ -252,6 +252,28 @@ async function uploadTicket(event: Event) {
   } finally {
     busy.value = ''
   }
+}
+async function uploadTicket(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  const plan = pendingUploadPlan.value
+  input.value = ''
+  pendingUploadPlan.value = null
+  if (!file || !plan) return
+  await uploadTicketFile(file, plan)
+}
+function handlePaste(event: ClipboardEvent) {
+  const plan = pendingUploadPlan.value
+  if (!plan) return
+  const file = Array.from(event.clipboardData?.items || [])
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .find((item): item is File => !!item)
+    || event.clipboardData?.files?.[0]
+  if (!file) return
+  event.preventDefault()
+  pendingUploadPlan.value = null
+  void uploadTicketFile(file, plan)
 }
 async function deleteTicket(plan: any) {
   if (!window.confirm(`确定移除计划 ${plan.plan_id} 的实票图片？`)) return
@@ -411,12 +433,16 @@ watch(() => filters.q, () => {
 watch(settings, () => { syncRecipientText(); syncRuntimeText() })
 
 onMounted(async () => {
+  document.addEventListener('paste', handlePaste)
   try {
     bootstrap.value = await apiGet('/api/v1/bootstrap')
     setCsrfToken(bootstrap.value.csrf_token)
     await Promise.all([loadPlans(), loadSettings()])
     editModel()
   } catch (error) { toast((error as Error).message, 'error') }
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('paste', handlePaste)
 })
 </script>
 
@@ -492,7 +518,7 @@ onMounted(async () => {
               <button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button>
               <button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button>
               <button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button>
-              <button class="soft" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">上传实票</button>
+              <button class="soft" :class="{ 'paste-waiting': pendingUploadPlan === plan }" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">{{ pendingUploadPlan === plan ? '粘贴截图（Ctrl+V）…' : '上传实票' }}</button>
               <button class="soft" :disabled="busy === `push-${plan.plan_id}`" @click="action('/api/v1/actions/push-mail',{plan_id:plan.plan_id},`push-${plan.plan_id}`)">推送邮件</button>
             </div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
