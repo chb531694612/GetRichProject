@@ -1120,16 +1120,22 @@ class Database:
             return self._load_plans(connection, rows)
 
     def settled_plans_with_pending_legs(self, from_date: date, to_date: date) -> list[StoredPlan]:
-        """Return non-PENDING plans whose legs still have unresolved results."""
+        """Return non-PENDING plans whose legs still have unresolved results.
+
+        The date window filters on each pending leg's kickoff date (``start_at``),
+        not the plan's business date: a multi-day ticket's pending matches can
+        start on a later calendar date than the issue date that was stored on
+        the plan, so filtering by business date would silently skip those legs.
+        """
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT DISTINCT p.* FROM plans p
                 INNER JOIN plan_legs l ON l.plan_id = p.plan_id
                 WHERE p.status NOT IN ('pending', 'void')
-                  AND p.business_date >= ?
-                  AND p.business_date <= ?
                   AND l.result_status = 'pending'
+                  AND substr(l.start_at, 1, 10) >= ?
+                  AND substr(l.start_at, 1, 10) <= ?
                 ORDER BY p.created_at
                 """,
                 (from_date.isoformat(), to_date.isoformat()),

@@ -502,6 +502,150 @@ class DelayedSettlementTests(unittest.TestCase):
         for leg in plan.legs:
             self.assertEqual(leg.result_status, ResultStatus.FINAL)
 
+    def test_backfill_includes_settled_plan_with_earlier_business_date(self):
+        """A settled plan whose business_date predates the newest pending
+        plan's first kickoff must still get its pending legs backfilled."""
+        # Settle the original plan early as LOST, leaving legs 1-3 pending.
+        provider1 = _FakeResultProvider(
+            {self.matches[0].match_id: MatchResult(self.matches[0].match_id, ResultStatus.FINAL, 0, 0)}
+        )
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome1 = self._service(provider1).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome1.detail)
+        plan_a = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan_a)
+        self.assertEqual(plan_a.status, PlanStatus.LOST)
+
+        # A newer pending plan whose legs kick off the next day, so its first
+        # kickoff date (7/15) is after the settled plan's business_date (7/14).
+        later = self.now + timedelta(days=1)
+        later_matches = [
+            make_match(i, later, business_date="2026-07-15", odds="2.00")
+            for i in range(11, 15)
+        ]
+        second = replace(make_recommendation(later, later_matches), plan_id="BF4-TEST-LATER")
+        subject, text_body, html_body = render_recommendation(second)
+        self.assertTrue(
+            self.database.create_plan_with_mail(
+                second,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                expires_at=later + timedelta(hours=5),
+            )
+        )
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE plans SET delivery_status = 'sent' WHERE plan_id = ?",
+                (second.plan_id,),
+            )
+
+        results = {
+            m.match_id: MatchResult(m.match_id, ResultStatus.FINAL, 1, 0)
+            for m in self.matches[1:]
+        }
+        results.update(
+            {
+                m.match_id: MatchResult(m.match_id, ResultStatus.FINAL, 1, 0)
+                for m in later_matches
+            }
+        )
+        provider2 = _FakeResultProvider(results)
+        settle_at2 = max(m.start_at for m in later_matches) + timedelta(hours=1)
+        self._service(provider2).settle(settle_at2)
+
+        # The settled plan's remaining legs must now be filled in.
+        plan_a = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan_a)
+        for leg in plan_a.legs[1:]:
+            self.assertEqual(leg.result_status, ResultStatus.FINAL, f"leg {leg.position}")
+
+    def test_stale_match_id_reconciled_by_match_num_and_date(self):
+        """A stale match_id with unrelated team names is reconciled via the
+        official match number + kickoff date (e.g. 001 + 8/13 vs 周三001)."""
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            # Unrelated names so only the match number + date can match.
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=f"甲队{match.match_id}",
+                away_team=f"乙队{match.match_id}",
+                match_num=match.match_num,
+                match_date=match.start_at.date().isoformat(),
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        for leg in plan.legs:
+            self.assertTrue(leg.match_id.startswith("NEW-"))
+
+    def test_settle_plan_reconciles_stale_match_id_by_num_and_date(self):
+        """settle_plan also reconciles a stale match_id via match number + date."""
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=f"甲队{match.match_id}",
+                away_team=f"乙队{match.match_id}",
+                match_num=match.match_num,
+                match_date=match.start_at.date().isoformat(),
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ):
+            outcome = self._service(provider).settle_plan(
+                self.recommendation.plan_id,
+                settle_at,
+            )
+        self.assertEqual(outcome.status, "ok")
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        for leg in plan.legs:
+            self.assertTrue(leg.match_id.startswith("NEW-"))
+
+    def test_team_name_containment_match_when_abbreviated(self):
+        """Abbreviated stored names match the feed's full names by containment
+        (e.g. 巴黎圣曼 vs 巴黎圣日尔曼, 维拉 vs 阿斯顿维拉)."""
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            # Full names contain the stored short names; no match_date, so the
+            # containment team-name path is the only one that can match.
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=f"全{match.home}队",
+                away_team=f"全{match.away}队",
+                match_num=match.match_num,
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        for leg in plan.legs:
+            self.assertTrue(leg.match_id.startswith("NEW-"))
+
 
 if __name__ == "__main__":
     unittest.main()

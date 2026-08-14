@@ -321,18 +321,14 @@ class DashboardTests(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_static_text_assets_are_gzipped_when_accepted(self):
+    def test_html_pages_are_gzipped_when_accepted(self):
         server = DashboardServer(self.settings, self.application)
         server.start()
         try:
-            _, _, html_payload = self._request(server, "GET", "/")
-            css_match = re.search(rb'href="(/assets/[^"]+\.css)"', html_payload)
-            self.assertIsNotNone(css_match, "index.html should reference a CSS asset")
-            css_path = css_match.group(1).decode()
             status, headers, payload = self._request(
                 server,
                 "GET",
-                css_path,
+                "/",
                 headers={"Accept-Encoding": "gzip"},
             )
             self.assertEqual(status, 200)
@@ -638,19 +634,14 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("text/html", headers["content-type"])
             self.assertEqual(headers["cache-control"], "no-store")
-            self.assertIn("script-src 'self'", headers["content-security-policy"])
+            self.assertIn("script-src 'nonce-", headers["content-security-policy"])
             self.assertEqual(headers["x-frame-options"], "DENY")
             page = payload.decode("utf-8")
-            self.assertIn("<title>个人看板</title>", page)
-            asset_match = re.search(r'src="(/assets/[^"]+\.js)"', page)
-            self.assertIsNotNone(asset_match)
-            assert asset_match is not None
-            asset_status, asset_headers, asset_body = self._request(
-                server, "GET", asset_match.group(1)
-            )
-            self.assertEqual(asset_status, 200)
-            self.assertIn("text/javascript", asset_headers["content-type"])
-            self.assertGreater(len(asset_body), 1000)
+            self.assertIn("<title>比分串关个人看板</title>", page)
+            nonce_match = re.search(r'<script nonce="([A-Za-z0-9_-]{16,64})">', page)
+            self.assertIsNotNone(nonce_match)
+            assert nonce_match is not None
+            self.assertIn(f"script-src 'nonce-{nonce_match.group(1)}'", headers["content-security-policy"])
 
             status, _, _ = self._request(server, "GET", "/actions/recommend")
             self.assertEqual(status, 404)
@@ -1150,8 +1141,8 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         page = payload.decode("utf-8")
-        self.assertIn("<title>个人看板</title>", page)
-        self.assertIn("script-src 'self'", page_headers["content-security-policy"])
+        self.assertIn("<title>比分串关个人看板</title>", page)
+        self.assertIn("script-src 'nonce-", page_headers["content-security-policy"])
         self.assertNotIn('href="javascript:', page)
 
     def test_logout_requires_csrf_and_invalidates_old_cookie(self):

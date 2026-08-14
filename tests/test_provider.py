@@ -326,6 +326,27 @@ class ProviderParsingTests(unittest.TestCase):
         self.assertEqual(results["11"].status.value, "void")
         self.assertEqual(results["12"].status.value, "pending")
 
+    def test_parses_result_match_date_for_reconciliation(self):
+        payload = {
+            "value": {
+                "matchResult": [
+                    {
+                        "matchId": 2040831,
+                        "matchNumStr": "周三001",
+                        "matchDate": "2026-08-13",
+                        "sectionsNo999": "2:1",
+                        "matchResultStatus": "2",
+                        "poolStatus": "Payout",
+                    }
+                ]
+            }
+        }
+        results = parse_results(payload)
+        result = results["2040831"]
+        self.assertEqual(result.match_num, "周三001")
+        self.assertEqual(result.match_date, "2026-08-13")
+        self.assertEqual(result.status.value, "final")
+
     def test_normalizes_score_label_from_code(self):
         payload = {
             "matches": [

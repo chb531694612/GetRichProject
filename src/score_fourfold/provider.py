@@ -675,6 +675,11 @@ def _result_from_record(raw: dict[str, Any]) -> MatchResult | None:
     match_id = _str(raw.get("matchId") or raw.get("match_id") or raw.get("id"))
     if not match_id:
         return None
+    match_date = _str(
+        raw.get("matchDate") or raw.get("match_date") or raw.get("matchDateTime")
+    )
+    if match_date:
+        match_date = match_date[:10]
     home_score = raw.get("homeScore", raw.get("home_score"))
     away_score = raw.get("awayScore", raw.get("away_score"))
     score: tuple[int, int] | None = None
@@ -751,6 +756,7 @@ def _result_from_record(raw: dict[str, Any]) -> MatchResult | None:
         home_team=_str(raw.get("allHomeTeam") or raw.get("homeTeam") or raw.get("home_team")),
         away_team=_str(raw.get("allAwayTeam") or raw.get("awayTeam") or raw.get("away_team")),
         match_num=_str(raw.get("matchNumStr") or raw.get("matchNum")),
+        match_date=match_date,
     )
 
 
