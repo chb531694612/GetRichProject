@@ -81,21 +81,36 @@ class AIModelAdapterTests(unittest.TestCase):
                     max_output_tokens=64,
                 )
 
-    def test_deepseek_configuration_is_not_activated_without_search_capability(self):
+    def test_deepseek_responses_endpoint_supports_native_web_search(self):
         runtime = AIModelRuntime(
             config_id="deepseek-test",
             provider="deepseek",
-            base_url="https://api.deepseek.com/chat/completions",
+            base_url="https://api.deepseek.com/responses",
             model_name="deepseek-v4-flash",
             api_key="secret",
         )
-        with self.assertRaisesRegex(AIModelError, "强制联网搜索"):
-            call_with_web_search(
-                runtime,
-                "test",
-                timeout_seconds=10,
-                max_output_tokens=64,
-            )
+        payload = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"type": "search", "queries": ["当前北京时间"]},
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "AI连接正常"}],
+                },
+            ],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            self.assertIn("测试通过", probe_model(runtime, 10))
+        request = opened.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        # DeepSeek Responses 兼容接口推荐对象形式强制 web_search。
+        self.assertEqual(body["tool_choice"], {"type": "web_search"})
+        self.assertEqual(body["tools"], [{"type": "web_search"}])
+        # qwen 专属字段不应出现在 DeepSeek 请求中。
+        self.assertNotIn("enable_thinking", body)
 
 
 if __name__ == "__main__":

@@ -542,6 +542,7 @@ class SettingsRepository:
             ).fetchone()
         if meta is None or notification is None or ai_runtime is None or runtime is None:
             raise RuntimeError("settings have not been initialized")
+        models = self._migrate_model_endpoints(models)
         return {
             "schema_version": int(meta["schema_version"]),
             "initialized_at": meta["initialized_at"],
@@ -672,6 +673,49 @@ class SettingsRepository:
                 raise ValueError("SETTINGS_MASTER_KEY is required to decrypt stored secrets")
             return self._cipher.decrypt(ciphertext)
         return os.getenv(env_name, "").strip() if env_name else ""
+
+    def _migrate_model_endpoints(self, models: list[Any]) -> list[Any]:
+        """Auto-rewrite legacy endpoints that now expose native web search.
+
+        DeepSeek moved its built-in ``web_search`` tool from the standard
+        Chat Completions endpoint (where it is only a function-calling stub)
+        to a dedicated ``/responses`` endpoint.  Old configurations saved
+        against ``/chat/completions`` must be transparently upgraded so users
+        do not have to manually re-save their model after this change ships.
+        """
+        pending: list[tuple[str, str]] = []
+        rewritten: list[Any] = []
+        for row in models:
+            row_dict = dict(row)
+            if (
+                row_dict.get("provider") == "deepseek"
+                and row_dict.get("base_url", "").rstrip("/").endswith("/chat/completions")
+            ):
+                new_url = "https://api.deepseek.com/responses"
+                if row_dict["base_url"] != new_url:
+                    pending.append((row_dict["model_config_id"], new_url))
+                    row_dict["base_url"] = new_url
+                    # 旧测试是针对旧端点的，重置以强制用户重新测试新接口。
+                    row_dict["last_test_status"] = "untested"
+                    row_dict["last_test_detail"] = ""
+                    row_dict["last_tested_at"] = None
+            rewritten.append(row_dict)
+        if pending:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for config_id, new_url in pending:
+                    connection.execute(
+                        """
+                        UPDATE ai_model_configs
+                        SET base_url = ?,
+                            last_test_status = 'untested',
+                            last_test_detail = '',
+                            last_tested_at = NULL
+                        WHERE model_config_id = ?
+                        """,
+                        (new_url, config_id),
+                    )
+        return rewritten
 
     def model_runtime(self, model_config_id: str) -> AIModelRuntime:
         with self.database.connect() as connection:

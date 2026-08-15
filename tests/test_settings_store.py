@@ -170,16 +170,16 @@ class SettingsRepositoryTests(unittest.TestCase):
         )
         repository = SettingsRepository(self.database, settings)
         repository.initialize_from_legacy(self.now)
-        deepseek_id = repository.save_model_config(
-            provider="deepseek",
-            display_name="DeepSeek",
-            base_url="https://api.deepseek.com/chat/completions",
-            model_name="deepseek-v4-flash",
-            api_key="ds-key",
+        zhipu_id = repository.save_model_config(
+            provider="zhipu",
+            display_name="智谱 GLM",
+            base_url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            model_name="glm-4.5",
+            api_key="glm-key",
             now=self.now,
         )
         success, detail = repository.test_and_activate_model(
-            deepseek_id,
+            zhipu_id,
             tester=lambda *_: self.fail("unsupported provider must fail before network"),
             now=self.now,
         )
@@ -187,7 +187,7 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertIn("强制联网搜索", detail)
         snapshot = repository.public_snapshot()
         self.assertEqual(snapshot["ai"]["active_model_config_id"], "legacy-qwen")
-        failed = next(model for model in snapshot["ai"]["models"] if model["id"] == deepseek_id)
+        failed = next(model for model in snapshot["ai"]["models"] if model["id"] == zhipu_id)
         self.assertEqual(failed["last_test_status"], "failed")
 
     def test_set_active_model_config_switches_only_passed_models(self):
@@ -232,12 +232,12 @@ class SettingsRepositoryTests(unittest.TestCase):
             repository.set_active_model_config("ghost-id", now=self.now)
 
         # Adding an unsupported provider must not become activatable even after a test pass.
-        deepseek_id = repository.save_model_config(
-            provider="deepseek",
-            display_name="DeepSeek",
-            base_url="https://api.deepseek.com/chat/completions",
-            model_name="deepseek-v4-flash",
-            api_key="ds-key",
+        zhipu_id = repository.save_model_config(
+            provider="zhipu",
+            display_name="智谱 GLM",
+            base_url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            model_name="glm-4.5",
+            api_key="glm-key",
             now=self.now,
         )
         with patch.object(repository, "test_and_activate_model") as fake_activate:
@@ -245,10 +245,10 @@ class SettingsRepositoryTests(unittest.TestCase):
             with self.database.connect() as connection:
                 connection.execute(
                     "UPDATE ai_model_configs SET last_test_status = 'passed' WHERE model_config_id = ?",
-                    (deepseek_id,),
+                    (zhipu_id,),
                 )
         with self.assertRaises(ValueError) as ctx:
-            repository.set_active_model_config(deepseek_id, now=self.now)
+            repository.set_active_model_config(zhipu_id, now=self.now)
         self.assertIn("联网搜索", str(ctx.exception))
 
     def test_updates_business_settings_and_exposes_effective_runtime(self):
@@ -306,6 +306,45 @@ class SettingsRepositoryTests(unittest.TestCase):
                 }
             )
         self.assertEqual(repository.public_snapshot()["runtime"], before)
+
+    def test_legacy_deepseek_endpoint_is_migrated_to_responses(self):
+        master_key = Fernet.generate_key().decode("ascii")
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            qwen_api_key="legacy-key",
+            settings_master_key=master_key,
+        )
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        deepseek_id = repository.save_model_config(
+            provider="deepseek",
+            display_name="DeepSeek",
+            base_url="https://api.deepseek.com/chat/completions",
+            model_name="deepseek-v4-flash",
+            api_key="ds-key",
+            now=self.now,
+        )
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                UPDATE ai_model_configs
+                SET last_test_status = 'passed', last_test_detail = '旧测试结果'
+                WHERE model_config_id = ?
+                """,
+                (deepseek_id,),
+            )
+
+        snapshot = repository.public_snapshot()
+        migrated = next(model for model in snapshot["ai"]["models"] if model["id"] == deepseek_id)
+        self.assertEqual(migrated["base_url"], "https://api.deepseek.com/responses")
+        # 迁移必须重置旧的测试结果，避免基于旧端点的"已通过"被误信。
+        self.assertEqual(migrated["last_test_status"], "untested")
+
+        # 迁移是幂等的，重复调用不会重复修改数据库。
+        again = repository.public_snapshot()
+        migrated_again = next(model for model in again["ai"]["models"] if model["id"] == deepseek_id)
+        self.assertEqual(migrated_again["base_url"], "https://api.deepseek.com/responses")
 
 
 if __name__ == "__main__":

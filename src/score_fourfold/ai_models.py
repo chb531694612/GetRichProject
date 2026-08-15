@@ -40,7 +40,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         "qwen3.7-max",
         True,
     ),
-    ProviderSpec("deepseek", "DeepSeek", "chat", "https://api.deepseek.com/chat/completions", "deepseek-v4-flash", False),
+    ProviderSpec("deepseek", "DeepSeek", "responses", "https://api.deepseek.com/responses", "deepseek-v4-flash", True),
     ProviderSpec("zhipu", "智谱 GLM", "chat", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4.5", False),
     ProviderSpec("moonshot", "Moonshot Kimi", "chat", "https://api.moonshot.cn/v1/chat/completions", "kimi-k2", False),
     ProviderSpec("doubao", "火山方舟豆包", "chat", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao", False),
@@ -120,11 +120,15 @@ def call_with_web_search(
             {"role": "user", "content": prompt},
         ],
         "tools": [{"type": "web_search"}],
-        "tool_choice": "required",
         "max_output_tokens": max_output_tokens,
     }
+    # 阿里云百炼接受 "required" 字符串；DeepSeek / OpenAI / 自定义等 OpenAI
+    # 兼容 Responses 接口推荐用对象形式强制调用 web_search。
     if spec.code == "qwen":
+        payload["tool_choice"] = "required"
         payload["enable_thinking"] = False
+    else:
+        payload["tool_choice"] = {"type": "web_search"}
     request = urllib.request.Request(
         runtime.base_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
