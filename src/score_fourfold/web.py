@@ -1907,6 +1907,9 @@ def build_handler(application: DashboardApplication):
                         dashboard_api.delete_model(str(payload.get("model_config_id", "")))
                         data = dashboard_api.settings()
                         detail = "大模型配置已删除"
+                    elif section == "model-activate":
+                        data = dashboard_api.activate_model(str(payload.get("model_config_id", "")))
+                        detail = "已切换为当前使用的大模型"
                     else:
                         data = dashboard_api.update_settings_section(section, payload)
                         detail = "设置已保存并立即生效"

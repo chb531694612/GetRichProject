@@ -386,6 +386,13 @@ class DashboardAPI:
             raise RuntimeError("settings repository is unavailable")
         return self.settings_repository.delete_model_config(model_config_id)
 
+    def activate_model(self, model_config_id: str) -> dict[str, Any]:
+        """Switch the active model without re-running the connectivity test."""
+        if self.settings_repository is None:
+            raise RuntimeError("settings repository is unavailable")
+        self.settings_repository.set_active_model_config(model_config_id)
+        return self.settings()
+
     def upload_ticket(self, plan_id: str, filename: str, data: bytes) -> tuple[str, str]:
         """Persist a ticket image for a plan via the application helper."""
         return self.application.trigger_upload_ticket(plan_id, filename, data)

@@ -849,6 +849,50 @@ class SettingsRepository:
                 )
         return success, detail
 
+    def set_active_model_config(
+        self,
+        model_config_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Switch the active AI model without re-running the test.
+
+        The caller must have already validated the model (see
+        :meth:`test_and_activate_model`).  This split keeps the activation UX
+        independent from a fresh network probe: a user can flip between any
+        model that has previously passed the forced web-search check.
+        """
+
+        config_id = model_config_id.strip()
+        if not config_id:
+            raise ValueError("模型配置 ID 不能为空")
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT provider, last_test_status FROM ai_model_configs WHERE model_config_id = ?",
+                (config_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("模型配置不存在")
+            if row["last_test_status"] != "passed":
+                raise ValueError(
+                    "该模型尚未通过测试，请先点击“测试并启用”验证后再切换"
+                )
+            spec = PROVIDER_BY_CODE.get(row["provider"])
+            if spec is None or not spec.native_web_search or spec.protocol != "responses":
+                raise ValueError(
+                    "该供应商当前不支持项目要求的强制联网搜索，无法作为当前模型"
+                )
+            connection.execute(
+                """
+                UPDATE ai_runtime_settings
+                SET enabled = 1, active_model_config_id = ?, updated_at = ?
+                WHERE singleton_id = 1
+                """,
+                (config_id, timestamp),
+            )
+
     def delete_model_config(self, model_config_id: str) -> bool:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

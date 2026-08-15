@@ -379,6 +379,17 @@ async function removeModel(id: string) {
   finally { busy.value = '' }
 }
 
+async function activateModel(id: string) {
+  if (!window.confirm('确定把这个大模型切换为当前使用？切换后立即影响 AI 分析。')) return
+  busy.value = `model-activate-${id}`
+  try {
+    const response = await apiPost<any>('/api/v1/settings/model-activate', { model_config_id: id })
+    settings.value = response.data
+    toast(response.detail || '已切换为当前模型')
+  } catch (error) { toast((error as Error).message, 'error') }
+  finally { busy.value = '' }
+}
+
 function money(value: string | number) { return `¥${Number(value || 0).toFixed(2)}` }
 function formatTime(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
 function shortId(value: string) { return value.length > 20 ? `${value.slice(0, 9)}…${value.slice(-6)}` : value }
@@ -576,9 +587,46 @@ onBeforeUnmount(() => {
             <hr/><h3>SMTP 发件设置</h3><div class="form-grid"><label>服务器<input v-model="settings.mail.smtp_host" /></label><label>端口<input v-model.number="settings.mail.smtp_port" type="number" /></label><label>用户名<input v-model="settings.mail.smtp_username" /></label><label>发件邮箱<input v-model="settings.mail.mail_from" type="email" /></label><label class="wide">新授权码<input v-model="authCode" type="password" :placeholder="settings.mail.smtp_auth_configured ? '已配置；留空表示不修改' : '请输入授权码'" /></label><label class="switch-row wide"><input v-model="settings.mail.mail_dry_run" type="checkbox" />只生成邮件预览，不实际发送</label></div><div class="form-actions"><button @click="saveMail">保存邮件设置</button></div>
           </section>
           <section v-else-if="settingsTab === 'models'">
-            <h3>大模型</h3><p class="hint">可添加多个模型，但同一时间只启用一个。点击“测试并启用”会真实调用 API，并核验联网搜索能力；失败不会替换当前模型。</p>
-            <div class="model-list"><article v-for="model in settings.ai.models" :key="model.id" :class="{active:settings.ai.active_model_config_id===model.id}"><div><b>{{ model.display_name }}</b><span>{{ model.provider }} · {{ model.model_name }}</span><small :class="model.last_test_status">{{ model.last_test_detail || '尚未测试' }}</small></div><div><button class="soft" @click="editModel(model)">编辑</button><button class="soft" :disabled="busy===`model-test-${model.id}`" @click="testModel(model.id)">{{ settings.ai.active_model_config_id===model.id ? '重新测试' : '测试并启用' }}</button><button class="text-danger" @click="removeModel(model.id)">删除</button></div></article></div>
-            <div class="model-form"><h4>{{ modelForm.id ? '编辑模型配置' : '添加模型配置' }}</h4><div class="form-grid"><label>模型厂商<select v-model="modelForm.provider" @change="applyProviderDefaults"><option v-for="provider in settings.providers" :key="provider.code" :value="provider.code">{{ provider.name }}</option></select></label><label>显示名称<input v-model="modelForm.display_name" /></label><label class="wide">API 地址<input v-model="modelForm.base_url" /></label><label>调用模型<input v-model="modelForm.model_name" /></label><label>API Key<input v-model="modelForm.api_key" type="password" :placeholder="modelForm.id ? '留空表示不修改' : '输入 API Key'" /></label></div><p v-if="selectedProvider() && !selectedProvider().native_web_search" class="warning">该厂商当前标准接口不支持系统强制联网搜索，可保存配置，但“测试并启用”会明确失败。</p><div class="form-actions"><button class="soft" @click="editModel()">清空</button><button @click="saveModel">保存模型</button></div></div>
+            <h3>大模型</h3>
+            <p class="hint">可添加多个模型，但同一时间只启用一个。点击“测试并启用”会真实调用 API 并核验联网搜索能力，失败不会替换当前模型。已通过测试的模型可随时“切换为当前”。</p>
+            <div class="model-list">
+              <article v-for="model in settings.ai.models" :key="model.id" :class="{ active: settings.ai.active_model_config_id === model.id }">
+                <div>
+                  <b>{{ model.display_name }}</b>
+                  <span>{{ model.provider }} · {{ model.model_name }}</span>
+                  <small :class="model.last_test_status">{{ model.last_test_detail || '尚未测试' }}</small>
+                  <span v-if="settings.ai.active_model_config_id === model.id" class="active-badge">当前正在使用</span>
+                </div>
+                <div>
+                  <button class="soft" @click="editModel(model)">编辑</button>
+                  <button class="soft" :disabled="busy === `model-test-${model.id}`" @click="testModel(model.id)">
+                    {{ settings.ai.active_model_config_id === model.id ? '重新测试' : '测试并启用' }}
+                  </button>
+                  <button
+                    v-if="settings.ai.active_model_config_id !== model.id && model.last_test_status === 'passed'"
+                    class="primary"
+                    :disabled="busy === `model-activate-${model.id}`"
+                    @click="activateModel(model.id)"
+                  >切换为当前</button>
+                  <button class="text-danger" :disabled="settings.ai.active_model_config_id === model.id" @click="removeModel(model.id)">删除</button>
+                </div>
+              </article>
+            </div>
+            <div class="model-form">
+              <h4>{{ modelForm.id ? '编辑模型配置' : '添加模型配置' }}</h4>
+              <div class="form-grid">
+                <label>模型厂商<select v-model="modelForm.provider" @change="applyProviderDefaults"><option v-for="provider in settings.providers" :key="provider.code" :value="provider.code">{{ provider.name }}</option></select></label>
+                <label>显示名称<input v-model="modelForm.display_name" /></label>
+                <label class="wide">API 地址<input v-model="modelForm.base_url" /></label>
+                <label>调用模型<input v-model="modelForm.model_name" /></label>
+                <label>API Key<input v-model="modelForm.api_key" type="password" :placeholder="modelForm.id ? '留空表示不修改' : '输入 API Key'" /></label>
+              </div>
+              <p v-if="selectedProvider() && !selectedProvider().native_web_search" class="warning">该厂商当前标准接口不支持系统强制联网搜索，可保存配置，但“测试并启用”会明确失败。</p>
+              <div class="form-actions">
+                <button class="soft" @click="editModel()">取消编辑</button>
+                <button @click="saveModel">{{ modelForm.id ? '保存修改' : '新增模型' }}</button>
+              </div>
+            </div>
           </section>
           <section v-else>
             <h3>时间与运行</h3><p class="hint">时间均为北京时间。最迟推送时间之后不会再发送当日推荐邮件。</p><div class="form-grid"><label class="wide">推荐生成时间（逗号分隔）<input v-model="recommendationTimesText" placeholder="14:00, 14:30" /></label><label>首封邮件时间<input v-model="settings.runtime.recommendation_first_mail_time" type="time" /></label><label>最迟生成时间<input v-model="settings.runtime.recommendation_latest_start" type="time" /></label><label>最迟推送时间<input v-model="settings.runtime.recommendation_deadline" type="time" /></label><label>推送安全缓冲（分钟）<input v-model.number="settings.runtime.recommendation_send_buffer_minutes" type="number" /></label><label>轮询间隔（秒）<input v-model.number="settings.runtime.poll_interval_seconds" type="number" min="60" /></label><label>赛果检查延迟（分钟）<input v-model.number="settings.runtime.result_check_delay_minutes" type="number" min="90" /></label><label class="switch-row wide"><input v-model="settings.runtime.send_no_recommendation" type="checkbox" />没有推荐时也发送通知</label></div><div class="form-actions"><button @click="saveRuntime">保存运行设置</button></div>

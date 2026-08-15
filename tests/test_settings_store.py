@@ -190,6 +190,67 @@ class SettingsRepositoryTests(unittest.TestCase):
         failed = next(model for model in snapshot["ai"]["models"] if model["id"] == deepseek_id)
         self.assertEqual(failed["last_test_status"], "failed")
 
+    def test_set_active_model_config_switches_only_passed_models(self):
+        master_key = Fernet.generate_key().decode("ascii")
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            qwen_api_key="legacy-key",
+            settings_master_key=master_key,
+        )
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        snapshot = repository.public_snapshot()
+        self.assertEqual(snapshot["ai"]["active_model_config_id"], "legacy-qwen")
+
+        # Build a second qwen model and verify activation requires a passed test.
+        second_id = repository.save_model_config(
+            provider="qwen",
+            display_name="备用千问",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+            model_name="qwen3.7-max",
+            api_key="new-key",
+            now=self.now,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            repository.set_active_model_config(second_id, now=self.now)
+        self.assertIn("尚未通过测试", str(ctx.exception))
+
+        def passing(runtime, _timeout):
+            return "OK"
+
+        repository.test_and_activate_model(second_id, tester=passing, now=self.now)
+        self.assertEqual(repository.public_snapshot()["ai"]["active_model_config_id"], second_id)
+
+        # Switching back to the legacy model only requires it to remain passed.
+        repository.test_and_activate_model("legacy-qwen", tester=passing, now=self.now)
+        repository.set_active_model_config(second_id, now=self.now)
+        self.assertEqual(repository.public_snapshot()["ai"]["active_model_config_id"], second_id)
+
+        # Switching to a non-existent or untested model must fail safely.
+        with self.assertRaises(ValueError):
+            repository.set_active_model_config("ghost-id", now=self.now)
+
+        # Adding an unsupported provider must not become activatable even after a test pass.
+        deepseek_id = repository.save_model_config(
+            provider="deepseek",
+            display_name="DeepSeek",
+            base_url="https://api.deepseek.com/chat/completions",
+            model_name="deepseek-v4-flash",
+            api_key="ds-key",
+            now=self.now,
+        )
+        with patch.object(repository, "test_and_activate_model") as fake_activate:
+            fake_activate.return_value = (True, "测试通过")
+            with self.database.connect() as connection:
+                connection.execute(
+                    "UPDATE ai_model_configs SET last_test_status = 'passed' WHERE model_config_id = ?",
+                    (deepseek_id,),
+                )
+        with self.assertRaises(ValueError) as ctx:
+            repository.set_active_model_config(deepseek_id, now=self.now)
+        self.assertIn("联网搜索", str(ctx.exception))
+
     def test_updates_business_settings_and_exposes_effective_runtime(self):
         settings = make_settings(self.root, database_path=self.database_path)
         repository = SettingsRepository(self.database, settings)
