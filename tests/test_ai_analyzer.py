@@ -235,6 +235,128 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(result.suggestions[0].option_code, "s1sh")
         self.assertEqual(result.suggestions[0].pick_label, "4:2")
 
+    @staticmethod
+    def _ttg_legs():
+        options = tuple(
+            ScoreOption(
+                f"s{goals}",
+                "7+" if goals == 7 else str(goals),
+                Decimal(str(3 + goals)),
+                Decimal("0.125"),
+                False,
+            )
+            for goals in range(8)
+        )
+        return [
+            SimpleNamespace(
+                match_id=str(2000 + index),
+                match_num=f"周三00{index}",
+                business_date="2026-07-22",
+                league="测试联赛",
+                home=f"主队{index}",
+                away=f"客队{index}",
+                start_at=datetime(2026, 7, 22, 20, index),
+                score_code=f"s{index}",
+                score_label=str(index),
+                odds=Decimal("5.00"),
+                probability=Decimal("0.125"),
+                options=options,
+            )
+            for index in (1, 2)
+        ]
+
+    def test_ttg_plan_analysis_accepts_high_goal_and_seven_plus(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        content = json.dumps(
+            {
+                "summary": "两队进攻火力较猛，存在大比分可能。",
+                "suggestions": [
+                    {"match_id": "2001", "pick": "6", "reason": "双方近期进攻火爆、防线漏洞多"},
+                    {"match_id": "2002", "pick": "7+", "reason": "历史交锋多次打出大比分"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload(content)),
+        ) as mocked:
+            result = analyze_plan_from_leg_data(self._ttg_legs(), MarketType.TTG, settings)
+
+        self.assertEqual([item.option_code for item in result.suggestions], ["s6", "s7"])
+        self.assertEqual([item.pick_label for item in result.suggestions], ["6", "7+"])
+        prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
+        self.assertIn("大胆", prompt)
+        self.assertIn("7+", prompt)
+        self.assertIn("爆冷", prompt)
+
+    def test_ttg_plan_analysis_normalizes_goal_variants(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        content = json.dumps(
+            {
+                "summary": "test",
+                "suggestions": [
+                    {"match_id": "2001", "pick": "6球", "reason": "进攻强"},
+                    {"match_id": "2002", "pick": "7球以上", "reason": "交锋大球多"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload(content)),
+        ):
+            result = analyze_plan_from_leg_data(self._ttg_legs(), MarketType.TTG, settings)
+
+        self.assertEqual([item.option_code for item in result.suggestions], ["s6", "s7"])
+        self.assertEqual([item.pick_label for item in result.suggestions], ["6", "7+"])
+
+    def test_had_plan_analysis_accepts_away_upset_pick(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        options = (
+            ScoreOption("h", "主胜", Decimal("1.80"), Decimal("0.50"), False),
+            ScoreOption("d", "平", Decimal("3.50"), Decimal("0.28"), False),
+            ScoreOption("a", "客胜", Decimal("4.50"), Decimal("0.22"), False),
+        )
+        legs = [
+            SimpleNamespace(
+                match_id=str(3000 + index),
+                match_num=f"周四00{index}",
+                business_date="2026-07-22",
+                league="测试联赛",
+                home=f"主队{index}",
+                away=f"客队{index}",
+                start_at=datetime(2026, 7, 22, 20, index),
+                score_code="a",
+                score_label="客胜",
+                odds=Decimal("4.50"),
+                probability=Decimal("0.22"),
+                options=options,
+            )
+            for index in (1, 2)
+        ]
+        content = json.dumps(
+            {
+                "summary": "客队状态回升且主队轮换，存在爆冷空间。",
+                "suggestions": [
+                    {"match_id": "3001", "pick": "客胜", "reason": "客队连胜、主队多名主力伤停"},
+                    {"match_id": "3002", "pick": "主胜", "reason": "主队主场强势"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload(content)),
+        ) as mocked:
+            result = analyze_plan_from_leg_data(legs, MarketType.HAD, settings)
+
+        self.assertEqual([item.option_code for item in result.suggestions], ["a", "h"])
+        self.assertEqual([item.pick_label for item in result.suggestions], ["客胜", "主胜"])
+        prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
+        self.assertIn("大胆性要求", prompt)
+        self.assertIn("冷门", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
