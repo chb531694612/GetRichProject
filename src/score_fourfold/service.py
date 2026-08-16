@@ -337,6 +337,41 @@ class ScoreFourfoldService:
         """Extract the numeric part from a match number (e.g. '周二004' -> '004')."""
         return re.sub(r"\D", "", match_num)
 
+    @classmethod
+    def _result_matches_leg(cls, result: MatchResult, leg) -> bool:
+        """Guard against match_id collisions between the odds and results feeds.
+
+        The official odds API (used at recommendation time) and the results
+        API (used at settlement time) maintain *independent* match_id number
+        spaces.  The same stored match_id can therefore resolve to a
+        completely different fixture in the results feed (e.g. 周六016 of a
+        previous sales period vs 周日016 of the next).  Only accept a result
+        for a leg when the fixtures plausibly match.
+        """
+        if result.home_team and result.away_team:
+            home_ok = cls._team_names_match(
+                cls._normalize_team(result.home_team), cls._normalize_team(leg.home)
+            )
+            away_ok = cls._team_names_match(
+                cls._normalize_team(result.away_team), cls._normalize_team(leg.away)
+            )
+            if home_ok and away_ok:
+                return True
+            # Partial transliteration variance (e.g. 雷克维京 vs 雷克雅未克维京人):
+            # one team matches exactly AND the match number digits agree.
+            if result.match_num and leg.match_num:
+                digits_ok = cls._match_num_digits(result.match_num) == cls._match_num_digits(
+                    leg.match_num
+                )
+                if digits_ok and (home_ok or away_ok):
+                    return True
+            return False
+        # Results without team names (e.g. a degraded third-party feed) can
+        # only be cross-checked by the match number digits.
+        if result.match_num and leg.match_num:
+            return cls._match_num_digits(result.match_num) == cls._match_num_digits(leg.match_num)
+        return True
+
     @staticmethod
     def _team_names_match(a: str, b: str) -> bool:
         """Exact or containment match for two normalized team names.
@@ -552,7 +587,7 @@ class ScoreFourfoldService:
             if leg.match_id in results and results[leg.match_id].status not in {ResultStatus.PENDING, ResultStatus.VOID}:
                 continue
             matched_mid = self._resolve_leg_match_id(leg, indexes)
-            if matched_mid and matched_mid in results:
+            if matched_mid and matched_mid in results and self._result_matches_leg(results[matched_mid], leg):
                 if leg.match_id != matched_mid:
                     self.database.update_leg_match_id(plan_id, leg.match_id, matched_mid)
                     leg_id_map[leg.match_id] = matched_mid
@@ -567,7 +602,7 @@ class ScoreFourfoldService:
         relevant: dict[str, MatchResult] = {}
         for leg in plan.legs:
             effective_id = leg_id_map.get(leg.match_id, leg.match_id)
-            if effective_id in results:
+            if effective_id in results and self._result_matches_leg(results[effective_id], leg):
                 relevant[effective_id] = results[effective_id]
         if relevant:
             self.database.update_leg_results(plan_id, relevant)
@@ -678,12 +713,16 @@ class ScoreFourfoldService:
         settled_count = 0
         updated_count = 0
         for plan in plans_to_check:
-            relevant = {leg.match_id: results[leg.match_id] for leg in plan.legs if leg.match_id in results}
+            relevant = {
+                leg.match_id: results[leg.match_id]
+                for leg in plan.legs
+                if leg.match_id in results and self._result_matches_leg(results[leg.match_id], leg)
+            }
             unmatched = [leg for leg in plan.legs if leg.match_id not in relevant]
             migrated = 0
             for leg in unmatched:
                 matched_mid = self._resolve_leg_match_id(leg, indexes)
-                if matched_mid and matched_mid in results:
+                if matched_mid and matched_mid in results and self._result_matches_leg(results[matched_mid], leg):
                     self.database.update_leg_match_id(plan.plan_id, leg.match_id, matched_mid)
                     relevant[matched_mid] = results[matched_mid]
                     migrated += 1

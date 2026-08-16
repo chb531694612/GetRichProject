@@ -408,6 +408,91 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.status, PlanStatus.WON)
 
+    def test_colliding_match_id_from_other_fixture_is_ignored(self):
+        """A result whose match_id collides with a *different* fixture must be rejected.
+
+        The odds API and results API maintain independent match_id spaces, so
+        the same stored match_id can resolve to a different match at settlement
+        time (e.g. 周六016 vs 周日016 of another sales period).  Settlement
+        must not consume that result.
+        """
+        victim = self.matches[0]
+        # The stored plan leg refers to 主队1 vs 客队1, but the results feed
+        # returns an unrelated fixture reusing the same match_id.
+        results = {
+            match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+            for match in self.matches[1:]
+        }
+        results[victim.match_id] = MatchResult(
+            victim.match_id,
+            ResultStatus.FINAL,
+            3,
+            0,
+            home_team="完全无关主队",
+            away_team="完全无关客队",
+            match_num="周三888",
+        )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成0张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        # The colliding leg stays pending; the other legs are updated.
+        collided = next(leg for leg in plan.legs if leg.match_id == victim.match_id)
+        self.assertEqual(collided.result_status, ResultStatus.PENDING)
+        self.assertIsNone(collided.result_home)
+
+    def test_colliding_match_id_ignored_in_settle_plan(self):
+        """settle_plan rejects a colliding match_id the same way."""
+        victim = self.matches[0]
+        results = {
+            match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+            for match in self.matches[1:]
+        }
+        results[victim.match_id] = MatchResult(
+            victim.match_id,
+            ResultStatus.FINAL,
+            0,
+            0,
+            home_team="无关主队A",
+            away_team="无关客队B",
+            match_num="周六999",
+        )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle_plan(self.recommendation.plan_id, settle_at)
+        # Three legitimate legs are updated; the colliding leg stays pending and
+        # the plan remains pending until the real fixture finishes.
+        self.assertEqual(outcome.status, "partial")
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        collided = next(leg for leg in plan.legs if leg.match_id == victim.match_id)
+        self.assertEqual(collided.result_status, ResultStatus.PENDING)
+        self.assertIsNone(collided.result_home)
+
+    def test_match_num_digits_only_still_accepted_when_teams_absent(self):
+        """Results without team names fall back to match-number validation."""
+        results = {
+            match.match_id: MatchResult(
+                match.match_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                match_num=match.match_num,
+            )
+            for match in self.matches
+        }
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+
     def test_settle_plan_team_name_fallback(self):
         """settle_plan also falls back to team-name matching."""
         results: dict[str, MatchResult] = {}
@@ -561,19 +646,19 @@ class DelayedSettlementTests(unittest.TestCase):
             self.assertEqual(leg.result_status, ResultStatus.FINAL, f"leg {leg.position}")
 
     def test_stale_match_id_reconciled_by_match_num_and_date(self):
-        """A stale match_id with unrelated team names is reconciled via the
+        """A stale match_id with matching team names is reconciled via the
         official match number + kickoff date (e.g. 001 + 8/13 vs 周三001)."""
         results: dict[str, MatchResult] = {}
         for match in self.matches:
             new_id = f"NEW-{match.match_id}"
-            # Unrelated names so only the match number + date can match.
+            # Same team names so the match number + date can safely match.
             results[new_id] = MatchResult(
                 new_id,
                 ResultStatus.FINAL,
                 1,
                 0,
-                home_team=f"甲队{match.match_id}",
-                away_team=f"乙队{match.match_id}",
+                home_team=match.home,
+                away_team=match.away,
                 match_num=match.match_num,
                 match_date=match.start_at.date().isoformat(),
             )
@@ -587,6 +672,36 @@ class DelayedSettlementTests(unittest.TestCase):
         for leg in plan.legs:
             self.assertTrue(leg.match_id.startswith("NEW-"))
 
+    def test_stale_match_id_with_unrelated_teams_is_not_reconciled(self):
+        """A stale match_id whose result has unrelated team names must NOT be
+        reconciled by match number + date — that is the collision case where
+        the odds feed and results feed reused the same match_id for different
+        fixtures (周六016 vs 周日016)."""
+        results: dict[str, MatchResult] = {}
+        for match in self.matches:
+            new_id = f"NEW-{match.match_id}"
+            # Unrelated names: only number + date would match, which is unsafe.
+            results[new_id] = MatchResult(
+                new_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=f"甲队{match.match_id}",
+                away_team=f"乙队{match.match_id}",
+                match_num=match.match_num,
+                match_date=match.start_at.date().isoformat(),
+            )
+        provider = _FakeResultProvider(results)
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成0张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.PENDING)
+            self.assertFalse(leg.match_id.startswith("NEW-"))
+
     def test_settle_plan_reconciles_stale_match_id_by_num_and_date(self):
         """settle_plan also reconciles a stale match_id via match number + date."""
         results: dict[str, MatchResult] = {}
@@ -597,8 +712,8 @@ class DelayedSettlementTests(unittest.TestCase):
                 ResultStatus.FINAL,
                 1,
                 0,
-                home_team=f"甲队{match.match_id}",
-                away_team=f"乙队{match.match_id}",
+                home_team=match.home,
+                away_team=match.away,
                 match_num=match.match_num,
                 match_date=match.start_at.date().isoformat(),
             )
