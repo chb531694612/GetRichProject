@@ -11,10 +11,16 @@ from unittest.mock import patch
 
 from score_fourfold.ai_analyzer import (
     AIAnalysisError,
+    DEFAULT_PLAN_REQUIREMENTS,
+    DEFAULT_SUMMARY_REQUIREMENTS,
     analyze_matches,
     analyze_plan_from_leg_data,
     probe_qwen,
     qwen_analyze,
+)
+from score_fourfold.ai_models import (
+    DEFAULT_SYSTEM_PROMPT,
+    set_prompt_overrides,
 )
 from score_fourfold.domain import MarketType, ScoreOption
 
@@ -286,7 +292,9 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual([item.option_code for item in result.suggestions], ["s6", "s7"])
         self.assertEqual([item.pick_label for item in result.suggestions], ["6", "7+"])
         prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
-        self.assertIn("大胆", prompt)
+        # 提示词已回退到上一版本：不再包含"大胆性"鼓励内容。
+        self.assertNotIn("大胆", prompt)
+        self.assertNotIn("胆量", prompt)
         self.assertIn("7+", prompt)
         self.assertIn("爆冷", prompt)
 
@@ -354,8 +362,71 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual([item.option_code for item in result.suggestions], ["a", "h"])
         self.assertEqual([item.pick_label for item in result.suggestions], ["客胜", "主胜"])
         prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
-        self.assertIn("大胆性要求", prompt)
+        # 提示词已回退到上一版本：不再包含"大胆性要求"段落。
+        self.assertNotIn("大胆性要求", prompt)
         self.assertIn("冷门", prompt)
+
+    def test_default_prompts_stay_reverted_after_boldness_rollout(self):
+        # 回归保护：默认提示词不得再出现"大胆/胆量"类鼓励措辞。
+        self.assertNotIn("大胆", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertNotIn("胆量", DEFAULT_SUMMARY_REQUIREMENTS)
+        self.assertNotIn("胆量", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("爆冷分析要求", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("冷门风险", DEFAULT_SUMMARY_REQUIREMENTS)
+
+    def test_prompt_overrides_replace_default_requirements(self):
+        self.addCleanup(set_prompt_overrides)
+        set_prompt_overrides(
+            system_prompt="自定义系统提示词ABC",
+            plan_requirements="自定义计划要求XYZ",
+            summary_requirements="自定义总结要求QRS",
+        )
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        content = json.dumps(
+            {
+                "summary": "test",
+                "suggestions": [
+                    {"match_id": "1001", "pick": "1:1", "reason": "ok"},
+                    {"match_id": "1002", "pick": "1:0", "reason": "ok"},
+                ],
+            }
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload(content)),
+        ) as mocked:
+            analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings)
+
+        payload = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["input"][0]["content"], "自定义系统提示词ABC")
+        prompt = payload["input"][1]["content"]
+        self.assertIn("自定义计划要求XYZ", prompt)
+        self.assertNotIn("爆冷分析要求", prompt)
+
+    def test_summary_prompt_uses_override_when_set(self):
+        self.addCleanup(set_prompt_overrides)
+        set_prompt_overrides(summary_requirements="自定义总结要求QRS")
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        match = SimpleNamespace(
+            match_id="1001",
+            match_num="周二001",
+            business_date="2026-07-22",
+            league="测试联赛",
+            home="主队",
+            away="客队",
+            start_at=datetime(2026, 7, 22, 20, 0),
+        )
+        selected = ScoreOption("s01s00", "1:0", Decimal("9.99"), Decimal("0.12"))
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload("联网分析完成")),
+        ) as mocked:
+            qwen_analyze([(match, selected)], MarketType.CRS, settings)
+
+        payload = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
+        prompt = payload["input"][1]["content"]
+        self.assertIn("自定义总结要求QRS", prompt)
+        self.assertNotIn("空泛套话", prompt)
 
 
 if __name__ == "__main__":

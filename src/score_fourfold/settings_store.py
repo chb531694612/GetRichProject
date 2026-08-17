@@ -14,9 +14,15 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from .ai_models import (
     AIModelRuntime,
+    DEFAULT_SYSTEM_PROMPT,
     PROVIDER_BY_CODE,
+    set_prompt_overrides,
     test_model,
     validate_runtime,
+)
+from .ai_analyzer import (
+    DEFAULT_PLAN_REQUIREMENTS,
+    DEFAULT_SUMMARY_REQUIREMENTS,
 )
 from .config import Settings
 from .database import Database
@@ -69,6 +75,96 @@ class SettingsRepository:
             SecretCipher(legacy.settings_master_key)
             if legacy.settings_master_key
             else None
+        )
+        try:
+            self._sync_prompt_overrides()
+        except Exception:
+            # 数据库尚未初始化或读取失败时保持内置默认，绝不能阻断启动。
+            set_prompt_overrides()
+
+    def _prompt_row(self) -> Any:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_prompt_settings WHERE singleton_id = 1"
+            ).fetchone()
+            if row is not None:
+                return row
+            timestamp = datetime.now(self.legacy.timezone).isoformat()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO ai_prompt_settings
+                    (singleton_id, system_prompt, plan_requirements,
+                     summary_requirements, updated_at)
+                VALUES (1, '', '', '', ?)
+                """,
+                (timestamp,),
+            )
+            return connection.execute(
+                "SELECT * FROM ai_prompt_settings WHERE singleton_id = 1"
+            ).fetchone()
+
+    def ai_prompt_settings(self) -> dict[str, Any]:
+        row = self._prompt_row()
+        return {
+            "system_prompt": row["system_prompt"],
+            "plan_requirements": row["plan_requirements"],
+            "summary_requirements": row["summary_requirements"],
+            "updated_at": row["updated_at"],
+        }
+
+    def update_ai_prompt_settings(
+        self,
+        values: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        fields = (
+            ("system_prompt", "系统提示词"),
+            ("plan_requirements", "计划推荐分析要求"),
+            ("summary_requirements", "总结分析要求"),
+        )
+        cleaned: dict[str, str] = {}
+        for key, label in fields:
+            text = str(values.get(key, "") or "").strip()
+            if len(text) > 8000:
+                raise ValueError(f"{label}不能超过8000字")
+            cleaned[key] = text
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO ai_prompt_settings
+                    (singleton_id, system_prompt, plan_requirements,
+                     summary_requirements, updated_at)
+                VALUES (1, '', '', '', ?)
+                ON CONFLICT(singleton_id) DO NOTHING
+                """,
+                (timestamp,),
+            )
+            connection.execute(
+                """
+                UPDATE ai_prompt_settings
+                SET system_prompt = ?, plan_requirements = ?,
+                    summary_requirements = ?, updated_at = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    cleaned["system_prompt"],
+                    cleaned["plan_requirements"],
+                    cleaned["summary_requirements"],
+                    timestamp,
+                ),
+            )
+        self._sync_prompt_overrides()
+
+    def _sync_prompt_overrides(self) -> None:
+        row = self._prompt_row()
+        set_prompt_overrides(
+            row["system_prompt"],
+            row["plan_requirements"],
+            row["summary_requirements"],
         )
 
     @staticmethod
@@ -543,6 +639,15 @@ class SettingsRepository:
         if meta is None or notification is None or ai_runtime is None or runtime is None:
             raise RuntimeError("settings have not been initialized")
         models = self._migrate_model_endpoints(models)
+        try:
+            prompt_row = self._prompt_row()
+        except Exception:
+            prompt_row = {
+                "system_prompt": "",
+                "plan_requirements": "",
+                "summary_requirements": "",
+                "updated_at": "",
+            }
         return {
             "schema_version": int(meta["schema_version"]),
             "initialized_at": meta["initialized_at"],
@@ -603,6 +708,17 @@ class SettingsRepository:
                 "poll_interval_seconds": int(runtime["poll_interval_seconds"]),
                 "result_check_delay_minutes": int(runtime["result_check_delay_minutes"]),
                 "send_no_recommendation": bool(runtime["send_no_recommendation"]),
+            },
+            "ai_prompts": {
+                "system_prompt": prompt_row["system_prompt"],
+                "plan_requirements": prompt_row["plan_requirements"],
+                "summary_requirements": prompt_row["summary_requirements"],
+                "updated_at": prompt_row["updated_at"],
+                "defaults": {
+                    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                    "plan_requirements": DEFAULT_PLAN_REQUIREMENTS,
+                    "summary_requirements": DEFAULT_SUMMARY_REQUIREMENTS,
+                },
             },
             "secret_storage_ready": self._cipher is not None,
         }

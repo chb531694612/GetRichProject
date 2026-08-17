@@ -322,6 +322,22 @@ function saveRuntime() {
   })
 }
 
+const promptFields = ['system_prompt', 'plan_requirements', 'summary_requirements'] as const
+function savePrompts() {
+  const prompts = settings.value?.ai_prompts || {}
+  saveSection('prompts', {
+    system_prompt: prompts.system_prompt || '',
+    plan_requirements: prompts.plan_requirements || '',
+    summary_requirements: prompts.summary_requirements || '',
+  })
+}
+function resetPrompts() {
+  if (!window.confirm('确定清空全部自定义提示词并恢复内置默认？保存后生效。')) return
+  const prompts = settings.value?.ai_prompts
+  if (!prompts) return
+  promptFields.forEach((field) => { prompts[field] = '' })
+}
+
 const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '' })
 function selectedProvider() { return settings.value?.providers?.find((item: any) => item.code === modelForm.provider) }
 function applyProviderDefaults() {
@@ -575,7 +591,7 @@ onBeforeUnmount(() => {
     <section class="settings-modal surface">
       <header><div><h2>设置</h2><p>现有配置已自动初始化到新设置中，不会覆盖历史计划。</p></div><button class="modal-close" @click="settingsOpen = false">×</button></header>
       <div v-if="settings" class="settings-body">
-        <nav class="settings-nav"><button v-for="tab in [{v:'recommendations',l:'推荐计划'},{v:'recipients',l:'推送邮箱'},{v:'models',l:'大模型'},{v:'runtime',l:'时间与运行'}]" :key="tab.v" :class="{active:settingsTab===tab.v}" @click="settingsTab=tab.v">{{ tab.l }}</button></nav>
+        <nav class="settings-nav"><button v-for="tab in [{v:'recommendations',l:'推荐计划'},{v:'recipients',l:'推送邮箱'},{v:'models',l:'大模型'},{v:'prompts',l:'AI提示词'},{v:'runtime',l:'时间与运行'}]" :key="tab.v" :class="{active:settingsTab===tab.v}" @click="settingsTab=tab.v">{{ tab.l }}</button></nav>
         <div class="settings-content">
           <section v-if="settingsTab === 'recommendations'">
             <h3>计划生成规则</h3><p class="hint">优先使用最高串关数；比赛不足逐级降低。连最低串关数也不满足时不生成。</p>
@@ -626,6 +642,29 @@ onBeforeUnmount(() => {
                 <button class="soft" @click="editModel()">取消编辑</button>
                 <button @click="saveModel">{{ modelForm.id ? '保存修改' : '新增模型' }}</button>
               </div>
+            </div>
+          </section>
+          <section v-else-if="settingsTab === 'prompts'">
+            <h3>AI 提示词</h3>
+            <p class="hint">留空使用内置默认。保存后立即影响后续自动推荐和手动 AI 分析；JSON 输出格式、赛程拼接等安全结构不在可编辑范围内。</p>
+            <div class="prompt-field">
+              <label><b>系统提示词</b><small>每次 AI 调用的角色设定（system 消息）</small></label>
+              <textarea v-model="settings.ai_prompts.system_prompt" rows="4" placeholder="留空使用内置默认"></textarea>
+              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.system_prompt }}</pre></details>
+            </div>
+            <div class="prompt-field">
+              <label><b>计划推荐分析要求</b><small>「AI分析并推荐」每场推荐时附加到提示词末尾的分析规则</small></label>
+              <textarea v-model="settings.ai_prompts.plan_requirements" rows="12" placeholder="留空使用内置默认"></textarea>
+              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.plan_requirements }}</pre></details>
+            </div>
+            <div class="prompt-field">
+              <label><b>总结分析要求</b><small>生成计划总体分析（ai_summary）时使用的分析要求</small></label>
+              <textarea v-model="settings.ai_prompts.summary_requirements" rows="8" placeholder="留空使用内置默认"></textarea>
+              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.summary_requirements }}</pre></details>
+            </div>
+            <div class="form-actions">
+              <button class="soft" @click="resetPrompts">恢复全部默认</button>
+              <button :disabled="busy === 'settings-prompts'" @click="savePrompts">保存提示词</button>
             </div>
           </section>
           <section v-else>

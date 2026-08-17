@@ -54,6 +54,35 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 PROVIDER_BY_CODE = {provider.code: provider for provider in PROVIDERS}
 
 
+DEFAULT_SYSTEM_PROMPT = (
+    "你是一名严谨的足球比赛信息分析师。必须先联网检索公开资料，综合战绩、交锋、伤停、"
+    "赛程和社区观点进行交叉验证，严禁敷衍了事或给出空泛结论。严格按用户要求输出。"
+)
+
+# 提示词覆盖注册表：空字符串表示使用内置默认。
+# 由 SettingsRepository 在启动和设置更新时写入；放在模块级是为了让
+# strategy/service 等无法穿透传参的调用链也能即时读到最新配置。
+_PROMPT_OVERRIDES: dict[str, str] = {"system": "", "plan": "", "summary": ""}
+
+
+def set_prompt_overrides(
+    system_prompt: str = "",
+    plan_requirements: str = "",
+    summary_requirements: str = "",
+) -> None:
+    _PROMPT_OVERRIDES["system"] = (system_prompt or "").strip()
+    _PROMPT_OVERRIDES["plan"] = (plan_requirements or "").strip()
+    _PROMPT_OVERRIDES["summary"] = (summary_requirements or "").strip()
+
+
+def prompt_overrides() -> dict[str, str]:
+    return dict(_PROMPT_OVERRIDES)
+
+
+def effective_system_prompt() -> str:
+    return _PROMPT_OVERRIDES["system"] or DEFAULT_SYSTEM_PROMPT
+
+
 def validate_runtime(runtime: AIModelRuntime) -> ProviderSpec:
     spec = PROVIDER_BY_CODE.get(runtime.provider)
     if spec is None:
@@ -115,7 +144,7 @@ def call_with_web_search(
         "input": [
             {
                 "role": "system",
-                "content": "你是一名严谨的足球比赛信息分析师。必须先联网检索公开资料，综合战绩、交锋、伤停、赛程和社区观点进行交叉验证，严禁敷衍了事或给出空泛结论。分析要有胆量：只要证据支持，就敢于给出高进球数、大比分、弱队拿分等非主流判断，不要回避冷门。严格按用户要求输出。",
+                "content": effective_system_prompt(),
             },
             {"role": "user", "content": prompt},
         ],

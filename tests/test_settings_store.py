@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
 
+from score_fourfold import ai_models
 from score_fourfold.database import Database
 from score_fourfold.settings_store import SettingsRepository
 
@@ -27,6 +28,56 @@ class SettingsRepositoryTests(unittest.TestCase):
     def tearDown(self):
         for suffix in ("", "-wal", "-shm"):
             Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+        ai_models.set_prompt_overrides()
+
+    def test_ai_prompt_settings_roundtrip_and_override_sync(self):
+        self.addCleanup(ai_models.set_prompt_overrides)
+        settings = make_settings(self.root, database_path=self.database_path)
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+
+        snapshot = repository.public_snapshot()
+        self.assertEqual(snapshot["ai_prompts"]["system_prompt"], "")
+        self.assertEqual(snapshot["ai_prompts"]["plan_requirements"], "")
+        self.assertEqual(snapshot["ai_prompts"]["summary_requirements"], "")
+        self.assertIn(
+            "爆冷分析要求",
+            snapshot["ai_prompts"]["defaults"]["plan_requirements"],
+        )
+        self.assertIn(
+            "冷门风险",
+            snapshot["ai_prompts"]["defaults"]["summary_requirements"],
+        )
+        # 空值 = 使用内置默认。
+        self.assertEqual(
+            ai_models.effective_system_prompt(),
+            ai_models.DEFAULT_SYSTEM_PROMPT,
+        )
+
+        repository.update_ai_prompt_settings(
+            {
+                "system_prompt": "自定义系统提示词",
+                "plan_requirements": "自定义计划要求",
+                "summary_requirements": "",
+            },
+            now=self.now,
+        )
+        snapshot = repository.public_snapshot()
+        self.assertEqual(snapshot["ai_prompts"]["system_prompt"], "自定义系统提示词")
+        self.assertEqual(snapshot["ai_prompts"]["plan_requirements"], "自定义计划要求")
+        self.assertEqual(snapshot["ai_prompts"]["summary_requirements"], "")
+        # 保存后立即同步到运行时提示词覆盖。
+        self.assertEqual(ai_models.effective_system_prompt(), "自定义系统提示词")
+        self.assertEqual(ai_models.prompt_overrides()["plan"], "自定义计划要求")
+        self.assertEqual(ai_models.prompt_overrides()["summary"], "")
+
+        # 重新构造仓库（模拟进程重启）会从数据库恢复覆盖。
+        SettingsRepository(self.database, settings)
+        self.assertEqual(ai_models.effective_system_prompt(), "自定义系统提示词")
+
+        # 超长内容被拒绝。
+        with self.assertRaises(ValueError):
+            repository.update_ai_prompt_settings({"system_prompt": "x" * 8001})
 
     def test_initializes_all_legacy_values_once_and_encrypts_secrets(self):
         master_key = Fernet.generate_key().decode("ascii")

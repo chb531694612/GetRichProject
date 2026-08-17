@@ -300,6 +300,8 @@ class DashboardAPI:
             )
         elif section == "runtime":
             repository.update_runtime_settings(payload)
+        elif section == "prompts":
+            repository.update_ai_prompt_settings(payload)
         else:
             raise ValueError("unknown settings section")
         if self.application.wake_mailer is not None:
