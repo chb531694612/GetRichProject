@@ -322,20 +322,58 @@ function saveRuntime() {
   })
 }
 
-const promptFields = ['system_prompt', 'plan_requirements', 'summary_requirements'] as const
+const promptFields = [
+  { field: 'system_prompt', label: '系统提示词', help: '每次 AI 调用的角色设定（system 消息）' },
+  { field: 'plan_requirements', label: '计划推荐分析要求', help: '「AI分析并推荐」每场推荐时附加到提示词末尾的分析规则' },
+  { field: 'summary_requirements', label: '总结分析要求', help: '生成计划总体分析（ai_summary）时使用的分析要求' },
+] as const
+
+const promptDrafts = reactive<Record<string, string>>({})
+
+watch(
+  () => settings.value?.ai_prompts,
+  (val) => {
+    if (!val) return
+    for (const { field } of promptFields) {
+      const override = ((val as Record<string, string>)[field] || '').trimEnd()
+      const fallback = (val.defaults?.[field] || '').trimEnd()
+      promptDrafts[field] = override || fallback
+    }
+  },
+  { immediate: true, deep: true }
+)
+
+function promptIsOverridden(field: string): boolean {
+  const override = ((settings.value as Record<string, any>)?.ai_prompts?.[field] || '').trimEnd()
+  return override !== ''
+}
+function promptIsDirty(field: string): boolean {
+  const override = ((settings.value as Record<string, any>)?.ai_prompts?.[field] || '').trimEnd()
+  const fallback = ((settings.value as Record<string, any>)?.ai_prompts?.defaults?.[field] || '').trimEnd()
+  const draft = (promptDrafts[field] || '').trimEnd()
+  if (draft === fallback) return override !== ''
+  return draft !== override
+}
+function clearPromptDraft(field: string) {
+  promptDrafts[field] = ''
+}
+function resetPromptDraft(field: string) {
+  promptDrafts[field] = (settings.value as Record<string, any>)?.ai_prompts?.defaults?.[field] || ''
+}
 function savePrompts() {
-  const prompts = settings.value?.ai_prompts || {}
-  saveSection('prompts', {
-    system_prompt: prompts.system_prompt || '',
-    plan_requirements: prompts.plan_requirements || '',
-    summary_requirements: prompts.summary_requirements || '',
-  })
+  const payload: Record<string, string> = {}
+  for (const { field } of promptFields) {
+    const draft = (promptDrafts[field] || '').trimEnd()
+    const fallback = ((settings.value as Record<string, any>)?.ai_prompts?.defaults?.[field] || '').trimEnd()
+    payload[field] = draft === fallback ? '' : draft
+  }
+  saveSection('prompts', payload)
 }
 function resetPrompts() {
   if (!window.confirm('确定清空全部自定义提示词并恢复内置默认？保存后生效。')) return
-  const prompts = settings.value?.ai_prompts
-  if (!prompts) return
-  promptFields.forEach((field) => { prompts[field] = '' })
+  for (const { field } of promptFields) {
+    promptDrafts[field] = (settings.value as Record<string, any>)?.ai_prompts?.defaults?.[field] || ''
+  }
 }
 
 const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '' })
@@ -409,6 +447,27 @@ async function activateModel(id: string) {
 function money(value: string | number) { return `¥${Number(value || 0).toFixed(2)}` }
 function formatTime(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
 function shortId(value: string) { return value.length > 20 ? `${value.slice(0, 9)}…${value.slice(-6)}` : value }
+// 距离比赛已开赛多久仍 pending。体彩官方赛果接口一般在完赛后 2-4 小时内
+// 更新，4 小时后仍未拿到即可视为「官方未公布」。这只是一个展示提示，不改变
+// 服务端数据：result_status 仍按原始 PENDING 保留，结算逻辑也不会被它绕过。
+const PENDING_OFFICIAL_STALE_MS = 4 * 60 * 60 * 1000
+function pendingHint(leg: any): string {
+  if (!leg || !leg.result || leg.result.status !== 'pending') return ''
+  const start = new Date(leg.start_at || '').getTime()
+  if (!Number.isFinite(start)) return ''
+  const now = Date.now()
+  if (now < start) {
+    const leftMin = Math.round((start - now) / 60000)
+    if (leftMin < 60) return `${leftMin} 分钟后开赛`
+    const leftH = Math.round((start - now) / (60 * 60 * 1000))
+    return `${leftH}h 后开赛`
+  }
+  const ageMs = now - start
+  if (ageMs < PENDING_OFFICIAL_STALE_MS) return '等待官宣'
+  const ageH = Math.round(ageMs / (60 * 60 * 1000))
+  if (ageH < 48) return `官方未公布 · 已过 ${ageH}h`
+  return `官方未公布 · 已过 ${ageH / 24 | 0}d`
+}
 function formatResult(market: string, result: any) {
   if (result.status === 'pending') return '待公布'
   if (result.status === 'void') return '比赛无效'
@@ -526,7 +585,7 @@ onBeforeUnmount(() => {
                 <td><span v-if="leg.original_pick_label" class="pick original">{{ pickWithBall(leg.original_pick_label, plan.market) }}</span><span v-else class="muted">-</span></td>
                 <td><span v-if="leg.ai_suggestion" class="ai-suggestion">{{ pickWithBall(leg.ai_suggestion.label, plan.market) }}</span><span v-else class="muted">-</span></td>
                 <td>{{ leg.odds }}</td>
-                <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ formatResult(plan.market, leg.result) }}</span></td>
+                <td class="result-cell"><span :class="['result-label', leg.result.status]">{{ formatResult(plan.market, leg.result) }}</span><small v-if="pendingHint(leg)" class="pending-hint" :title="leg.result.status === 'pending' ? '官方赛果接口尚未返回此场比赛结果，超过 4 小时仍会持续轮询刷新，结算逻辑不变。' : ''">{{ pendingHint(leg) }}</small></td>
                 <td class="settle-cell">
                   <b :class="['verdict', leg.result.hit === true ? 'hit' : leg.result.hit === false ? 'miss' : leg.result.status]">{{ leg.result.verdict }}</b>
                   <div class="settle-actions">
@@ -646,21 +705,20 @@ onBeforeUnmount(() => {
           </section>
           <section v-else-if="settingsTab === 'prompts'">
             <h3>AI 提示词</h3>
-            <p class="hint">留空使用内置默认。保存后立即影响后续自动推荐和手动 AI 分析；JSON 输出格式、赛程拼接等安全结构不在可编辑范围内。</p>
-            <div class="prompt-field">
-              <label><b>系统提示词</b><small>每次 AI 调用的角色设定（system 消息）</small></label>
-              <textarea v-model="settings.ai_prompts.system_prompt" rows="4" placeholder="留空使用内置默认"></textarea>
-              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.system_prompt }}</pre></details>
-            </div>
-            <div class="prompt-field">
-              <label><b>计划推荐分析要求</b><small>「AI分析并推荐」每场推荐时附加到提示词末尾的分析规则</small></label>
-              <textarea v-model="settings.ai_prompts.plan_requirements" rows="12" placeholder="留空使用内置默认"></textarea>
-              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.plan_requirements }}</pre></details>
-            </div>
-            <div class="prompt-field">
-              <label><b>总结分析要求</b><small>生成计划总体分析（ai_summary）时使用的分析要求</small></label>
-              <textarea v-model="settings.ai_prompts.summary_requirements" rows="8" placeholder="留空使用内置默认"></textarea>
-              <details class="prompt-default"><summary>查看内置默认</summary><pre>{{ settings.ai_prompts.defaults?.summary_requirements }}</pre></details>
+            <p class="hint">下方文本框已预填当前内置默认内容，可直接在默认基础上微调。留空保存 = 仍使用默认；保存后立即影响后续自动推荐和手动 AI 分析；JSON 输出格式、赛程拼接等安全结构不在可编辑范围内。</p>
+            <div v-for="pf in promptFields" :key="pf.field" class="prompt-field">
+              <label>
+                <b>{{ pf.label }}</b>
+                <small>{{ pf.help }}</small>
+                <span class="prompt-status" :class="{ overridden: promptIsOverridden(pf.field), dirty: promptIsDirty(pf.field) }">
+                  {{ promptIsOverridden(pf.field) ? (promptIsDirty(pf.field) ? '已修改未保存' : '已自定义') : (promptIsDirty(pf.field) ? '已修改未保存' : '使用内置默认') }}
+                </span>
+              </label>
+              <textarea v-model="promptDrafts[pf.field]" rows="12" :placeholder="settings.ai_prompts.defaults?.[pf.field]"></textarea>
+              <div class="prompt-actions">
+                <button class="soft" type="button" @click="clearPromptDraft(pf.field)">清空输入</button>
+                <button class="soft" type="button" @click="resetPromptDraft(pf.field)">恢复默认</button>
+              </div>
             </div>
             <div class="form-actions">
               <button class="soft" @click="resetPrompts">恢复全部默认</button>
