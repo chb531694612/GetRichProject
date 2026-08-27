@@ -99,6 +99,21 @@ class AIAnalyzerTests(unittest.TestCase):
         ):
             self.assertEqual(analyze_matches([], MarketType.CRS, settings), "")
 
+    def test_zero_timeout_means_unlimited_wait(self):
+        settings = make_settings(
+            Path("data"),
+            qwen_api_key="secret",
+            ai_analysis_enabled=True,
+            ai_http_timeout_seconds=0,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            return_value=_Response(_qwen_payload("AI连接正常")),
+        ) as mocked:
+            self.assertEqual(probe_qwen(settings), "AI连接正常")
+        # 0 表示不限制超时，urlopen 收到 None 而不是 0。
+        self.assertIsNone(mocked.call_args.kwargs["timeout"])
+
     def test_probe_uses_authenticated_qwen_responses_with_search(self):
         settings = make_settings(Path("data"), qwen_api_key="secret", ai_analysis_enabled=True)
         with patch(
@@ -253,10 +268,54 @@ class AIAnalyzerTests(unittest.TestCase):
         )
         with patch(
             "score_fourfold.ai_analyzer.urllib.request.urlopen",
-            return_value=_Response(_qwen_payload(content)),
-        ):
+            side_effect=[
+                _Response(_qwen_payload(content)),
+                _Response(_qwen_payload(content)),
+            ],
+        ) as mocked:
             with self.assertRaisesRegex(AIAnalysisError, "cannot map to a real option"):
                 analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings)
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_plan_analysis_retries_non_json_once_with_correction(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        valid = json.dumps(
+            {
+                "summary": "已重新核对",
+                "suggestions": [
+                    {"match_id": "1001", "pick": "1:1", "reason": "状态稳定"},
+                    {"match_id": "1002", "pick": "1:0", "reason": "主场占优"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            side_effect=[
+                _Response(_qwen_payload("我先说明一下分析过程，稍后再给建议。")),
+                _Response(_qwen_payload(valid)),
+            ],
+        ) as mocked:
+            result = analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings)
+
+        self.assertEqual(result.summary, "已重新核对")
+        self.assertEqual(mocked.call_count, 2)
+        retry_payload = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
+        retry_prompt = retry_payload["input"][1]["content"]
+        self.assertIn("上一次回答未通过系统的结构校验", retry_prompt)
+        self.assertIn("只能输出一个完整", retry_prompt)
+        self.assertNotIn("我先说明一下分析过程", retry_prompt)
+
+    def test_plan_analysis_stops_after_two_invalid_responses(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        invalid = _qwen_payload("仍然没有 JSON")
+        with patch(
+            "score_fourfold.ai_analyzer.urllib.request.urlopen",
+            side_effect=[_Response(invalid), _Response(invalid)],
+        ) as mocked:
+            with self.assertRaisesRegex(AIAnalysisError, "not a JSON object"):
+                analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings)
+        self.assertEqual(mocked.call_count, 2)
 
     def test_exact_ai_score_can_map_to_trusted_other_score_option(self):
         settings = make_settings(Path("data"), qwen_api_key="secret")

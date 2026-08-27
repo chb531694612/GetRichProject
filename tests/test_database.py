@@ -523,6 +523,85 @@ class DatabaseSafetyTests(unittest.TestCase):
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{legacy_path}{suffix}").unlink(missing_ok=True)
 
+    def test_migrates_ai_runtime_timeout_constraint_and_default(self):
+        """旧 CHECK(http_timeout_seconds >= 1) 迁移后必须允许 0（不限制）。"""
+        legacy_path = Path("data") / f"legacy_ai_runtime_{self._testMethodName}.db"
+        legacy_path.unlink(missing_ok=True)
+        try:
+            connection = sqlite3.connect(legacy_path)
+            connection.executescript(
+                """
+                CREATE TABLE ai_model_configs (
+                    model_config_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    api_key_ciphertext TEXT NOT NULL DEFAULT '',
+                    api_key_env TEXT NOT NULL DEFAULT '',
+                    web_search_required INTEGER NOT NULL DEFAULT 1,
+                    last_test_status TEXT NOT NULL DEFAULT 'untested',
+                    last_test_detail TEXT NOT NULL DEFAULT '',
+                    last_tested_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE ai_runtime_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    active_model_config_id TEXT REFERENCES ai_model_configs(model_config_id),
+                    http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 1),
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO ai_model_configs
+                    (model_config_id, provider, display_name, base_url, model_name,
+                     created_at, updated_at)
+                VALUES ('qwen-main', 'qwen', '千问', 'https://example.invalid',
+                        'qwen3.7-max', '2026-08-01T00:00:00', '2026-08-01T00:00:00');
+                INSERT INTO ai_runtime_settings
+                    (singleton_id, enabled, active_model_config_id,
+                     http_timeout_seconds, updated_at)
+                VALUES (1, 1, 'qwen-main', 600, '2026-08-01T00:00:00');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            legacy = Database(legacy_path)
+            legacy.initialize()
+            with legacy.connect() as migrated:
+                table_sql = migrated.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='ai_runtime_settings'"
+                ).fetchone()[0]
+                self.assertIn("http_timeout_seconds >= 0", table_sql)
+                self.assertNotIn("http_timeout_seconds >= 1", table_sql)
+                row = migrated.execute(
+                    """
+                    SELECT enabled, active_model_config_id, http_timeout_seconds
+                    FROM ai_runtime_settings WHERE singleton_id = 1
+                    """
+                ).fetchone()
+                self.assertEqual(row["enabled"], 1)
+                self.assertEqual(row["active_model_config_id"], "qwen-main")
+                # 旧默认 600 秒被改为 0（不限制），当前模型等其余字段保持不变。
+                self.assertEqual(row["http_timeout_seconds"], 0)
+                migrated.execute(
+                    "UPDATE ai_runtime_settings SET http_timeout_seconds = 0 "
+                    "WHERE singleton_id = 1"
+                )
+            # 幂等：再次初始化不报错，值保持 0。
+            legacy.initialize()
+            with legacy.connect() as migrated:
+                row = migrated.execute(
+                    "SELECT http_timeout_seconds FROM ai_runtime_settings "
+                    "WHERE singleton_id = 1"
+                ).fetchone()
+                self.assertEqual(row["http_timeout_seconds"], 0)
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{legacy_path}{suffix}").unlink(missing_ok=True)
+
 
 class PaginationAndCalendarTests(unittest.TestCase):
     """Regression tests for paginated_plans, calendar_stats, set_purchased, set_ticket_image."""

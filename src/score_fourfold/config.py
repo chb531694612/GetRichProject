@@ -219,7 +219,9 @@ class Settings:
             poll_interval_seconds=_int("POLL_INTERVAL_SECONDS", 1800, minimum=60),
             result_check_delay_minutes=_int("RESULT_CHECK_DELAY_MINUTES", 150, minimum=90),
             http_timeout_seconds=_int("HTTP_TIMEOUT_SECONDS", 20, minimum=1),
-            ai_http_timeout_seconds=_int("AI_HTTP_TIMEOUT_SECONDS", 600, minimum=1),
+            # 0 表示不限制：思考模型 + 强制联网搜索的完整分析可能远超 600 秒，
+            # 后台分析任务不应被固定超时打断；同步的模型连接测试仍另行限制。
+            ai_http_timeout_seconds=_int("AI_HTTP_TIMEOUT_SECONDS", 0, minimum=0),
             web_enabled=_bool("WEB_ENABLED", True),
             web_host=os.getenv("WEB_HOST", "127.0.0.1").strip(),
             web_port=_int("WEB_PORT", 8080, minimum=1),

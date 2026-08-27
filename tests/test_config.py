@@ -35,7 +35,8 @@ class WebSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_access_mode, "ssh")
         self.assertEqual(settings.http_timeout_seconds, 20)
-        self.assertEqual(settings.ai_http_timeout_seconds, 600)
+        # 默认 0 表示后台 AI 分析不限制超时（思考模型完整生成可能远超 600 秒）。
+        self.assertEqual(settings.ai_http_timeout_seconds, 0)
         self.assertFalse(settings.web_password_hash)
         self.assertFalse(settings.web_trust_proxy_headers)
 

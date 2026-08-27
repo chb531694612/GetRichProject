@@ -23,7 +23,7 @@
 - app 固定容器名：`score-fourfold-app`。
 - app 加入外部 Docker 网络：`1panel-network`。
 - 当前 1Panel OpenResty 容器使用 `host` 网络，反向代理目标为 `http://127.0.0.1:8080`；只有将 OpenResty 加入 `1panel-network` 后才可改用 `http://score-fourfold-app:8080`。
-- 站点代理片段位于 `/opt/1panel/www/sites/score-fourfold/proxy/root.conf`。AI 请求最长允许 600 秒，因此该片段必须设置 `proxy_connect_timeout 30s`、`proxy_send_timeout 660s` 和 `proxy_read_timeout 660s`，为应用处理和重定向额外保留 60 秒。
+- 站点代理片段位于 `/opt/1panel/www/sites/score-fourfold/proxy/root.conf`。后台 AI 分析任务已不设固定超时（`AI_HTTP_TIMEOUT_SECONDS=0` 表示不限制，由页面轮询任务状态）；经代理同步执行的模型连接测试最多等待 600 秒，因此该片段必须设置 `proxy_connect_timeout 30s`、`proxy_send_timeout 660s` 和 `proxy_read_timeout 660s`，为应用处理和重定向额外保留 60 秒。
 - 宿主机仅绑定 `127.0.0.1:8080`，不得在安全组或防火墙公开 8080。
 
 ### 2.1 生产服务器远程操作授权

@@ -975,7 +975,10 @@ class SettingsRepository:
         runtime = self.model_runtime(model_config_id)
         try:
             validate_runtime(runtime)
-            detail = str(tester(runtime, self.legacy.ai_http_timeout_seconds))
+            # 模型连接测试是同步网页请求（经 OpenResty 代理，读超时 660 秒），
+            # 因此即使后台分析已配置为不限制超时（0），探测也最多等 600 秒。
+            probe_timeout = self.legacy.ai_http_timeout_seconds or 600
+            detail = str(tester(runtime, probe_timeout))
             success = True
         except Exception as exc:
             detail = str(exc)[:500] or type(exc).__name__

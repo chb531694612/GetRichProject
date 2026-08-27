@@ -303,7 +303,7 @@ class Database:
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
                     active_model_config_id TEXT REFERENCES ai_model_configs(model_config_id),
-                    http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 1),
+                    http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 0),
                     updated_at TEXT NOT NULL
                 );
 
@@ -579,6 +579,42 @@ class Database:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_activity_logs_plan ON activity_logs(plan_id, id DESC)"
         )
+
+        # v0.8: AI 后台分析不再受固定 600 秒超时限制（0 表示不限制）。
+        # 旧表 CHECK(http_timeout_seconds >= 1) 不允许 0，需要整表重建；
+        # 仅当确实存在旧约束时执行一次，保持迁移幂等。旧默认值 600 同步
+        # 改为 0（不限制）；用户显式配置的其他超时值原样保留。
+        ai_runtime_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ai_runtime_settings'"
+        ).fetchone()
+        if ai_runtime_sql and "http_timeout_seconds >= 1" in (ai_runtime_sql[0] or ""):
+            connection.execute("DROP TABLE IF EXISTS ai_runtime_settings_v2")
+            connection.execute(
+                """
+                CREATE TABLE ai_runtime_settings_v2 (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    active_model_config_id TEXT REFERENCES ai_model_configs(model_config_id),
+                    http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 0),
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO ai_runtime_settings_v2
+                    (singleton_id, enabled, active_model_config_id,
+                     http_timeout_seconds, updated_at)
+                SELECT singleton_id, enabled, active_model_config_id,
+                       CASE WHEN http_timeout_seconds = 600 THEN 0 ELSE http_timeout_seconds END,
+                       updated_at
+                FROM ai_runtime_settings
+                """
+            )
+            connection.execute("DROP TABLE ai_runtime_settings")
+            connection.execute(
+                "ALTER TABLE ai_runtime_settings_v2 RENAME TO ai_runtime_settings"
+            )
 
         connection.execute("PRAGMA user_version = 9")
 

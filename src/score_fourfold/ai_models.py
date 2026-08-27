@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AIModelError(RuntimeError):
@@ -141,6 +145,9 @@ def call_with_web_search(
     timeout_seconds: int,
     max_output_tokens: int,
 ) -> str:
+    # 0 或负数表示不限制超时：思考模型 + 强制联网搜索的完整分析
+    # （例如 6 场比赛的 HAD 计划）可能远超 600 秒，由后台任务耐心等待。
+    timeout = timeout_seconds if timeout_seconds > 0 else None
     spec = validate_runtime(runtime)
     payload: dict[str, Any] = {
         "model": runtime.model_name,
@@ -172,7 +179,8 @@ def call_with_web_search(
     else:
         payload["tool_choice"] = {"type": "web_search"}
 
-    def _attempt() -> str:
+    def _attempt(attempt: int) -> str:
+        started_at = time.monotonic()
         request = urllib.request.Request(
             runtime.base_url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -185,7 +193,7 @@ def call_with_web_search(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             try:
@@ -196,6 +204,8 @@ def call_with_web_search(
         except urllib.error.URLError as exc:
             raise AIModelError(f"无法连接模型接口：{exc.reason}") from exc
         except TimeoutError as exc:
+            if timeout is None:
+                raise AIModelError("模型调用超时") from exc
             raise AIModelError(f"模型调用超过 {timeout_seconds} 秒") from exc
         try:
             result = json.loads(raw.decode("utf-8"))
@@ -216,6 +226,12 @@ def call_with_web_search(
         text, searched = _response_text_and_search(result)
         if not searched:
             raise AIModelError("模型连接正常，但没有执行项目要求的联网搜索")
+        LOGGER.info(
+            "AI model %s attempt %s completed in %.1f seconds",
+            runtime.model_name,
+            attempt,
+            time.monotonic() - started_at,
+        )
         return text
 
     # 暂时性失败（上游 5xx、incomplete、空内容、输出超限）重试一次，短暂退避后
@@ -231,13 +247,18 @@ def call_with_web_search(
         "空内容",
     )
     try:
-        return _attempt()
+        return _attempt(1)
     except AIModelError as exc:
         message = str(exc)
         if not any(marker in message for marker in transient_markers):
             raise
+        LOGGER.warning(
+            "AI model %s attempt 1 failed with a transient response (%s); retrying once",
+            runtime.model_name,
+            message,
+        )
         time.sleep(5)
-        return _attempt()
+        return _attempt(2)
 
 
 def test_model(runtime: AIModelRuntime, timeout_seconds: int) -> str:

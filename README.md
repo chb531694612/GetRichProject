@@ -107,13 +107,13 @@ OKOOO_BASE_URL=https://www.okooo.com
 
 ```dotenv
 AI_ANALYSIS_ENABLED=true
-AI_HTTP_TIMEOUT_SECONDS=600
+AI_HTTP_TIMEOUT_SECONDS=0
 QWEN_API_KEY=只写在服务器.env中的百炼密钥
 QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/responses
 QWEN_MODEL=qwen3.7-max
 ```
 
-`AI_HTTP_TIMEOUT_SECONDS` 只控制 AI Responses API 请求，默认允许等待 600 秒；比赛数据源和邮件仍使用 `HTTP_TIMEOUT_SECONDS`，避免普通网络请求长时间占用服务。
+`AI_HTTP_TIMEOUT_SECONDS` 只控制 AI Responses API 请求，默认 `0` 表示不限制超时——思考模型加强制联网搜索的完整分析可能远超 600 秒，后台分析任务会耐心等待模型返回；比赛数据源和邮件仍使用 `HTTP_TIMEOUT_SECONDS`，避免普通网络请求长时间占用服务。设置页中同步执行的"测试并启用"模型探测仍最多等待 600 秒，避免网页请求无限挂起。
 
 看板中的“今日全部推荐”和“AI分析并推荐”使用后台任务：提交后页面立即返回，不需要保持浏览器等待。单张计划 AI 分析通常提示 1–10 分钟后刷新；今日全部推荐可能依次分析多张计划，因此提示 1–40 分钟后刷新。运行期间看板会禁用重复提交，并在推荐区域或对应计划的每场比赛上显示“生成中/分析中”。
 

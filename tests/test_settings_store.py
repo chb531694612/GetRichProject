@@ -211,6 +211,33 @@ class SettingsRepositoryTests(unittest.TestCase):
             ["passed"],
         )
 
+    def test_unlimited_analysis_timeout_still_bounds_synchronous_probe(self):
+        master_key = Fernet.generate_key().decode("ascii")
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            qwen_api_key="legacy-key",
+            settings_master_key=master_key,
+            ai_http_timeout_seconds=0,
+        )
+        repository = SettingsRepository(self.database, settings)
+        repository.initialize_from_legacy(self.now)
+        # 后台 AI 分析超时为 0（不限制）。
+        self.assertEqual(repository.effective_settings().ai_http_timeout_seconds, 0)
+        # 同步模型测试走网页请求（OpenResty 读超时 660 秒），必须保持 600 秒上限。
+        received: list[int] = []
+
+        def passing(runtime, timeout):
+            received.append(timeout)
+            return "测试通过"
+
+        repository.test_and_activate_model(
+            "legacy-qwen",
+            tester=passing,
+            now=self.now,
+        )
+        self.assertEqual(received, [600])
+
     def test_failed_or_unsupported_model_test_keeps_previous_active_model(self):
         master_key = Fernet.generate_key().decode("ascii")
         settings = make_settings(

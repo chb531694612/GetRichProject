@@ -161,8 +161,9 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         method="POST",
     )
     try:
+        # 0 表示不限制超时（思考模型的完整生成时间不受固定上限约束）。
         with urllib.request.urlopen(
-            request, timeout=settings.ai_http_timeout_seconds
+            request, timeout=settings.ai_http_timeout_seconds or None
         ) as response:
             response_body = response.read()
     except urllib.error.HTTPError as exc:
@@ -178,9 +179,11 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
     except urllib.error.URLError as exc:
         raise AIAnalysisError(f"Qwen unreachable: {exc.reason}") from exc
     except TimeoutError as exc:
-        raise AIAnalysisError(
-            f"Qwen timed out after {settings.ai_http_timeout_seconds} seconds"
-        ) from exc
+        if settings.ai_http_timeout_seconds > 0:
+            raise AIAnalysisError(
+                f"Qwen timed out after {settings.ai_http_timeout_seconds} seconds"
+            ) from exc
+        raise AIAnalysisError("Qwen timed out") from exc
 
     try:
         result = json.loads(response_body.decode("utf-8"))
@@ -465,6 +468,20 @@ def _parse_plan_analysis(
     return AIPlanAnalysis(summary=summary[:4000], suggestions=tuple(parsed))
 
 
+def _plan_format_retry_prompt(prompt: str, error: AIAnalysisError) -> str:
+    """Ask for one fresh, complete response without echoing the invalid output."""
+    return "\n".join(
+        [
+            prompt,
+            "",
+            "上一次回答未通过系统的结构校验。请重新联网核对并从头生成完整答案。",
+            f"需要修正的问题：{error}",
+            "这次只能输出一个完整、可被严格解析的 JSON 对象；不要输出解释、前后缀或 Markdown 代码块。",
+            "suggestions 必须覆盖上面列出的每一个 match_id，不能遗漏、重复或增加比赛。",
+        ]
+    )
+
+
 def analyze_plan_from_leg_data(
     legs: Sequence[Any],
     market: MarketType,
@@ -476,16 +493,27 @@ def analyze_plan_from_leg_data(
     if not legs:
         raise AIAnalysisError("plan has no legs to analyze")
     prompt = _build_plan_recommendation_prompt(legs, market, history_context)
-    if runtime is None:
-        content = _qwen_response(prompt, settings, max_tokens=16384)
-    else:
+    for attempt in (1, 2):
+        if runtime is None:
+            content = _qwen_response(prompt, settings, max_tokens=16384)
+        else:
+            try:
+                content = call_with_web_search(
+                    runtime,
+                    prompt,
+                    timeout_seconds=settings.ai_http_timeout_seconds,
+                    max_output_tokens=16384,
+                )
+            except AIModelError as exc:
+                raise AIAnalysisError(str(exc)) from exc
         try:
-            content = call_with_web_search(
-                runtime,
-                prompt,
-                timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=16384,
+            return _parse_plan_analysis(content, legs, market)
+        except AIAnalysisError as exc:
+            if attempt == 2:
+                raise
+            LOGGER.warning(
+                "AI plan response failed structural validation (%s); retrying once",
+                exc,
             )
-        except AIModelError as exc:
-            raise AIAnalysisError(str(exc)) from exc
-    return _parse_plan_analysis(content, legs, market)
+            prompt = _plan_format_retry_prompt(prompt, exc)
+    raise AssertionError("unreachable")

@@ -94,6 +94,29 @@ class AIModelAdapterTests(unittest.TestCase):
             [{"type": "web_search"}, {"type": "web_extractor"}],
         )
 
+    def test_zero_timeout_disables_urlopen_deadline(self):
+        # 0 表示不限制超时：思考模型的完整分析可能远超 600 秒，
+        # 后台任务应等待模型自然返回而不是中途掐断。
+        payload = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call"},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "分析完成"}],
+                },
+            ],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            result = call_with_web_search(
+                self.runtime,
+                "test",
+                timeout_seconds=0,
+                max_output_tokens=2048,
+            )
+        self.assertEqual(result, "分析完成")
+        self.assertIsNone(opened.call_args.kwargs["timeout"])
+
     def test_responses_adapter_rejects_answer_without_actual_search(self):
         payload = {
             "status": "completed",
@@ -222,6 +245,35 @@ class RetryBehaviorTests(unittest.TestCase):
         self.assertEqual(result, "AI连接正常")
         self.assertEqual(opened.call_count, 2)
         slept.assert_called_once_with(5)
+
+    def test_empty_content_is_retried_once_then_succeeds(self):
+        empty = {
+            "status": "completed",
+            "output": [{"type": "web_search_call"}],
+        }
+        completed = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call"},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "分析完成"}],
+                },
+            ],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[_Response(empty), _Response(completed)],
+        ) as opened:
+            with patch("time.sleep"):
+                result = call_with_web_search(
+                    self.runtime,
+                    "test",
+                    timeout_seconds=10,
+                    max_output_tokens=2048,
+                )
+        self.assertEqual(result, "分析完成")
+        self.assertEqual(opened.call_count, 2)
 
     def test_transient_500_is_not_retried_when_second_attempt_fails(self):
         with patch(
