@@ -463,14 +463,14 @@ def analyze_plan_from_leg_data(
         raise AIAnalysisError("plan has no legs to analyze")
     prompt = _build_plan_recommendation_prompt(legs, market, history_context)
     if runtime is None:
-        content = _qwen_response(prompt, settings, max_tokens=2400)
+        content = _qwen_response(prompt, settings, max_tokens=8192)
     else:
         try:
             content = call_with_web_search(
                 runtime,
                 prompt,
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=2400,
+                max_output_tokens=8192,
             )
         except AIModelError as exc:
             raise AIAnalysisError(str(exc)) from exc

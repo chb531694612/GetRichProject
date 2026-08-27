@@ -56,6 +56,28 @@ def _qwen_payload(content: str, *, searched: bool = True) -> dict:
 
 
 class AIAnalyzerTests(unittest.TestCase):
+    def test_plan_analysis_allows_enough_output_for_thinking_and_search(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        runtime = SimpleNamespace(provider="qwen")
+        content = json.dumps(
+            {
+                "summary": "分析完成",
+                "suggestions": [
+                    {"match_id": leg.match_id, "pick": "1:0", "reason": "理由"}
+                    for leg in self._legs()
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with patch(
+            "score_fourfold.ai_analyzer.call_with_web_search",
+            return_value=content,
+        ) as called:
+            analyze_plan_from_leg_data(
+                self._legs(), MarketType.CRS, settings, runtime=runtime
+            )
+        self.assertEqual(called.call_args.kwargs["max_output_tokens"], 8192)
+
     def test_timeout_is_normalized_and_automatic_analysis_does_not_raise(self):
         settings = make_settings(
             Path("data"),

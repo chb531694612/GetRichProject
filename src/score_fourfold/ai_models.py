@@ -192,8 +192,14 @@ def call_with_web_search(
         raise AIModelError("模型返回结构无效")
     if result.get("error"):
         raise AIModelError(f"模型接口错误：{result['error']}")
-    if result.get("status") not in {None, "completed"}:
-        raise AIModelError(f"模型任务状态异常：{result.get('status')}")
+    status = result.get("status")
+    if status not in {None, "completed"}:
+        details = result.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else ""
+        if status == "incomplete" and reason == "max_output_tokens":
+            raise AIModelError("模型输出达到长度上限，未能生成完整推荐，请重试")
+        suffix = f"（原因：{reason}）" if reason else ""
+        raise AIModelError(f"模型任务状态异常：{status}{suffix}")
     text, searched = _response_text_and_search(result)
     if not searched:
         raise AIModelError("模型连接正常，但没有执行项目要求的联网搜索")

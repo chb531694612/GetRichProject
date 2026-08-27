@@ -81,6 +81,21 @@ class AIModelAdapterTests(unittest.TestCase):
                     max_output_tokens=64,
                 )
 
+    def test_responses_adapter_explains_output_limit(self):
+        payload = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)):
+            with self.assertRaisesRegex(AIModelError, "达到长度上限"):
+                call_with_web_search(
+                    self.runtime,
+                    "test",
+                    timeout_seconds=10,
+                    max_output_tokens=64,
+                )
+
     def test_deepseek_responses_endpoint_supports_native_web_search(self):
         runtime = AIModelRuntime(
             config_id="deepseek-test",
