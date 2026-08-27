@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from score_fourfold.database import Database
+from score_fourfold.database import Database, _settled_leg_hit
 from score_fourfold.domain import MarketType, MatchResult, ResultStatus
 from score_fourfold.mail import render_recommendation, render_settlement
 from score_fourfold.service import ScoreFourfoldService
@@ -43,6 +43,14 @@ class DatabaseSafetyTests(unittest.TestCase):
         )
         self.assertTrue(created)
         return recommendation
+
+    def test_settled_leg_hit_supports_all_markets(self):
+        self.assertTrue(_settled_leg_hit("crs", "s02s01", "2:1", 2, 1))
+        self.assertFalse(_settled_leg_hit("crs", "s02s01", "2:1", 1, 1))
+        self.assertTrue(_settled_leg_hit("had", "a", "客胜", 0, 1))
+        self.assertFalse(_settled_leg_hit("had", "h", "主胜", 0, 1))
+        self.assertTrue(_settled_leg_hit("ttg", "s7", "7+", 4, 3))
+        self.assertFalse(_settled_leg_hit("ttg", "s6", "6", 4, 3))
 
     def test_database_enforces_one_crs_plan_per_recommendation_date(self):
         recommendation = self._create_plan()
@@ -736,6 +744,46 @@ class PaginationAndCalendarTests(unittest.TestCase):
         self.assertEqual(searched[0].plan_id, first.plan_id)
         dated = self.database.filtered_summary({"date": "2026-07-16"})
         self.assertEqual(dated["plans_total"], 1)
+
+    def test_filtered_summary_counts_final_plan_legs_and_hit_rate_inputs(self):
+        recommendation = self._create_sent_plan(
+            plan_id="BF4-HIT-RATE-0001", business_date="2026-07-14"
+        )
+        self.database.set_purchased(recommendation.plan_id, True)
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', result_home = 1, result_away = 0
+                WHERE plan_id = ? AND position IN (1, 2)
+                """,
+                (recommendation.plan_id,),
+            )
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', result_home = 0, result_away = 1
+                WHERE plan_id = ? AND position = 3
+                """,
+                (recommendation.plan_id,),
+            )
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'void', result_home = NULL, result_away = NULL
+                WHERE plan_id = ? AND position = 4
+                """,
+                (recommendation.plan_id,),
+            )
+
+        summary = self.database.filtered_summary({"purchased": True})
+
+        self.assertEqual(summary["legs_hit"], 2)
+        self.assertEqual(summary["legs_settled"], 3)
+        self.assertEqual(
+            self.database.filtered_summary({"purchased": False})["legs_settled"],
+            0,
+        )
 
     def test_set_purchased_and_ticket_image_roundtrip(self):
         rec = self._create_sent_plan()

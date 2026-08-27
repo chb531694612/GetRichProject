@@ -32,6 +32,36 @@ def _money(cents: int) -> Decimal:
     return (Decimal(cents) / 100).quantize(Decimal("0.00"))
 
 
+def _settled_leg_hit(
+    market: str,
+    score_code: str,
+    score_label: str,
+    result_home: int,
+    result_away: int,
+) -> bool:
+    """Return whether one final plan leg hit under its market rules."""
+    if market == MarketType.HAD.value:
+        actual = "h" if result_home > result_away else (
+            "a" if result_home < result_away else "d"
+        )
+        return score_code.lower() == actual
+    if market == MarketType.TTG.value:
+        total = result_home + result_away
+        return score_label == ("7+" if total >= 7 else str(total))
+    code_match = re.fullmatch(r"s(\d{2})s(\d{2})", score_code)
+    if code_match:
+        return (int(code_match.group(1)), int(code_match.group(2))) == (
+            result_home,
+            result_away,
+        )
+    label_match = re.fullmatch(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*", score_label)
+    return bool(
+        label_match
+        and (int(label_match.group(1)), int(label_match.group(2)))
+        == (result_home, result_away)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StoredLeg:
     position: int
@@ -1381,6 +1411,31 @@ class Database:
                 """,
                 params,
             ).fetchone()
+            settled_leg_where = (f"{where} AND" if where else " WHERE") + (
+                " l.result_status = 'final'"
+                " AND l.result_home IS NOT NULL"
+                " AND l.result_away IS NOT NULL"
+            )
+            settled_legs = connection.execute(
+                f"""
+                SELECT p.market, l.score_code, l.score_label,
+                       l.result_home, l.result_away
+                FROM plans p
+                JOIN plan_legs l ON l.plan_id = p.plan_id
+                {settled_leg_where}
+                """,
+                params,
+            ).fetchall()
+        legs_hit = sum(
+            _settled_leg_hit(
+                str(leg["market"]),
+                str(leg["score_code"]),
+                str(leg["score_label"]),
+                int(leg["result_home"]),
+                int(leg["result_away"]),
+            )
+            for leg in settled_legs
+        )
         return {
             "plans_total": int(row["total"] or 0),
             "plans_pending": int(row["pending"] or 0),
@@ -1388,6 +1443,8 @@ class Database:
             "plans_lost": int(row["lost"] or 0),
             "plans_void": int(row["voided"] or 0),
             "plans_purchased": int(row["purchased"] or 0),
+            "legs_hit": legs_hit,
+            "legs_settled": len(settled_legs),
             "stake": str(_money(row["stake_cents"] or 0)),
             "return": str(_money(row["return_cents"] or 0)),
             "profit": str(_money(row["profit_cents"] or 0)),

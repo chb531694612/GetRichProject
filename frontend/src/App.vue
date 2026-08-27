@@ -72,6 +72,11 @@ function jumpToPage() {
 }
 
 const summary = computed(() => result.value.summary || {})
+const legHitRate = computed(() => {
+  const total = Number(summary.value.legs_settled || 0)
+  if (!total) return '—'
+  return `${(Number(summary.value.legs_hit || 0) / total * 100).toFixed(1)}%`
+})
 const calendarTitle = computed(() => `${calendarDate.value.getFullYear()}年${calendarDate.value.getMonth() + 1}月`)
 const calendarCells = computed(() => {
   const year = calendarDate.value.getFullYear()
@@ -623,6 +628,7 @@ onBeforeUnmount(() => {
       <div class="metric"><span>投入金额</span><strong>{{ money(summary.stake) }}</strong><small>已购买 {{ summary.plans_purchased || 0 }} 张</small></div>
       <div class="metric"><span>实际返还</span><strong>{{ money(summary.return) }}</strong><small>中奖 {{ summary.plans_won || 0 }} 张</small></div>
       <div class="metric"><span>净盈亏</span><strong :class="Number(summary.profit) >= 0 ? 'profit' : 'loss'">{{ money(summary.profit) }}</strong><small>未中 {{ summary.plans_lost || 0 }} 张</small></div>
+      <div class="metric"><span>单场命中率</span><strong>{{ legHitRate }}</strong><small>命中 {{ summary.legs_hit || 0 }} / {{ summary.legs_settled || 0 }} 场</small></div>
       <div class="summary-action"><span>汇总随当前筛选实时变化</span><button :disabled="busy === 'recommend'" @click="recommend">{{ busy === 'recommend' ? '提交中…' : '生成今日推荐' }}</button></div>
     </section>
 
