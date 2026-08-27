@@ -153,6 +153,13 @@ class DashboardApplication:
         self._recommendation_task: BackgroundTask | None = None
         self._settle_task: BackgroundTask | None = None
         self._analysis_tasks: dict[str, BackgroundTask] = {}
+        # Only one plan's AI analysis may call the model at a time.  DeepSeek /
+        # Qwen thinking models exhaust their output budget when several plans
+        # are analyzed concurrently, which produces empty/incomplete responses.
+        # Queued plans wait on this semaphore inside their own worker thread.
+        self._ai_analysis_semaphore = threading.BoundedSemaphore(1)
+        # Upper bound on plans waiting behind a running AI analysis.
+        self._ai_analysis_max_queue = 3
         if self.public_mode:
             parsed_origin = _origin(self.public_origin)
             if parsed_origin is None or parsed_origin[0] != "https":
@@ -299,16 +306,43 @@ class DashboardApplication:
         started_at = self.now()
         with self._lock:
             current = self._analysis_tasks.get(plan_id)
-            if current is not None and current.status == "running":
+            if current is not None and current.status in {"running", "queued"}:
                 return (
                     "warn",
-                    f"计划 {plan_id} 正在后台进行 AI 分析，请勿重复提交；预计 1–10 分钟后刷新查看。",
+                    f"计划 {plan_id} 正在后台进行 AI 分析（或已在队列中），请勿重复提交；预计 1–10 分钟后刷新查看。",
+                )
+            # Serialize model calls across plans: only one analysis may run at
+            # a time, the rest wait in a bounded queue so a burst of manual
+            # clicks can never overwhelm the upstream model with concurrent
+            # thinking-mode requests.
+            active = any(
+                task.status in {"running", "queued"}
+                for task in self._analysis_tasks.values()
+            )
+            waiting = sum(
+                1
+                for task in self._analysis_tasks.values()
+                if task.status == "queued"
+            )
+            if active and waiting >= self._ai_analysis_max_queue:
+                return (
+                    "warn",
+                    f"AI 分析队列已满（{self._ai_analysis_max_queue} 个任务等待中），请稍后再试。",
+                )
+            if active:
+                status, level, detail = (
+                    "queued",
+                    "warn",
+                    f"计划 {plan_id} 已加入 AI 分析队列，排在 {waiting + 1} 个任务之后；请稍后刷新查看。",
+                )
+            else:
+                status, level, detail = (
+                    "running",
+                    "warn",
+                    f"计划 {plan_id} 正在后台进行 AI 分析；预计 1–10 分钟后刷新查看。",
                 )
             self._analysis_tasks[plan_id] = BackgroundTask(
-                "running",
-                "warn",
-                f"计划 {plan_id} 正在后台进行 AI 分析；预计 1–10 分钟后刷新查看。",
-                started_at,
+                status, level, detail, started_at
             )
         threading.Thread(
             target=self._run_ai_analysis_task,
@@ -316,6 +350,14 @@ class DashboardApplication:
             name=f"ai-analysis-{plan_id[:12]}",
             daemon=True,
         ).start()
+        if active:
+            self.database.add_log(
+                "ai",
+                f"计划{plan_id}加入AI分析队列",
+                f"排在{waiting + 1}个任务之后",
+                plan_id,
+            )
+            return ("warn", detail)
         return (
             "ok",
             f"计划 {plan_id} 已提交后台 AI 分析，无需等待；预计 1–10 分钟后回来刷新查看。",
@@ -325,7 +367,39 @@ class DashboardApplication:
         level = "error"
         detail = f"计划 {plan_id} 的 AI 分析后台执行异常，请查看日志。"
         try:
-            level, detail = self.trigger_ai_analysis(plan_id)
+            # Wait for any previously queued analysis to finish.  The thread
+            # blocks here (daemon), so concurrent submissions never call the
+            # model simultaneously.
+            acquired = self._ai_analysis_semaphore.acquire(timeout=3600)
+            if not acquired:
+                detail = f"计划 {plan_id} 的 AI 分析等待超时（超过 1 小时仍未轮到），请重新提交。"
+                with self._lock:
+                    current = self._analysis_tasks.get(plan_id)
+                    if current is not None and current.started_at == started_at:
+                        self._analysis_tasks[plan_id] = BackgroundTask(
+                            "finished", "error", detail, started_at, self.now()
+                        )
+                return
+            try:
+                # 拿到执行权后把排队任务升级为 running，前端可即时感知进展。
+                with self._lock:
+                    current = self._analysis_tasks.get(plan_id)
+                    if current is not None and current.status == "queued":
+                        self._analysis_tasks[plan_id] = BackgroundTask(
+                            "running",
+                            "warn",
+                            f"计划 {plan_id} 正在后台进行 AI 分析；预计 1–10 分钟后刷新查看。",
+                            started_at,
+                        )
+                        self.database.add_log(
+                            "ai",
+                            f"计划{plan_id}开始AI分析",
+                            "前序任务已完成，本任务开始执行",
+                            plan_id,
+                        )
+                level, detail = self.trigger_ai_analysis(plan_id)
+            finally:
+                self._ai_analysis_semaphore.release()
         except Exception:
             LOGGER.exception("background AI analysis of plan %s failed", plan_id)
         finished_at = self.now()
@@ -544,7 +618,7 @@ class DashboardApplication:
                 return ("warn", "AI分析未启用，请设置 QWEN_API_KEY 并开启 AI_ANALYSIS_ENABLED")
             if not self.settings.qwen_api_key:
                 return ("warn", "未配置 QWEN_API_KEY")
-        self.database.add_log("ai", f"开始AI分析计划{plan_id}", f"{len(plan.legs)}场比赛, 玩法: {plan.market}")
+        self.database.add_log("ai", f"开始AI分析计划{plan_id}", f"{len(plan.legs)}场比赛, 玩法: {plan.market}", plan_id)
         if self.provider is not None:
             get_matches = getattr(self.provider, "get_matches", None)
             if callable(get_matches):
@@ -554,20 +628,20 @@ class DashboardApplication:
                     refreshed_plan = self.database.get_plan(plan_id)
                     if refreshed_plan is not None:
                         plan = refreshed_plan
-                    self.database.add_log("ai", f"刷新{len(matches)}场比赛赔率数据")
+                    self.database.add_log("ai", f"刷新{len(matches)}场比赛赔率数据", plan_id=plan_id)
                 except Exception as exc:
                     LOGGER.warning("Could not refresh options for AI plan %s: %s", plan_id, exc)
-                    self.database.add_log("ai", f"刷新赔率数据失败: {exc}")
+                    self.database.add_log("ai", f"刷新赔率数据失败: {exc}", plan_id=plan_id)
         unavailable = [leg.match_num for leg in plan.legs if len(leg.options) < 2]
         if unavailable:
-            self.database.add_log("ai", f"AI分析中止，比赛{', '.join(unavailable)}可选项不足")
+            self.database.add_log("ai", f"AI分析中止，比赛{', '.join(unavailable)}可选项不足", plan_id=plan_id)
             return (
                 "warn",
                 "以下比赛没有足够的真实可选项，暂时无法生成可替换建议："
                 + "、".join(unavailable),
             )
         model_name = getattr(ai_runtime, "model_name", None) or self.settings.qwen_model if ai_runtime else self.settings.qwen_model
-        self.database.add_log("ai", f"正在调用AI模型({model_name})...")
+        self.database.add_log("ai", f"正在调用AI模型({model_name})...", plan_id=plan_id)
         try:
             analysis = analyze_plan_from_leg_data(
                 plan.legs,
@@ -576,7 +650,7 @@ class DashboardApplication:
                 runtime=ai_runtime,
                 history_context=self.database.ai_history_context(plan.market),
             )
-            self.database.add_log("ai", f"AI返回{len(analysis.suggestions)}场推荐")
+            self.database.add_log("ai", f"AI返回{len(analysis.suggestions)}场推荐", plan_id=plan_id)
             stored = self.database.update_ai_analysis(
                 plan_id,
                 analysis.summary,
@@ -593,16 +667,16 @@ class DashboardApplication:
             )
         except AIAnalysisError as exc:
             LOGGER.warning("AI recommendation of plan %s failed: %s", plan_id, exc)
-            self.database.add_log("ai", f"AI分析失败: {exc}")
+            self.database.add_log("ai", f"AI分析失败: {exc}", plan_id=plan_id)
             return ("error", f"AI推荐失败：{exc}")
         except Exception as exc:
             LOGGER.exception("AI analysis of plan %s failed", plan_id)
-            self.database.add_log("ai", f"AI分析异常: {exc}")
+            self.database.add_log("ai", f"AI分析异常: {exc}", plan_id=plan_id)
             return ("error", f"AI分析失败：{exc}")
         if not stored:
-            self.database.add_log("ai", f"AI分析结果未保存，计划{plan_id}已不存在")
+            self.database.add_log("ai", f"AI分析结果未保存，计划{plan_id}已不存在", plan_id=plan_id)
             return ("warn", f"计划 {plan_id} 已不存在，AI结果未保存")
-        self.database.add_log("ai", f"AI分析完成，结果已保存", f"计划{plan_id}, {len(analysis.suggestions)}场推荐")
+        self.database.add_log("ai", f"AI分析完成，结果已保存", f"计划{plan_id}, {len(analysis.suggestions)}场推荐", plan_id)
         return ("ok", f"AI分析和逐场推荐已完成，请选择是否替换计划 {plan_id}")
 
     def trigger_update_leg(

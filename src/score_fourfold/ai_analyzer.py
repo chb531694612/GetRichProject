@@ -135,7 +135,8 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         ],
         "tools": [{"type": "web_search"}, {"type": "web_extractor"}],
         # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
-        "enable_thinking": True,
+        # 探测请求关闭思考，避免思考 token 提前耗尽 max_output_tokens 造成假失败。
+        "enable_thinking": max_tokens >= 2048,
         "max_output_tokens": max_tokens,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -160,6 +161,10 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
             error_detail = exc.read().decode("utf-8", errors="ignore")[:500]
         except Exception:
             error_detail = ""
+        if exc.code >= 500:
+            raise AIAnalysisError(
+                f"Qwen 上游服务暂时不可用（HTTP {exc.code}）：{error_detail}"
+            ) from exc
         raise AIAnalysisError(f"Qwen HTTP {exc.code}: {error_detail}") from exc
     except urllib.error.URLError as exc:
         raise AIAnalysisError(f"Qwen unreachable: {exc.reason}") from exc
@@ -228,7 +233,7 @@ def probe_qwen(settings: Settings) -> str:
     return _qwen_response(
         "请联网搜索当前北京时间。完成搜索后只回复：AI连接正常",
         settings,
-        max_tokens=64,
+        max_tokens=128,
     )
 
 
@@ -463,14 +468,14 @@ def analyze_plan_from_leg_data(
         raise AIAnalysisError("plan has no legs to analyze")
     prompt = _build_plan_recommendation_prompt(legs, market, history_context)
     if runtime is None:
-        content = _qwen_response(prompt, settings, max_tokens=8192)
+        content = _qwen_response(prompt, settings, max_tokens=16384)
     else:
         try:
             content = call_with_web_search(
                 runtime,
                 prompt,
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=8192,
+                max_output_tokens=16384,
             )
         except AIModelError as exc:
             raise AIAnalysisError(str(exc)) from exc

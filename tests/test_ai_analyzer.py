@@ -76,7 +76,7 @@ class AIAnalyzerTests(unittest.TestCase):
             analyze_plan_from_leg_data(
                 self._legs(), MarketType.CRS, settings, runtime=runtime
             )
-        self.assertEqual(called.call_args.kwargs["max_output_tokens"], 8192)
+        self.assertEqual(called.call_args.kwargs["max_output_tokens"], 16384)
 
     def test_timeout_is_normalized_and_automatic_analysis_does_not_raise(self):
         settings = make_settings(
@@ -99,7 +99,7 @@ class AIAnalyzerTests(unittest.TestCase):
         ):
             self.assertEqual(analyze_matches([], MarketType.CRS, settings), "")
 
-    def test_probe_uses_authenticated_qwen_responses_with_thinking_and_search(self):
+    def test_probe_uses_authenticated_qwen_responses_with_search(self):
         settings = make_settings(Path("data"), qwen_api_key="secret", ai_analysis_enabled=True)
         with patch(
             "score_fourfold.ai_analyzer.urllib.request.urlopen",
@@ -112,7 +112,8 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(payload["model"], "qwen3.7-max")
         self.assertEqual(payload["tools"], [{"type": "web_search"}, {"type": "web_extractor"}])
         self.assertNotIn("tool_choice", payload)
-        self.assertTrue(payload["enable_thinking"])
+        # 探测用小输出配额关闭思考模式，避免思考 token 耗尽输出预算造成假失败。
+        self.assertFalse(payload["enable_thinking"])
 
     def test_probe_rejects_missing_key_and_empty_response(self):
         with self.assertRaisesRegex(AIAnalysisError, "not configured"):

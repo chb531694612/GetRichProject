@@ -462,11 +462,63 @@ class DatabaseSafetyTests(unittest.TestCase):
             self.assertEqual(legacy.summary()["baseline_return"], "32.00")
             self.assertEqual(legacy.summary()["baseline_profit"], "30.00")
             with legacy.connect() as migrated:
-                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 8)
+                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 9)
                 stale = migrated.execute(
                     "SELECT status FROM email_outbox WHERE dedupe_key = 'recommendation:STALE'"
                 ).fetchone()
                 self.assertEqual(stale["status"], "expired")
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{legacy_path}{suffix}").unlink(missing_ok=True)
+
+    def test_migrates_legacy_activity_logs_adds_plan_id_column(self):
+        """Old databases without activity_logs.plan_id must upgrade idempotently."""
+        legacy_path = Path("data") / f"legacy_logs_{self._testMethodName}.db"
+        legacy_path.unlink(missing_ok=True)
+        try:
+            connection = sqlite3.connect(legacy_path)
+            connection.executescript(
+                """
+                CREATE TABLE activity_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO activity_logs (created_at, category, message, detail)
+                VALUES ('2026-08-27T10:00:00', 'ai', '旧日志', '无 plan_id');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            legacy = Database(legacy_path)
+            legacy.initialize()
+            # 迁移后 plan_id 列存在且旧行保留。
+            with legacy.connect() as migrated:
+                columns = {
+                    row["name"]
+                    for row in migrated.execute("PRAGMA table_info(activity_logs)")
+                }
+                self.assertIn("plan_id", columns)
+                row = migrated.execute(
+                    "SELECT message, plan_id FROM activity_logs WHERE message = '旧日志'"
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertIsNone(row["plan_id"])
+            # 新写入带 plan_id 的日志。
+            legacy.add_log("ai", "新日志", "带计划", "BF4-TEST-0001")
+            logs = legacy.query_logs(category="ai", limit=10)
+            self.assertTrue(
+                any(item["plan_id"] == "BF4-TEST-0001" for item in logs["items"])
+            )
+            # 幂等：再次初始化不报错。
+            legacy.initialize()
+            with legacy.connect() as migrated:
+                self.assertEqual(
+                    migrated.execute("PRAGMA user_version").fetchone()[0], 9
+                )
         finally:
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{legacy_path}{suffix}").unlink(missing_ok=True)

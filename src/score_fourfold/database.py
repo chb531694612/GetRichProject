@@ -333,7 +333,8 @@ class Database:
                     created_at TEXT NOT NULL,
                     category TEXT NOT NULL,
                     message TEXT NOT NULL,
-                    detail TEXT NOT NULL DEFAULT ''
+                    detail TEXT NOT NULL DEFAULT '',
+                    plan_id TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON activity_logs(created_at DESC);
@@ -568,7 +569,18 @@ class Database:
               )
             """
         )
-        connection.execute("PRAGMA user_version = 8")
+        # v0.8: activity_logs.plan_id groups AI logs per plan so the dashboard
+        # can distinguish concurrent analysis tasks instead of merging them.
+        log_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(activity_logs)")
+        }
+        if "plan_id" not in log_columns:
+            connection.execute("ALTER TABLE activity_logs ADD COLUMN plan_id TEXT")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_logs_plan ON activity_logs(plan_id, id DESC)"
+        )
+
+        connection.execute("PRAGMA user_version = 9")
 
     def count_plans_for_business_date(self, business_date: str) -> int:
         with self.connect() as connection:
@@ -2402,13 +2414,13 @@ class Database:
                 "emails_expired": int(mail_row["expired"] or 0),
             }
 
-    def add_log(self, category: str, message: str, detail: str = "") -> None:
+    def add_log(self, category: str, message: str, detail: str = "", plan_id: str = "") -> None:
         """Record a human-readable activity log entry."""
         now = datetime.now().isoformat()
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO activity_logs (created_at, category, message, detail) VALUES (?, ?, ?, ?)",
-                (now, category, message[:500], detail[:2000]),
+                "INSERT INTO activity_logs (created_at, category, message, detail, plan_id) VALUES (?, ?, ?, ?, ?)",
+                (now, category, message[:500], detail[:2000], plan_id or None),
             )
 
     def query_logs(self, category: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
@@ -2420,7 +2432,7 @@ class Database:
                 f"SELECT COUNT(*) AS n FROM activity_logs{where}", params
             ).fetchone()
             rows = connection.execute(
-                f"""SELECT id, created_at, category, message, detail
+                f"""SELECT id, created_at, category, message, detail, plan_id
                     FROM activity_logs{where}
                     ORDER BY id DESC LIMIT ? OFFSET ?""",
                 params + [limit, offset],
@@ -2434,6 +2446,7 @@ class Database:
                     "category": row["category"],
                     "message": row["message"],
                     "detail": row["detail"],
+                    "plan_id": row["plan_id"],
                 }
                 for row in rows
             ],

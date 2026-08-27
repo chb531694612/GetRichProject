@@ -352,6 +352,123 @@ class DashboardTests(unittest.TestCase):
             all("AI预测：1:1" in item.reason for item in stored.ai_suggestions)
         )
 
+    def test_ai_analysis_serializes_concurrent_plan_requests(self):
+        """Burst submissions must not call the model concurrently."""
+        recommendation = self._create_plan(index=0)
+        second = self._create_plan(index=1)
+        third = self._create_plan(index=2)
+        matches = [
+            make_match(i, self.now, business_date="2026-07-15", odds="2.00")
+            for i in range(1, 5)
+        ]
+        provider = FakeProvider(matches)
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            mail_preview_dir=self.preview,
+            web_port=0,
+            ai_analysis_enabled=True,
+            qwen_api_key="secret",
+        )
+        application = DashboardApplication(
+            settings,
+            self.database,
+            self._trigger,
+            provider=provider,
+        )
+        # 第一个任务阻塞在事件上，确保后续提交时它仍处于 running。
+        gate = threading.Event()
+
+        def analyze_stub(legs, market, settings, *, runtime=None, history_context=""):
+            gate.wait(timeout=5)
+            return AIPlanAnalysis(
+                summary="总体建议",
+                suggestions=tuple(
+                    AIOptionSuggestion(
+                        leg.match_id, "s01s01", "1:1", "理由"
+                    )
+                    for leg in legs
+                ),
+            )
+
+        with patch(
+            "score_fourfold.web.analyze_plan_from_leg_data",
+            side_effect=analyze_stub,
+        ):
+            level1, _ = application.queue_ai_analysis(recommendation.plan_id)
+            # 第一个请求立即进入 running。
+            self.assertEqual(level1, "ok")
+            task1 = application.analysis_task(recommendation.plan_id)
+            self.assertEqual(task1.status, "running")
+            # 第二个请求必须排队而不是并发调用模型。
+            level2, _ = application.queue_ai_analysis(second.plan_id)
+            self.assertEqual(level2, "warn")
+            task2 = application.analysis_task(second.plan_id)
+            self.assertEqual(task2.status, "queued")
+            # 第三个请求排在队尾。
+            level3, _ = application.queue_ai_analysis(third.plan_id)
+            self.assertEqual(level3, "warn")
+            # 同一 plan 排队期间不允许重复提交。
+            level_dup, _ = application.queue_ai_analysis(second.plan_id)
+            self.assertEqual(level_dup, "warn")
+            # 放行第一个任务，其余排队任务随后串行完成。
+            gate.set()
+            for plan_id in (recommendation.plan_id, second.plan_id, third.plan_id):
+                self._wait_for(
+                    lambda pid=plan_id: (
+                        application.analysis_task(pid) is not None
+                        and application.analysis_task(pid).status == "finished"
+                    ),
+                    timeout=5.0,
+                )
+            for plan_id in (recommendation.plan_id, second.plan_id, third.plan_id):
+                stored = self.database.get_plan(plan_id)
+                self.assertIsNotNone(stored)
+                self.assertEqual(stored.ai_summary, "总体建议")
+
+    def test_ai_logs_carry_plan_id_for_dashboard_grouping(self):
+        """activity_logs rows written by AI analysis must include plan_id."""
+        recommendation = self._create_plan()
+        matches = [
+            make_match(i, self.now, business_date="2026-07-15", odds="2.00")
+            for i in range(1, 5)
+        ]
+        provider = FakeProvider(matches)
+        settings = make_settings(
+            self.root,
+            database_path=self.database_path,
+            mail_preview_dir=self.preview,
+            web_port=0,
+            ai_analysis_enabled=True,
+            qwen_api_key="secret",
+        )
+        application = DashboardApplication(
+            settings,
+            self.database,
+            self._trigger,
+            provider=provider,
+        )
+
+        def analyze_stub(legs, market, settings, *, runtime=None, history_context=""):
+            return AIPlanAnalysis(
+                summary="总体建议",
+                suggestions=tuple(
+                    AIOptionSuggestion(leg.match_id, "s01s01", "1:1", "理由")
+                    for leg in legs
+                ),
+            )
+
+        with patch(
+            "score_fourfold.web.analyze_plan_from_leg_data",
+            side_effect=analyze_stub,
+        ):
+            level, detail = application.trigger_ai_analysis(recommendation.plan_id)
+        self.assertEqual(level, "ok")
+        logs = self.database.query_logs(category="ai", limit=50)
+        ai_logs = [item for item in logs["items"] if item["plan_id"] == recommendation.plan_id]
+        self.assertTrue(ai_logs, "expected ai logs with plan_id")
+        self.assertIn("开始AI分析", ai_logs[-1]["message"])
+
     def test_deleting_losing_leg_recalculates_settled_plan(self):
         recommendation = self._create_plan()
         self._mark_recommendation_sent()
