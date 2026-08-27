@@ -20,6 +20,15 @@ from .domain import MarketType, ScoreOption
 
 LOGGER = logging.getLogger(__name__)
 
+SOURCE_REQUIREMENTS = [
+    "- 每场至少核对 3 个相互独立的来源；同一稿件的转载只算 1 个来源；",
+    "- 第一优先级：赛事官方、足协、俱乐部公告和赛前发布会；",
+    "- 第二优先级：雷速体育、懂球帝、直播吧、腾讯体育等中文平台；",
+    "- 第三优先级：Sofascore、Flashscore、Soccerway、Transfermarkt、BBC Sport、Opta 等国际数据或媒体；",
+    "- 至少包含 1 个中文来源（确实检索不到时须说明），并核对伤停、首发预测等易变信息的发布时间；",
+    "- 搜索摘要不足时读取原文；来源冲突时明确指出，不得擅自拼凑。",
+]
+
 
 # 总结分析（自动推荐/总体分析）的内置默认分析要求，可被面板设置覆盖。
 DEFAULT_SUMMARY_REQUIREMENTS = "\n".join(
@@ -72,19 +81,21 @@ class AIPlanAnalysis:
     suggestions: tuple[AIOptionSuggestion, ...]
 
 
-def _build_prompt(matches: list[tuple[Any, ScoreOption]], market: MarketType) -> str:
+def _build_prompt(
+    matches: list[tuple[Any, ScoreOption]], market: MarketType, history_context: str = ""
+) -> str:
     overrides = prompt_overrides()
     lines: list[str] = [
         "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
         "足球比赛充满变数；实力悬殊不等于结果确定。你必须主动识别和评估爆冷可能，不得默认选择强队或热门方向。",
-        "请先对每场比赛逐一联网搜索，务必综合以下信息源进行交叉验证：",
+        "请先对每场比赛逐一联网搜索并读取关键原文，按以下规则交叉验证：",
+        *SOURCE_REQUIREMENTS,
         "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
         "- 双方历史交锋记录（H2H）及主客场差异；",
         "- 球队伤停、停赛、轮换情况和关键球员 availability；",
         "- 近期赛程密度、体能状况及是否多线作战；",
         "- 主客场表现差异、主场优势程度；",
-        "- 雷速体育（leisu.com）等专业足球数据平台的近期战绩、交锋记录、伤停与阵容信息；",
-        "- 足球讨论区、球迷社区和专业媒体的主流观点与分歧。",
+        "- 足球讨论区、球迷社区只能用于发现线索或观点分歧，不能单独作为事实依据。",
         "",
         f"玩法：{market.label_zh}串关",
         "",
@@ -100,6 +111,9 @@ def _build_prompt(matches: list[tuple[Any, ScoreOption]], market: MarketType) ->
             f"{idx}. 比赛编号={match_num} | 比赛日期={business_date} | {match.league} | "
             f"{match.home} vs {match.away} | 开赛={match.start_at.strftime('%Y-%m-%d %H:%M')}"
         )
+    if history_context:
+        lines.extend(["", "本系统已结算历史赛果的匿名聚合统计（仅作弱参考，不代表未来规律）：", history_context,
+                      "不得因历史样本而忽略当前球队实时信息，也不得虚构因果关系。"])
     lines.append("")
     lines.append("不要讨论或猜测任何赔率、SP值、概率，也不要声称系统已经选择了某个结果。")
     lines.append("请用中文输出分析结果，不要列出具体投注金额，不要建议用户加大投入。")
@@ -119,12 +133,9 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        "tools": [{"type": "web_search"}],
-        "tool_choice": "required",
-        # DashScope does not allow tool_choice="required" while thinking mode
-        # is enabled.  Web search is mandatory for this analyzer, so use the
-        # non-thinking path and keep tool_choice required.
-        "enable_thinking": False,
+        "tools": [{"type": "web_search"}, {"type": "web_extractor"}],
+        # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
+        "enable_thinking": True,
         "max_output_tokens": max_tokens,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -226,17 +237,18 @@ def analyze_matches(
     market: MarketType,
     settings: Settings,
     runtime: AIModelRuntime | None = None,
+    history_context: str = "",
 ) -> str:
     """Safe wrapper that never raises."""
     try:
         if runtime is not None:
             return call_with_web_search(
                 runtime,
-                _build_prompt(matches, market),
+                _build_prompt(matches, market, history_context),
                 timeout_seconds=settings.ai_http_timeout_seconds,
                 max_output_tokens=2048,
             )
-        return qwen_analyze(matches, market, settings)
+        return _qwen_response(_build_prompt(matches, market, history_context), settings, max_tokens=2048)
     except (AIAnalysisError, AIModelError) as exc:
         LOGGER.warning("AI analysis skipped: %s", exc)
         return ""
@@ -283,7 +295,9 @@ def _leg_options(leg: Any) -> tuple[ScoreOption, ...]:
     )
 
 
-def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -> str:
+def _build_plan_recommendation_prompt(
+    legs: Sequence[Any], market: MarketType, history_context: str = ""
+) -> str:
     pick_name = market.label_zh
     pick_rule = {
         MarketType.CRS: "pick 必须是一个具体的全场比分，例如 1:0、1:1、0:2。",
@@ -293,14 +307,14 @@ def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -
     lines = [
         "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
         "足球比赛充满变数；实力悬殊不等于结果确定。你必须主动识别和评估爆冷可能，不得默认选择强队或热门方向。",
-        "必须先对每场比赛逐一联网搜索，综合以下信息源进行交叉验证后再给出判断：",
+        "必须先对每场比赛逐一联网搜索并读取关键原文，按以下规则交叉验证后再判断：",
+        *SOURCE_REQUIREMENTS,
         "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
         "- 双方历史交锋记录（H2H）及主客场差异；",
         "- 球队伤停、停赛、轮换情况和关键球员 availability；",
         "- 近期赛程密度、体能状况及是否多线作战；",
         "- 主客场表现差异、主场优势程度；",
-        "- 雷速体育（leisu.com）等专业足球数据平台的近期战绩、交锋记录、伤停与阵容信息；",
-        "- 足球讨论区、球迷社区和专业媒体的主流观点与分歧。",
+        "- 足球讨论区、球迷社区只能用于发现线索或观点分歧，不能单独作为事实依据。",
         "",
         f"当前玩法：{pick_name}串关。你必须覆盖每一个 match_id。{pick_rule}",
         "系统不会向你提供赔率、概率、候选项或当前推荐；请不要讨论、猜测或反推这些信息。",
@@ -317,6 +331,9 @@ def _build_plan_recommendation_prompt(legs: Sequence[Any], market: MarketType) -
             f"比赛日期={leg.business_date} | {leg.league} | {leg.home} vs {leg.away} | "
             f"开赛={leg.start_at.strftime('%Y-%m-%d %H:%M')}"
         )
+    if history_context:
+        lines.extend(["", "本系统已结算历史赛果的匿名聚合统计（仅作弱参考，不代表未来规律）：", history_context,
+                      "不得因历史样本而忽略当前球队实时信息，也不得虚构因果关系。"])
     overrides = prompt_overrides()
     lines.extend(
         [
@@ -439,11 +456,12 @@ def analyze_plan_from_leg_data(
     market: MarketType,
     settings: Settings,
     runtime: AIModelRuntime | None = None,
+    history_context: str = "",
 ) -> AIPlanAnalysis:
     """Return a validated, structured recommendation for every stored plan leg."""
     if not legs:
         raise AIAnalysisError("plan has no legs to analyze")
-    prompt = _build_plan_recommendation_prompt(legs, market)
+    prompt = _build_plan_recommendation_prompt(legs, market, history_context)
     if runtime is None:
         content = _qwen_response(prompt, settings, max_tokens=2400)
     else:

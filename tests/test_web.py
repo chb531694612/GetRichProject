@@ -1565,6 +1565,16 @@ class NewFeatureTests(unittest.TestCase):
 
     # --- ticket image upload ---
 
+    def test_sent_plan_renders_mobile_upload_drop_zone_and_screenshot(self):
+        self._create_sent_plan()
+        page = self.application.render(csrf_token="csrf-token")
+        self.assertIn('class="ticket-file-input"', page)
+        self.assertIn('accept="image/*"', page)
+        self.assertIn("点击或拖拽上传", page)
+        self.assertIn('data-action="screenshot-plan"', page)
+        self.assertIn("ClipboardItem", page)
+        self.assertIn("DataTransfer", page)
+
     def test_upload_ticket_saves_image_and_marks_purchased(self):
         rec = self._create_sent_plan()
         png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100

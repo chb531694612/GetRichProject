@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import re
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -1154,6 +1155,42 @@ class Database:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
             return self._load_plan(connection, row) if row else None
+
+    def ai_history_context(self, market: MarketType, limit: int = 500) -> str:
+        """Build an anonymous result summary without exposing picks, odds, or teams."""
+        safe_limit = max(20, min(int(limit), 2000))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT l.result_home, l.result_away
+                FROM plan_legs l
+                INNER JOIN plans p ON p.plan_id = l.plan_id
+                WHERE p.market = ? AND l.result_status = 'final'
+                  AND l.result_home IS NOT NULL AND l.result_away IS NOT NULL
+                ORDER BY COALESCE(p.settled_at, p.created_at) DESC
+                LIMIT ?
+                """,
+                (market.value, safe_limit),
+            ).fetchall()
+        if not rows:
+            return "暂无可用的已结算历史样本。"
+        scores = Counter(f"{int(row['result_home'])}:{int(row['result_away'])}" for row in rows)
+        outcomes = Counter(
+            "主胜" if row["result_home"] > row["result_away"] else (
+                "客胜" if row["result_home"] < row["result_away"] else "平"
+            ) for row in rows
+        )
+        totals = Counter(
+            "7+" if int(row["result_home"]) + int(row["result_away"]) >= 7
+            else str(int(row["result_home"]) + int(row["result_away"]))
+            for row in rows
+        )
+        sample = len(rows)
+        pct = lambda count: f"{count * 100 / sample:.1f}%"
+        outcome_text = "、".join(f"{key}{value}场({pct(value)})" for key, value in outcomes.items())
+        score_text = "、".join(f"{key} {value}场" for key, value in scores.most_common(8))
+        total_text = "、".join(f"{key}球 {value}场" for key, value in totals.most_common())
+        return f"最近{sample}个已结算场次：赛果分布 {outcome_text}；常见比分 {score_text}；总进球分布 {total_text}。"
 
     def recent_plans(self, limit: int = 100) -> list[StoredPlan]:
         safe_limit = max(1, min(int(limit), 500))

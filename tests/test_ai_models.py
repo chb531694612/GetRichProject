@@ -58,9 +58,9 @@ class AIModelAdapterTests(unittest.TestCase):
             self.assertIn("测试通过", probe_model(self.runtime, 10))
         request = opened.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["tool_choice"], "required")
-        self.assertEqual(body["tools"], [{"type": "web_search"}])
-        self.assertFalse(body["enable_thinking"])
+        self.assertNotIn("tool_choice", body)
+        self.assertEqual(body["tools"], [{"type": "web_search"}, {"type": "web_extractor"}])
+        self.assertTrue(body["enable_thinking"])
 
     def test_responses_adapter_rejects_answer_without_actual_search(self):
         payload = {

@@ -55,9 +55,10 @@ PROVIDER_BY_CODE = {provider.code: provider for provider in PROVIDERS}
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "你是一名严谨的足球比赛信息分析师。必须先联网检索公开资料，综合战绩、交锋、伤停、"
-    "赛程和社区观点进行交叉验证（可重点参考雷速体育 leisu.com 等专业足球数据平台），"
-    "严禁敷衍了事或给出空泛结论。严格按用户要求输出。"
+    "你是一名严谨的足球比赛信息分析师。先在内部完成充分推理，再输出简洁结论；不得展示思维链。"
+    "必须联网检索公开资料，并用多个相互独立的数据源交叉验证战绩、交锋、伤停、阵容和赛程。"
+    "兼顾权威赛事/俱乐部来源、国际数据平台与雷速体育等中文体育平台，标明信息时效，"
+    "不得把单一媒体观点当成事实。严禁敷衍或给出空泛结论，严格按用户要求输出。"
 )
 
 # 提示词覆盖注册表：空字符串表示使用内置默认。
@@ -152,11 +153,11 @@ def call_with_web_search(
         "tools": [{"type": "web_search"}],
         "max_output_tokens": max_output_tokens,
     }
-    # 阿里云百炼接受 "required" 字符串；DeepSeek / OpenAI / 自定义等 OpenAI
-    # 兼容 Responses 接口推荐用对象形式强制调用 web_search。
+    # 百炼思考模式不允许 tool_choice="required"；省略该参数并在响应端校验
+    # web_search_call，既保留思考能力，又保证没有实际联网时整次调用失败。
     if spec.code == "qwen":
-        payload["tool_choice"] = "required"
-        payload["enable_thinking"] = False
+        payload["tools"] = [{"type": "web_search"}, {"type": "web_extractor"}]
+        payload["enable_thinking"] = True
     else:
         payload["tool_choice"] = {"type": "web_search"}
     request = urllib.request.Request(

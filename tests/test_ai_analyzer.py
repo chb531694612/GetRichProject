@@ -77,7 +77,7 @@ class AIAnalyzerTests(unittest.TestCase):
         ):
             self.assertEqual(analyze_matches([], MarketType.CRS, settings), "")
 
-    def test_probe_uses_authenticated_qwen_responses_with_required_search(self):
+    def test_probe_uses_authenticated_qwen_responses_with_thinking_and_search(self):
         settings = make_settings(Path("data"), qwen_api_key="secret", ai_analysis_enabled=True)
         with patch(
             "score_fourfold.ai_analyzer.urllib.request.urlopen",
@@ -88,9 +88,9 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "qwen3.7-max")
-        self.assertEqual(payload["tools"], [{"type": "web_search"}])
-        self.assertEqual(payload["tool_choice"], "required")
-        self.assertFalse(payload["enable_thinking"])
+        self.assertEqual(payload["tools"], [{"type": "web_search"}, {"type": "web_extractor"}])
+        self.assertNotIn("tool_choice", payload)
+        self.assertTrue(payload["enable_thinking"])
 
     def test_probe_rejects_missing_key_and_empty_response(self):
         with self.assertRaisesRegex(AIAnalysisError, "not configured"):
@@ -197,6 +197,24 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertNotIn("SP", prompt)
         self.assertNotIn("5.00", prompt)
         self.assertNotIn("0.20", prompt)
+
+    def test_plan_prompt_includes_diverse_sources_and_anonymous_history(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        content = json.dumps({"summary": "有依据。", "suggestions": [
+            {"match_id": "1001", "pick": "1:0", "reason": "来源充分"},
+            {"match_id": "1002", "pick": "1:1", "reason": "来源充分"},
+        ]}, ensure_ascii=False)
+        history = "最近120个已结算场次：主胜45.0%，常见比分1:1。"
+        with patch("score_fourfold.ai_analyzer.urllib.request.urlopen",
+                   return_value=_Response(_qwen_payload(content))) as mocked:
+            analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings,
+                                       history_context=history)
+        prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
+        self.assertIn("雷速体育", prompt)
+        self.assertIn("懂球帝", prompt)
+        self.assertIn("Sofascore", prompt)
+        self.assertIn("至少核对 3 个", prompt)
+        self.assertIn(history, prompt)
 
     def test_plan_analysis_rejects_invented_or_missing_options(self):
         settings = make_settings(Path("data"), qwen_api_key="secret")
