@@ -149,43 +149,6 @@ class DashboardTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_previewed_plan_is_not_counted_and_hides_purchase_details(self):
-        recommendation = self._create_plan(secret_team="PRIVATE-TEAM-NAME")
-        clock = FixedClock(self.now)
-        self.assertEqual(
-            flush_outbox(self.database, Mailer(self.settings, clock=clock), self.now),
-            (1, 0),
-        )
-
-        page = self.application.render()
-        self.assertIn("仅生成本地预览，不计账", page)
-        self.assertIn("购买内容已隐藏", page)
-        self.assertNotIn("PRIVATE-TEAM-NAME", page)
-        self.assertNotIn("SP 2.00", page)
-        self.assertNotIn("<strong>1:0</strong>", page)
-        stored = self.database.get_plan(recommendation.plan_id)
-        assert stored is not None
-        self.assertEqual(stored.delivery_status, "previewed")
-        self.assertEqual(self.database.summary()["plans_total"], 0)
-        self.assertEqual(self.database.summary()["baseline_stake"], "0.00")
-
-    def test_sent_plan_escapes_database_and_flash_content(self):
-        attack = '<script>alert("database-xss")</script>'
-        self._create_plan(secret_team=attack)
-        self._mark_recommendation_sent()
-
-        page = self.application.render(
-            message='<img src=x onerror="alert(1)">',
-            level="not-a-real-level",
-        )
-        self.assertNotIn(attack, page)
-        self.assertIn("&lt;script&gt;alert(&quot;database-xss&quot;)&lt;/script&gt;", page)
-        self.assertNotIn('<img src=x onerror="alert(1)">', page)
-        self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", page)
-        # Toast-based: message is in a hidden div with data-level
-        self.assertIn('id="init-message"', page)
-        self.assertIn('data-level="warn"', page)
-
     def test_json_api_bootstrap_plans_and_recommend_without_page_reload(self):
         recommendation = self._create_plan()
         server = DashboardServer(self.settings, self.application)
@@ -321,172 +284,26 @@ class DashboardTests(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_html_pages_are_gzipped_when_accepted(self):
+    def test_removed_legacy_frontend_and_form_actions_return_404(self):
         server = DashboardServer(self.settings, self.application)
         server.start()
         try:
-            status, headers, payload = self._request(
+            status, _, _ = self._request(server, "GET", "/legacy")
+            self.assertEqual(status, 404)
+            status, _, _ = self._request(
                 server,
-                "GET",
-                "/",
-                headers={"Accept-Encoding": "gzip"},
+                "POST",
+                "/actions/recommend",
+                body=b"request_id=obsolete",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Host": f"127.0.0.1:{server.address[1]}",
+                },
             )
-            self.assertEqual(status, 200)
-            self.assertEqual(headers.get("content-encoding"), "gzip")
-            self.assertEqual(headers.get("vary"), "Accept-Encoding")
-            self.assertGreater(len(payload), 0)
-            decompressed = gzip.decompress(payload)
-            self.assertGreater(len(decompressed), 1024)
+            self.assertEqual(status, 404)
+            self.assertEqual(self.triggered, [])
         finally:
             server.stop()
-
-    def test_ai_summary_is_rendered_in_modal_with_per_match_ai_cells(self):
-        recommendation = self._create_plan()
-        self._mark_recommendation_sent()
-        self.assertTrue(
-            self.database.update_ai_summary(
-                recommendation.plan_id,
-                "这是一段已持久化的AI分析内容。",
-            )
-        )
-
-        page = self.application.render(csrf_token="csrf-test-token")
-
-        self.assertIn("这是一段已持久化的AI分析内容。", page)
-        self.assertEqual(page.count('class="ai-cell"'), 4)
-        self.assertNotIn("rowspan=", page)
-        self.assertIn("查看总体分析", page)
-
-    def test_dashboard_marks_recommendation_and_each_match_during_ai_work(self):
-        self._create_plan()
-        self._mark_recommendation_sent()
-
-        page = self.application.render(csrf_token="csrf-test-token")
-
-        self.assertIn('id="recommend-form"', page)
-        self.assertIn("推荐正在后台生成（含 AI 分析）", page)
-        self.assertIn("本场比赛 AI 分析中，请稍候", page)
-        self.assertIn("AI 正在联网分析，最长可能需要约 10 分钟", page)
-        self.assertIn("target.disabled=true", page)
-
-    def test_recommendation_is_queued_and_rendered_without_waiting(self):
-        started = threading.Event()
-        release = threading.Event()
-
-        def slow_trigger(_request_id: str) -> tuple[str, str]:
-            started.set()
-            release.wait(2)
-            return "created", "后台推荐已完成"
-
-        application = DashboardApplication(
-            self.settings,
-            self.database,
-            slow_trigger,
-            secret=b"background-recommend-test-secret",
-        )
-        level, detail = application.queue_recommendation("background-request-0001")
-        self.assertEqual(level, "ok")
-        self.assertIn("无需停留", detail)
-        self.assertTrue(started.wait(1))
-
-        page = application.render(csrf_token="csrf-test-token")
-        self.assertIn("今日全部推荐正在后台生成", page)
-        self.assertIn("推荐生成中…", page)
-        self.assertIn("预计 1–40 分钟后刷新", page)
-        duplicate_level, _ = application.queue_recommendation("background-request-0002")
-        self.assertEqual(duplicate_level, "warn")
-
-        release.set()
-        self._wait_for(
-            lambda: application.recommendation_task() is not None
-            and application.recommendation_task().status == "finished"
-        )
-        self.assertIn("后台推荐结果：后台推荐已完成", application.render())
-
-    def test_plan_ai_is_queued_and_each_leg_stays_marked_while_running(self):
-        recommendation = self._create_plan()
-        self._mark_recommendation_sent()
-        started = threading.Event()
-        release = threading.Event()
-        settings = make_settings(
-            self.root,
-            database_path=self.database_path,
-            mail_preview_dir=self.preview,
-            ai_analysis_enabled=True,
-            qwen_api_key="secret",
-        )
-        application = DashboardApplication(settings, self.database, self._trigger)
-
-        def slow_analysis(_plan_id: str) -> tuple[str, str]:
-            started.set()
-            release.wait(2)
-            return "ok", "后台逐场分析已完成"
-
-        application.trigger_ai_analysis = slow_analysis
-        level, detail = application.queue_ai_analysis(recommendation.plan_id)
-        self.assertEqual(level, "ok")
-        self.assertIn("无需等待", detail)
-        self.assertTrue(started.wait(1))
-
-        page = application.render(csrf_token="csrf-test-token")
-        self.assertEqual(page.count("本场比赛正在后台 AI 分析中"), 4)
-        self.assertIn("正在后台逐场分析", page)
-        self.assertNotIn('data-action="delete-leg"', page)
-        duplicate_level, _ = application.queue_ai_analysis(recommendation.plan_id)
-        self.assertEqual(duplicate_level, "warn")
-        self.assertEqual(application.trigger_delete_plan(recommendation.plan_id)[0], "warn")
-        first_leg = recommendation.legs[0]
-        self.assertEqual(
-            application.trigger_update_leg(
-                recommendation.plan_id, first_leg.match.match_id, "s01s01"
-            )[0],
-            "warn",
-        )
-
-        release.set()
-        self._wait_for(
-            lambda: application.analysis_task(recommendation.plan_id) is not None
-            and application.analysis_task(recommendation.plan_id).status == "finished"
-        )
-        self.assertIn("后台分析结果：后台逐场分析已完成", application.render())
-
-    def test_dashboard_renders_ai_replacements_and_manual_pick_editor(self):
-        recommendation = self._create_plan()
-        self._mark_recommendation_sent()
-        plan = self.database.get_plan(recommendation.plan_id)
-        assert plan is not None
-        suggestions = [
-            (
-                leg.match_id,
-                "s01s01" if index == 0 else leg.score_code,
-                "这是逐场AI推荐理由",
-            )
-            for index, leg in enumerate(plan.legs)
-        ]
-        self.assertTrue(
-            self.database.update_ai_analysis(
-                plan.plan_id, "总体AI分析", suggestions
-            )
-        )
-
-        page = self.application.render(csrf_token="csrf-test-token")
-
-        self.assertIn("AI逐场推荐", page)
-        self.assertEqual(page.count("AI建议："), 4)
-        self.assertEqual(page.count("替换为此推荐"), 1)
-        self.assertEqual(page.count("与当前推荐一致"), 3)
-        self.assertEqual(page.count("手动修改推荐"), 4)
-        self.assertIn("width:min(96vw,1680px)", page)
-
-        first = plan.legs[0]
-        level, _ = self.application.trigger_update_leg(
-            plan.plan_id, first.match_id, "s01s01"
-        )
-        self.assertEqual(level, "ok")
-        updated = self.database.get_plan(plan.plan_id)
-        assert updated is not None
-        self.assertEqual(updated.legs[0].score_label, "1:1")
-        self.assertEqual(updated.combined_odds, Decimal("60"))
 
     def test_manual_ai_refreshes_options_and_stores_every_match_suggestion(self):
         recommendation = self._create_plan()
@@ -535,52 +352,6 @@ class DashboardTests(unittest.TestCase):
             all("AI预测：1:1" in item.reason for item in stored.ai_suggestions)
         )
 
-    def test_dashboard_distinguishes_quoted_and_actual_settlement_values(self):
-        recommendation = self._create_plan()
-        self._mark_recommendation_sent()
-        results = {
-            leg.match.match_id: MatchResult(
-                leg.match.match_id,
-                ResultStatus.FINAL,
-                1,
-                0,
-            )
-            for leg in recommendation.legs
-        }
-        results[recommendation.legs[0].match.match_id] = MatchResult(
-            recommendation.legs[0].match.match_id,
-            ResultStatus.VOID,
-        )
-        self.database.update_leg_results(recommendation.plan_id, results)
-        plan = self.database.get_plan(recommendation.plan_id)
-        assert plan is not None
-        settlement = ScoreFourfoldService._build_settlement(plan, self.now + timedelta(days=1))
-        assert settlement is not None
-        subject, text_body, html_body = render_settlement(
-            plan,
-            settlement,
-            self.database.summary(),
-        )
-        self.assertTrue(
-            self.database.settle_plan_with_mail(
-                settlement,
-                subject=subject,
-                text_body=text_body,
-                html_body=html_body,
-            )
-        )
-
-        page = self.application.render()
-        self.assertIn("2元理论税前返还", page)
-        self.assertIn("32.00 元", page)
-        self.assertIn("实际税后返还", page)
-        self.assertIn("16.00 元", page)
-        self.assertIn("本期净盈亏", page)
-        self.assertIn("14.00 元", page)
-        summary = self.database.summary()
-        self.assertEqual(summary["baseline_return"], "16.00")
-        self.assertEqual(summary["baseline_profit"], "14.00")
-
     def test_deleting_losing_leg_recalculates_settled_plan(self):
         recommendation = self._create_plan()
         self._mark_recommendation_sent()
@@ -625,64 +396,6 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(updated.status.value, "won")
         self.assertEqual(updated.settled_net_prize, Decimal("16.00"))
         self.assertEqual(updated.net_profit, Decimal("14.00"))
-
-    def test_get_has_security_headers_and_action_is_post_only(self):
-        server = DashboardServer(self.settings, self.application)
-        server.start()
-        try:
-            status, headers, payload = self._request(server, "GET", "/")
-            self.assertEqual(status, 200)
-            self.assertIn("text/html", headers["content-type"])
-            self.assertEqual(headers["cache-control"], "no-store")
-            self.assertIn("script-src 'nonce-", headers["content-security-policy"])
-            self.assertEqual(headers["x-frame-options"], "DENY")
-            page = payload.decode("utf-8")
-            self.assertIn("<title>比分串关个人看板</title>", page)
-            nonce_match = re.search(r'<script nonce="([A-Za-z0-9_-]{16,64})">', page)
-            self.assertIsNotNone(nonce_match)
-            assert nonce_match is not None
-            self.assertIn(f"script-src 'nonce-{nonce_match.group(1)}'", headers["content-security-policy"])
-
-            status, _, _ = self._request(server, "GET", "/actions/recommend")
-            self.assertEqual(status, 404)
-            self.assertEqual(self.triggered, [])
-        finally:
-            server.stop()
-
-    def test_update_leg_route_is_post_only_and_recalculates_plan(self):
-        recommendation = self._create_plan()
-        self._mark_recommendation_sent()
-        first = recommendation.legs[0]
-        server = DashboardServer(self.settings, self.application)
-        server.start()
-        try:
-            status, _, _ = self._request(server, "GET", "/actions/update-leg")
-            self.assertEqual(status, 404)
-            body = urlencode(
-                {
-                    "plan_id": recommendation.plan_id,
-                    "match_id": first.match.match_id,
-                    "option_code": "s01s01",
-                    "csrf_token": "",
-                }
-            ).encode()
-            status, _, _ = self._request(
-                server,
-                "POST",
-                "/actions/update-leg",
-                body=body,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Host": f"127.0.0.1:{server.address[1]}",
-                },
-            )
-            self.assertEqual(status, 303)
-            updated = self.database.get_plan(recommendation.plan_id)
-            assert updated is not None
-            self.assertEqual(updated.legs[0].score_code, "s01s01")
-            self.assertEqual(updated.combined_odds, Decimal("60"))
-        finally:
-            server.stop()
 
     def test_plan_changes_no_longer_auto_refresh_mail_push_is_manual(self):
         """update_leg no longer auto-refreshes mail; push is now manual."""
@@ -732,108 +445,6 @@ class DashboardTests(unittest.TestCase):
             "mail body should contain updated score after push",
         )
         self.assertTrue(wake_calls, "wake_mailer should be called on manual push")
-
-    def test_post_requires_loopback_host_same_origin_and_valid_signature(self):
-        server = DashboardServer(self.settings, self.application)
-        server.start()
-        try:
-            request_id, signature = self.application.new_request()
-            body = urlencode({"request_id": request_id, "signature": signature}).encode()
-            base_headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Host": f"127.0.0.1:{server.address[1]}",
-            }
-
-            status, _, _ = self._request(
-                server,
-                "POST",
-                "/actions/recommend",
-                body=body,
-                headers={**base_headers, "Host": "dashboard.example.com"},
-            )
-            self.assertEqual(status, 403)
-            status, _, _ = self._request(
-                server,
-                "POST",
-                "/actions/recommend",
-                body=body,
-                headers={**base_headers, "Origin": "https://attacker.example"},
-            )
-            self.assertEqual(status, 403)
-            invalid = urlencode({"request_id": request_id, "signature": "0" * 64}).encode()
-            status, _, _ = self._request(
-                server,
-                "POST",
-                "/actions/recommend",
-                body=invalid,
-                headers=base_headers,
-            )
-            self.assertEqual(status, 403)
-            self.assertEqual(self.triggered, [])
-
-            status, _, _ = self._request(
-                server,
-                "POST",
-                "/actions/recommend",
-                body=b"\xff",
-                headers=base_headers,
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(self.triggered, [])
-
-            status, headers, _ = self._request(
-                server,
-                "POST",
-                "/actions/recommend",
-                body=body,
-                headers={**base_headers, "Origin": f"http://127.0.0.1:{server.address[1]}"},
-            )
-            self.assertEqual(status, 303)
-            self.assertTrue(headers["location"].startswith("/?message="))
-            self._wait_for(lambda: self.triggered == [request_id])
-            self.assertEqual(self.triggered, [request_id])
-        finally:
-            server.stop()
-
-    def test_dashboard_pagination_by_date(self):
-        first = self._create_plan()
-        earlier = datetime(2026, 7, 14, 12, 0, tzinfo=TZ)
-        earlier_matches = [
-            make_match(i, earlier, business_date="2026-07-14", odds="2.00")
-            for i in range(1, 5)
-        ]
-        earlier_rec = replace(
-            make_recommendation(earlier, earlier_matches),
-            plan_id="BF4-TEST-EARLIER",
-        )
-        subject, text_body, html_body = render_recommendation(earlier_rec)
-        self.assertTrue(
-            self.database.create_plan_with_mail(
-                earlier_rec,
-                subject=subject,
-                text_body=text_body,
-                html_body=html_body,
-                expires_at=earlier + timedelta(hours=5),
-            )
-        )
-        # Default list view shows both plans (paginated)
-        page = self.application.render(view="list")
-        self.assertIn(first.plan_id, page)
-
-        # Date view shows plans for a specific date with navigation
-        page = self.application.render(view="date", date="2026-07-15")
-        self.assertIn("2026-07-15", page)
-        self.assertIn("第 1 / 2 天", page)
-        self.assertIn(first.plan_id, page)
-        self.assertNotIn(earlier_rec.plan_id, page)
-        self.assertIn("?date=2026-07-14", page)
-
-        page_earlier = self.application.render(view="date", date="2026-07-14")
-        self.assertIn(earlier_rec.plan_id, page_earlier)
-        self.assertNotIn(first.plan_id, page_earlier)
-        self.assertIn("第 2 / 2 天", page_earlier)
-        self.assertIn("?date=2026-07-15", page_earlier)
-
 
 class ManualActionAndDatabaseGateTests(unittest.TestCase):
     def setUp(self):
@@ -1083,33 +694,6 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         cookie = headers["set-cookie"]
         return cookie.split(";", 1)[0]
 
-    def test_unauthenticated_home_redirects_and_recommend_is_blocked(self):
-        self._create_sensitive_plan()
-        status, headers, payload = self._request("GET", "/", headers=self._public_headers())
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["location"], "/login")
-        self.assertNotIn(b"SECRET-PUBLIC-TEAM", payload)
-
-        request_id, signature = self.application.new_request()
-        body = urlencode(
-            {
-                "request_id": request_id,
-                "signature": signature,
-                "csrf_token": "forged",
-            }
-        ).encode()
-        status, headers, _ = self._request(
-            "POST",
-            "/actions/recommend",
-            body=body,
-            headers=self._public_headers(
-                **{"Content-Type": "application/x-www-form-urlencoded"}
-            ),
-        )
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["location"], "/login")
-        self.assertEqual(self.triggered, [])
-
     def test_login_sets_secure_cookie_and_rejects_account_enumeration(self):
         status, headers, _ = self._login()
         self.assertEqual(status, 303)
@@ -1127,69 +711,6 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         status, _, payload = self._login(username="owner", password="wrong horse battery!!")
         self.assertEqual(status, 401)
         self.assertIn("用户名或密码错误", payload.decode("utf-8"))
-
-    def test_forged_cookie_is_ignored_and_successful_login_rotates_token(self):
-        forged = f"__Host-score_session={'A' * 48}"
-        status, headers, _ = self._login(cookie=forged)
-        self.assertEqual(status, 303)
-        new_cookie = self._cookie_from(headers)
-        self.assertNotEqual(new_cookie, forged)
-        status, page_headers, payload = self._request(
-            "GET",
-            "/",
-            headers=self._public_headers(Cookie=new_cookie),
-        )
-        self.assertEqual(status, 200)
-        page = payload.decode("utf-8")
-        self.assertIn("<title>比分串关个人看板</title>", page)
-        self.assertIn("script-src 'nonce-", page_headers["content-security-policy"])
-        self.assertNotIn('href="javascript:', page)
-
-    def test_logout_requires_csrf_and_invalidates_old_cookie(self):
-        status, headers, _ = self._login()
-        cookie = self._cookie_from(headers)
-        token = cookie.split("=", 1)[1]
-        session = self.application.get_session(token)
-        assert session is not None
-
-        body = urlencode({"csrf_token": "wrong-csrf"}).encode()
-        status, _, _ = self._request(
-            "POST",
-            "/logout",
-            body=body,
-            headers=self._public_headers(
-                **{
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Cookie": cookie,
-                }
-            ),
-        )
-        self.assertEqual(status, 403)
-        self.assertIsNotNone(self.application.get_session(token))
-
-        body = urlencode({"csrf_token": session.csrf_token}).encode()
-        status, headers, _ = self._request(
-            "POST",
-            "/logout",
-            body=body,
-            headers=self._public_headers(
-                **{
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Cookie": cookie,
-                }
-            ),
-        )
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["location"], "/login")
-        self.assertIn("Max-Age=0", headers["set-cookie"])
-        self.assertIsNone(self.application.get_session(token))
-        status, headers, _ = self._request(
-            "GET",
-            "/",
-            headers=self._public_headers(Cookie=cookie),
-        )
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["location"], "/login")
 
     def test_vue_api_logout_requires_csrf_and_clears_session_cookie(self):
         status, headers, _ = self._login()
@@ -1216,136 +737,6 @@ class PublicDashboardSecurityTests(unittest.TestCase):
         self.assertEqual(json.loads(payload)["level"], "ok")
         self.assertIn("Max-Age=0", response_headers["set-cookie"])
         self.assertIsNone(self.application.get_session(token))
-
-    def test_recommend_requires_session_csrf_host_and_origin(self):
-        status, headers, home = self._login()
-        cookie = self._cookie_from(headers)
-        token = cookie.split("=", 1)[1]
-        session = self.application.get_session(token)
-        assert session is not None
-        page = home.decode("utf-8") if home else ""
-        if "csrf_token" not in page:
-            status, _, payload = self._request(
-                "GET",
-                "/",
-                headers=self._public_headers(Cookie=cookie),
-            )
-            self.assertEqual(status, 200)
-            page = payload.decode("utf-8")
-        request_id, signature = self.application.new_request()
-        other_token, other_session = self.application.create_session()
-
-        valid_body = urlencode(
-            {
-                "request_id": request_id,
-                "signature": signature,
-                "csrf_token": session.csrf_token,
-            }
-        ).encode()
-        cases = [
-            (
-                urlencode(
-                    {
-                        "request_id": request_id,
-                        "signature": signature,
-                        "csrf_token": other_session.csrf_token,
-                    }
-                ).encode(),
-                self._public_headers(
-                    **{
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie": cookie,
-                    }
-                ),
-                403,
-            ),
-            (
-                valid_body,
-                {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Host": PUBLIC_IP,
-                    "X-Forwarded-Proto": "https",
-                    "X-Forwarded-For": "198.51.100.20",
-                    "Cookie": cookie,
-                },
-                403,
-            ),
-            (
-                valid_body,
-                self._public_headers(
-                    **{
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie": cookie,
-                        "Origin": "https://evil.example",
-                    }
-                ),
-                403,
-            ),
-            (
-                valid_body,
-                {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Host": f"{PUBLIC_IP},{PUBLIC_IP}",
-                    "X-Forwarded-Proto": "https",
-                    "X-Forwarded-For": "198.51.100.20",
-                    "Origin": PUBLIC_ORIGIN,
-                    "Cookie": cookie,
-                },
-                403,
-            ),
-            (
-                valid_body,
-                self._public_headers(
-                    **{
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie": cookie,
-                        "X-Forwarded-For": "198.51.100.20, 198.51.100.21",
-                    }
-                ),
-                403,
-            ),
-            (
-                valid_body,
-                self._public_headers(
-                    **{
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie": cookie,
-                        "X-Forwarded-Proto": "http",
-                    }
-                ),
-                403,
-            ),
-        ]
-        for body, headers, expected in cases:
-            with self.subTest(expected=expected, headers=headers):
-                before = list(self.triggered)
-                status, _, _ = self._request(
-                    "POST",
-                    "/actions/recommend",
-                    body=body,
-                    headers=headers,
-                )
-                self.assertEqual(status, expected)
-                self.assertEqual(self.triggered, before)
-
-        # Referer with a path should still be accepted when Origin is absent.
-        no_origin = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Host": PUBLIC_IP,
-            "X-Forwarded-Proto": "https",
-            "X-Forwarded-For": "198.51.100.20",
-            "Referer": f"{PUBLIC_ORIGIN}/",
-            "Cookie": cookie,
-        }
-        status, headers, _ = self._request(
-            "POST",
-            "/actions/recommend",
-            body=valid_body,
-            headers=no_origin,
-        )
-        self.assertEqual(status, 303)
-        self.assertEqual(self.triggered, [request_id])
-        _ = other_token
 
     def test_login_rate_limit_is_per_ip_and_clears_on_success(self):
         for _ in range(5):
@@ -1546,34 +937,11 @@ class NewFeatureTests(unittest.TestCase):
 
     # --- purchase marking ---
 
-    def test_mark_purchased_shows_badge_and_unmark_removes_it(self):
-        rec = self._create_sent_plan()
-        level, detail = self.application.trigger_mark_purchased(rec.plan_id, True)
-        self.assertEqual(level, "ok")
-        self.assertIn("标记购买", detail)
-        page = self.application.render(csrf_token="csrf-token")
-        self.assertIn('class="badge purchase-badge"', page)
-
-        level2, _ = self.application.trigger_mark_purchased(rec.plan_id, False)
-        self.assertEqual(level2, "ok")
-        page2 = self.application.render(csrf_token="csrf-token")
-        self.assertNotIn('class="badge purchase-badge"', page2)
-
     def test_mark_purchased_nonexistent_plan(self):
         level, detail = self.application.trigger_mark_purchased("NONEXISTENT", True)
         self.assertEqual(level, "warn")
 
     # --- ticket image upload ---
-
-    def test_sent_plan_renders_mobile_upload_drop_zone_and_screenshot(self):
-        self._create_sent_plan()
-        page = self.application.render(csrf_token="csrf-token")
-        self.assertIn('class="ticket-file-input"', page)
-        self.assertIn('accept="image/*"', page)
-        self.assertIn("点击或拖拽上传", page)
-        self.assertIn('data-action="screenshot-plan"', page)
-        self.assertIn("ClipboardItem", page)
-        self.assertIn("DataTransfer", page)
 
     def test_upload_ticket_saves_image_and_marks_purchased(self):
         rec = self._create_sent_plan()
@@ -1742,53 +1110,6 @@ class NewFeatureTests(unittest.TestCase):
 
     # --- pagination view ---
 
-    def test_list_view_shows_pagination_with_10_per_page(self):
-        for n in range(1, 13):
-            self._create_sent_plan(
-                plan_id=f"BF4-TEST-{n:04d}",
-                business_date=f"2026-07-{n:02d}",
-                day_offset=n - 1,
-            )
-        page = self.application.render(view="list", page=1, csrf_token="csrf")
-        self.assertIn("BF4-TEST-0012", page)
-        self.assertIn("BF4-TEST-0003", page)
-        self.assertNotIn("BF4-TEST-0002", page)
-        self.assertIn("pagination", page)
-        page2 = self.application.render(view="list", page=2, csrf_token="csrf")
-        self.assertIn("BF4-TEST-0002", page2)
-        self.assertIn("BF4-TEST-0001", page2)
-
-    # --- calendar view ---
-
-    def test_calendar_view_shows_daily_counts(self):
-        self._create_sent_plan(plan_id="BF4-A-0001", business_date="2026-07-14", day_offset=0)
-        self._create_sent_plan(plan_id="BF4-B-0002", business_date="2026-07-15", day_offset=1)
-        self._create_sent_plan(plan_id="BF4-C-0003", business_date="2026-07-16", day_offset=2)
-        page = self.application.render(
-            view="calendar",
-            cal_year=2026,
-            cal_month=7,
-            csrf_token="csrf",
-        )
-        self.assertIn("calendar", page)
-        self.assertIn("2026-07", page)
-
-    # --- view tabs ---
-
-    def test_view_tabs_present_in_all_views(self):
-        self._create_sent_plan()
-        for view in ("date", "list", "calendar"):
-            page = self.application.render(
-                view=view,
-                date="2026-07-15" if view == "date" else "",
-                cal_year=2026,
-                cal_month=7,
-                csrf_token="csrf",
-            )
-            self.assertIn("view-tab", page)
-
-    # --- AJAX JSON responses ---
-
     def test_ajax_mark_purchased_returns_json(self):
         """AJAX requests should get JSON, not a 303 redirect."""
         rec = self._create_sent_plan()
@@ -1807,84 +1128,6 @@ class NewFeatureTests(unittest.TestCase):
         self.assertIsNone(self.database.get_plan(rec.plan_id))
 
     # --- toast notifications ---
-
-    def test_toast_container_present_in_all_views(self):
-        self._create_sent_plan()
-        for view in ("list", "calendar", "date"):
-            page = self.application.render(
-                view=view,
-                date="2026-07-15" if view == "date" else "",
-                cal_year=2026,
-                cal_month=7,
-                csrf_token="csrf",
-            )
-            self.assertIn('id="toast-container"', page)
-            self.assertIn("showToast", page)
-
-    def test_flash_message_uses_init_toast_div(self):
-        """Messages should be in a hidden div for toast display, not inline flash."""
-        page = self.application.render(
-            message="测试消息",
-            level="ok",
-            csrf_token="csrf",
-        )
-        self.assertIn('id="init-message"', page)
-        self.assertIn("测试消息", page)
-        self.assertIn("showToast(initMsg", page)
-
-    # --- no "按日期" tab in default list view ---
-
-    def test_no_date_tab_in_list_view(self):
-        self._create_sent_plan()
-        page = self.application.render(view="list", csrf_token="csrf")
-        self.assertNotIn("按日期", page)
-        self.assertIn("全部记录", page)
-        self.assertIn("日历", page)
-
-    def test_date_tab_shows_contextually(self):
-        """Date tab should appear when a specific date is selected."""
-        self._create_sent_plan()
-        page = self.application.render(view="date", date="2026-07-15", csrf_token="csrf")
-        self.assertIn("2026-07-15", page)
-
-    # --- data-plan-card attribute ---
-
-    def test_plan_card_has_data_attribute(self):
-        rec = self._create_sent_plan()
-        page = self.application.render(view="list", csrf_token="csrf")
-        self.assertIn(f'data-plan-card="{rec.plan_id}"', page)
-
-    # --- per-plan settle ---
-
-    def test_settle_plan_button_on_pending_plan(self):
-        rec = self._create_sent_plan()
-        page = self.application.render(view="list", csrf_token="csrf")
-        self.assertIn("settle-plan", page)
-        self.assertIn("更新本场赛果", page)
-        self.assertIn(f'data-plan-id="{rec.plan_id}"', page)
-
-    def test_settle_plan_button_absent_on_non_pending(self):
-        rec = self._create_sent_plan()
-        # Manually settle the plan as WON
-        settlement = Settlement(
-            plan_id=rec.plan_id,
-            status=PlanStatus.WON,
-            settled_at=self.now,
-            gross_prize=Decimal("100"),
-            tax=Decimal("0"),
-            net_prize=Decimal("100"),
-            net_profit=Decimal("98"),
-            leg_results=(),
-        )
-        self.database.settle_plan_with_mail(
-            settlement,
-            subject="test",
-            text_body="test",
-            html_body="test",
-        )
-        page = self.application.render(view="list", csrf_token="csrf")
-        # Settle button should not appear for non-pending plans
-        self.assertNotIn("更新本场赛果", page)
 
     def test_queue_settle_plan_nonexistent(self):
         level, detail = self.application.queue_settle_plan("NONEXISTENT")
@@ -1985,15 +1228,6 @@ class NewFeatureTests(unittest.TestCase):
         self.assertIn("已提交后台", detail)
 
     # --- fetch-based postAction in JS ---
-
-    def test_postAction_uses_fetch_not_form_submit(self):
-        """The JS should use fetch() for AJAX, not form.submit()."""
-        page = self.application.render(csrf_token="csrf")
-        self.assertIn("fetch(path", page)
-        self.assertIn("X-Requested-With", page)
-        self.assertIn("XMLHttpRequest", page)
-        # Old form-based postAction should be gone
-        self.assertNotIn("f.submit()", page)
 
     @staticmethod
     def _wait_for(predicate, timeout: float = 2.0) -> None:

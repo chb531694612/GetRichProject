@@ -91,6 +91,34 @@ class DatabaseSafetyTests(unittest.TestCase):
             2,
         )
 
+    def test_ai_history_context_deduplicates_matches_across_plans(self):
+        matches = [make_match(index, self.now, odds="2.00") for index in range(1, 5)]
+        base = make_recommendation(self.now, matches)
+        for number in (1, 2):
+            candidate = replace(base, plan_id=f"BF4-HISTORY-{number:04d}")
+            subject, text_body, html_body = render_recommendation(candidate)
+            self.assertTrue(
+                self.database.create_plan_with_mail(
+                    candidate,
+                    subject=subject,
+                    text_body=text_body,
+                    html_body=html_body,
+                    expires_at=self.now + timedelta(hours=5),
+                    market_limit=2,
+                )
+            )
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', result_home = 1, result_away = 0
+                WHERE plan_id LIKE 'BF4-HISTORY-%'
+                """
+            )
+        context = self.database.ai_history_context(MarketType.CRS)
+        self.assertIn("最近4个已结算场次", context)
+        self.assertIn("主胜4场(100.0%)", context)
+
     def test_same_issue_date_is_allowed_on_next_recommendation_date(self):
         matches = [make_match(index, self.now, odds="2.00") for index in range(1, 5)]
         first = replace(make_recommendation(self.now, matches), business_date="2026-07-15")

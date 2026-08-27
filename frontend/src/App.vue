@@ -228,18 +228,11 @@ async function deletePlan(plan: any) {
   await action('/api/v1/actions/delete-plan', { plan_id: plan.plan_id }, `delete-${plan.plan_id}`)
 }
 
-const ticketFileInput = ref<HTMLInputElement | null>(null)
 const pendingUploadPlan = ref<any>(null)
 const ticketZoomUrl = ref<string>('')
 function pickTicket(plan: any) {
-  if (pendingUploadPlan.value === plan) {
-    // 已处于等待粘贴状态，再次点击改为选择文件
-    pendingUploadPlan.value = null
-    ticketFileInput.value?.click()
-    return
-  }
-  pendingUploadPlan.value = plan
-  toast(`已就绪：请直接按 Ctrl+V 粘贴 ${plan.plan_id} 的实票截图，或再次点击按钮选择文件`, 'info')
+  pendingUploadPlan.value = pendingUploadPlan.value === plan ? null : plan
+  if (pendingUploadPlan.value) toast(`已就绪：可按 Ctrl+V 粘贴 ${plan.plan_id} 的实票截图`, 'info')
 }
 async function uploadTicketFile(file: File, plan: any) {
   busy.value = `ticket-${plan.plan_id}`
@@ -253,14 +246,23 @@ async function uploadTicketFile(file: File, plan: any) {
     busy.value = ''
   }
 }
-async function uploadTicket(event: Event) {
+async function uploadTicket(event: Event, plan: any) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  const plan = pendingUploadPlan.value
   input.value = ''
   pendingUploadPlan.value = null
   if (!file || !plan) return
   await uploadTicketFile(file, plan)
+}
+function dropTicket(event: DragEvent, plan: any) {
+  const file = event.dataTransfer?.files?.[0]
+  if (!file) return
+  if (!file.type.startsWith('image/')) {
+    toast('请选择图片文件', 'warn')
+    return
+  }
+  pendingUploadPlan.value = null
+  void uploadTicketFile(file, plan)
 }
 function handlePaste(event: ClipboardEvent) {
   const plan = pendingUploadPlan.value
@@ -278,6 +280,79 @@ function handlePaste(event: ClipboardEvent) {
 async function deleteTicket(plan: any) {
   if (!window.confirm(`确定移除计划 ${plan.plan_id} 的实票图片？`)) return
   await action('/api/v1/actions/delete-ticket', { plan_id: plan.plan_id }, `delticket-${plan.plan_id}`)
+}
+
+function canvasBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'))
+}
+function drawWrappedText(
+  context: CanvasRenderingContext2D, text: string, x: number, y: number,
+  maxWidth: number, lineHeight: number,
+): number {
+  let line = ''
+  const lines: string[] = []
+  Array.from(text || '').forEach((character) => {
+    const candidate = line + character
+    if (line && context.measureText(candidate).width > maxWidth) {
+      lines.push(line)
+      line = character
+    } else line = candidate
+  })
+  if (line) lines.push(line)
+  lines.forEach((item, index) => context.fillText(item, x, y + index * lineHeight))
+  return y + lines.length * lineHeight
+}
+async function screenshotPlan(plan: any) {
+  const width = 1080
+  const padding = 52
+  const rowHeight = 92
+  const height = 210 + plan.legs.length * rowHeight
+  const canvas = document.createElement('canvas')
+  const scale = Math.min(window.devicePixelRatio || 1, 2)
+  canvas.width = width * scale
+  canvas.height = height * scale
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('浏览器无法创建图片画布')
+  context.scale(scale, scale)
+  context.fillStyle = '#fff'
+  context.fillRect(0, 0, width, height)
+  context.fillStyle = '#101828'
+  context.font = 'bold 30px sans-serif'
+  context.fillText(`${plan.recommendation_date} · ${plan.market_label}${plan.pass_size}串1`, padding, 58)
+  context.fillStyle = '#667085'
+  context.font = '16px sans-serif'
+  context.fillText(`计划编号：${plan.plan_id}`, padding, 90)
+  context.strokeStyle = '#d0d5dd'
+  context.beginPath(); context.moveTo(padding, 112); context.lineTo(width - padding, 112); context.stroke()
+  context.fillStyle = '#344054'; context.font = 'bold 17px sans-serif'
+  context.fillText('比赛', padding, 145); context.fillText('对阵', 245, 145); context.fillText('推荐赛果', 760, 145)
+  let y = 180
+  plan.legs.forEach((leg: any) => {
+    context.fillStyle = '#101828'; context.font = '16px sans-serif'
+    drawWrappedText(context, `${leg.match_num} / ${leg.league}`, padding, y, 170, 23)
+    drawWrappedText(context, `${leg.home} vs ${leg.away}`, 245, y, 460, 23)
+    context.fillStyle = '#7a5af8'; context.font = 'bold 22px sans-serif'
+    drawWrappedText(context, String(pickWithBall(leg.pick_label, plan.market) || ''), 760, y, 250, 27)
+    context.strokeStyle = '#eaecf0'
+    context.beginPath(); context.moveTo(padding, y + 55); context.lineTo(width - padding, y + 55); context.stroke()
+    y += rowHeight
+  })
+  context.fillStyle = '#667085'; context.font = '14px sans-serif'
+  context.fillText('请与体彩店出票内容逐场核对', padding, height - 28)
+  const blob = await canvasBlob(canvas)
+  if (!blob) throw new Error('图片生成失败')
+  try {
+    if (!navigator.clipboard || !window.ClipboardItem) throw new Error('clipboard unavailable')
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+    toast('推荐图片已复制到剪贴板，可直接粘贴发送')
+  } catch {
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `${plan.plan_id}.png`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 1000)
+    toast('浏览器不允许复制图片，已自动保存 PNG 文件', 'warn')
+  }
 }
 
 async function deleteLeg(plan: any, leg: any) {
@@ -603,11 +678,26 @@ onBeforeUnmount(() => {
             <div class="action-bar">
               <button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button>
               <button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button>
+              <button class="screenshot-button" @click="screenshotPlan(plan).catch((error) => toast(`截图失败：${error.message}`, 'error'))">一键截图推荐</button>
               <button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button>
-              <button class="soft" :class="{ 'paste-waiting': pendingUploadPlan === plan }" :disabled="busy === `ticket-${plan.plan_id}`" @click="pickTicket(plan)">{{ pendingUploadPlan === plan ? '粘贴截图（Ctrl+V）…' : '上传实票' }}</button>
               <button class="soft" :disabled="busy === `push-${plan.plan_id}`" @click="action('/api/v1/actions/push-mail',{plan_id:plan.plan_id},`push-${plan.plan_id}`)">推送邮件</button>
             </div>
             <button class="text-danger" @click="deletePlan(plan)">删除计划</button>
+            <div class="ticket-upload-row">
+              <span class="ticket-upload-title">上传实票：</span>
+              <label
+                class="ticket-upload-zone"
+                :class="{ uploading: busy === `ticket-${plan.plan_id}` }"
+                @dragover.prevent
+                @drop.prevent="dropTicket($event, plan)"
+              >
+                <input type="file" accept="image/*" :disabled="busy === `ticket-${plan.plan_id}`" @change="uploadTicket($event, plan)" />
+                <span class="ticket-upload-icon" aria-hidden="true">☁↑</span>
+                <span>{{ busy === `ticket-${plan.plan_id}` ? '上传中…' : '点击或拖拽上传' }}</span>
+                <small>手机可选相册或拍照</small>
+              </label>
+              <button class="link paste-button" :class="{ 'paste-waiting': pendingUploadPlan === plan }" @click="pickTicket(plan)">{{ pendingUploadPlan === plan ? '等待粘贴…' : '从剪贴板粘贴' }}</button>
+            </div>
             <div v-if="plan.ticket_image_url" class="ticket-box">
               <img class="ticket-thumb" :src="plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票图片`" loading="lazy" @click="ticketZoomUrl = plan.ticket_image_url" />
               <div class="ticket-meta">
@@ -756,6 +846,5 @@ onBeforeUnmount(() => {
     <button class="modal-close zoom-close" @click="ticketZoomUrl = ''">×</button>
   </div>
 
-  <input ref="ticketFileInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp" hidden @change="uploadTicket" />
   <div class="toasts"><div v-for="item in toasts" :key="item.id" :class="['toast',item.level]">{{ item.text }}</div></div>
 </template>

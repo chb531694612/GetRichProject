@@ -1162,12 +1162,19 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT l.result_home, l.result_away
-                FROM plan_legs l
-                INNER JOIN plans p ON p.plan_id = l.plan_id
-                WHERE p.market = ? AND l.result_status = 'final'
-                  AND l.result_home IS NOT NULL AND l.result_away IS NOT NULL
-                ORDER BY COALESCE(p.settled_at, p.created_at) DESC
+                SELECT result_home, result_away
+                FROM (
+                    SELECT l.match_id,
+                           MAX(l.result_home) AS result_home,
+                           MAX(l.result_away) AS result_away,
+                           MAX(COALESCE(p.settled_at, p.created_at)) AS resolved_at
+                    FROM plan_legs l
+                    INNER JOIN plans p ON p.plan_id = l.plan_id
+                    WHERE p.market = ? AND l.result_status = 'final'
+                      AND l.result_home IS NOT NULL AND l.result_away IS NOT NULL
+                    GROUP BY l.match_id
+                ) unique_results
+                ORDER BY resolved_at DESC
                 LIMIT ?
                 """,
                 (market.value, safe_limit),
