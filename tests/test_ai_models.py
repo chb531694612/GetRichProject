@@ -59,13 +59,15 @@ class AIModelAdapterTests(unittest.TestCase):
             self.assertIn("测试通过", probe_model(self.runtime, 10))
         request = opened.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertNotIn("tool_choice", body)
-        # 小输出配额的连接性探测关闭思考模式（Normal 模式不支持 web_extractor），tools 仅保留 web_search。
+        self.assertEqual(body["tool_choice"], {"type": "web_search"})
+        # 小输出配额的连接性探测关闭思考模式（Normal 模式不支持 web_extractor），tools 仅保留 web_search；
+        # Normal 模式必须显式指定 tool_choice 强制联网（qwen3 系列不会主动调用 web_search）。
         self.assertEqual(body["tools"], [{"type": "web_search"}])
         self.assertFalse(body["enable_thinking"])
 
     def test_qwen_thinking_mode_attaches_web_extractor(self):
-        # 分析请求输出配额充足时开启思考模式，此时才允许附带 web_extractor。
+        # 分析请求输出配额充足时开启思考模式，此时才允许附带 web_extractor；
+        # 思考模式不允许 tool_choice，依赖模型自动搜索 + 响应端校验。
         payload = {
             "status": "completed",
             "output": [
@@ -86,6 +88,7 @@ class AIModelAdapterTests(unittest.TestCase):
         request = opened.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertTrue(body["enable_thinking"])
+        self.assertNotIn("tool_choice", body)
         self.assertEqual(
             body["tools"],
             [{"type": "web_search"}, {"type": "web_extractor"}],

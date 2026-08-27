@@ -158,7 +158,8 @@ def call_with_web_search(
     # web_search_call，既保留思考能力，又保证没有实际联网时整次调用失败。
     # 小输出配额（连接性探测）关闭思考，避免思考 token 耗尽输出预算造成假失败。
     # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
-    # 因此该工具仅在思考模式开启时附加，否则接口直接返回 HTTP 400。
+    # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
+    # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
     if spec.code == "qwen":
         thinking = max_output_tokens >= 2048
         tools = [{"type": "web_search"}]
@@ -166,6 +167,8 @@ def call_with_web_search(
             tools.append({"type": "web_extractor"})
         payload["tools"] = tools
         payload["enable_thinking"] = thinking
+        if not thinking:
+            payload["tool_choice"] = {"type": "web_search"}
     else:
         payload["tool_choice"] = {"type": "web_search"}
 

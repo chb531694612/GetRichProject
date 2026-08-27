@@ -127,7 +127,8 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
     # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
     # 探测请求关闭思考，避免思考 token 提前耗尽 max_output_tokens 造成假失败。
     # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
-    # 因此该工具仅在思考模式开启时附加，否则接口直接返回 HTTP 400。
+    # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
+    # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
     thinking = max_tokens >= 2048
     tools = [{"type": "web_search"}]
     if thinking:
@@ -145,6 +146,8 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
         "enable_thinking": thinking,
         "max_output_tokens": max_tokens,
     }
+    if not thinking:
+        payload["tool_choice"] = {"type": "web_search"}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         settings.qwen_api_url,

@@ -110,9 +110,10 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "qwen3.7-max")
-        # 探测用小输出配额关闭思考模式（Normal 模式不支持 web_extractor），tools 仅保留 web_search。
+        # 探测用小输出配额关闭思考模式（Normal 模式不支持 web_extractor），tools 仅保留 web_search，
+        # 且必须显式指定 tool_choice 强制联网（qwen3 系列 Normal 模式不会主动调用 web_search）。
         self.assertEqual(payload["tools"], [{"type": "web_search"}])
-        self.assertNotIn("tool_choice", payload)
+        self.assertEqual(payload["tool_choice"], {"type": "web_search"})
         self.assertFalse(payload["enable_thinking"])
 
     def test_probe_rejects_missing_key_and_empty_response(self):
