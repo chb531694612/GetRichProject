@@ -19,6 +19,7 @@ class VueFrontendSourceTests(unittest.TestCase):
         self.assertIn("navigator.clipboard.write", source)
         self.assertIn("link.download", source)
         self.assertIn("一键截图推荐", source)
+        self.assertNotIn("请与体彩店出票内容逐场核对", source)
 
     def test_mobile_breakpoints_are_present(self):
         styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")

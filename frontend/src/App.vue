@@ -306,7 +306,7 @@ async function screenshotPlan(plan: any) {
   const width = 1080
   const padding = 52
   const rowHeight = 92
-  const height = 210 + plan.legs.length * rowHeight
+  const height = 165 + plan.legs.length * rowHeight
   const canvas = document.createElement('canvas')
   const scale = Math.min(window.devicePixelRatio || 1, 2)
   canvas.width = width * scale
@@ -337,8 +337,6 @@ async function screenshotPlan(plan: any) {
     context.beginPath(); context.moveTo(padding, y + 55); context.lineTo(width - padding, y + 55); context.stroke()
     y += rowHeight
   })
-  context.fillStyle = '#667085'; context.font = '14px sans-serif'
-  context.fillText('请与体彩店出票内容逐场核对', padding, height - 28)
   const blob = await canvasBlob(canvas)
   if (!blob) throw new Error('图片生成失败')
   try {
