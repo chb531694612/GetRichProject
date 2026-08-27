@@ -60,9 +60,36 @@ class AIModelAdapterTests(unittest.TestCase):
         request = opened.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertNotIn("tool_choice", body)
-        self.assertEqual(body["tools"], [{"type": "web_search"}, {"type": "web_extractor"}])
-        # 小输出配额的连接性探测关闭思考模式，避免思考 token 耗尽输出预算。
+        # 小输出配额的连接性探测关闭思考模式（Normal 模式不支持 web_extractor），tools 仅保留 web_search。
+        self.assertEqual(body["tools"], [{"type": "web_search"}])
         self.assertFalse(body["enable_thinking"])
+
+    def test_qwen_thinking_mode_attaches_web_extractor(self):
+        # 分析请求输出配额充足时开启思考模式，此时才允许附带 web_extractor。
+        payload = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call"},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "AI连接正常"}],
+                },
+            ],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            call_with_web_search(
+                self.runtime,
+                "test",
+                timeout_seconds=10,
+                max_output_tokens=2048,
+            )
+        request = opened.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertTrue(body["enable_thinking"])
+        self.assertEqual(
+            body["tools"],
+            [{"type": "web_search"}, {"type": "web_extractor"}],
+        )
 
     def test_responses_adapter_rejects_answer_without_actual_search(self):
         payload = {

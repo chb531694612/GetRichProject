@@ -124,6 +124,14 @@ def _build_prompt(
 def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
     if not settings.qwen_api_key:
         raise AIAnalysisError("QWEN_API_KEY is not configured")
+    # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
+    # 探测请求关闭思考，避免思考 token 提前耗尽 max_output_tokens 造成假失败。
+    # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
+    # 因此该工具仅在思考模式开启时附加，否则接口直接返回 HTTP 400。
+    thinking = max_tokens >= 2048
+    tools = [{"type": "web_search"}]
+    if thinking:
+        tools.append({"type": "web_extractor"})
     payload = {
         "model": settings.qwen_model,
         "input": [
@@ -133,10 +141,8 @@ def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        "tools": [{"type": "web_search"}, {"type": "web_extractor"}],
-        # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
-        # 探测请求关闭思考，避免思考 token 提前耗尽 max_output_tokens 造成假失败。
-        "enable_thinking": max_tokens >= 2048,
+        "tools": tools,
+        "enable_thinking": thinking,
         "max_output_tokens": max_tokens,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
