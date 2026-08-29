@@ -1135,6 +1135,8 @@ def build_handler(application: DashboardApplication):
                     data = dashboard_api.plans(query)
                 elif parsed.path == "/api/v1/calendar":
                     data = dashboard_api.calendar(query)
+                elif parsed.path == "/api/v1/analytics":
+                    data = dashboard_api.analytics(query)
                 elif parsed.path == "/api/v1/settings":
                     data = dashboard_api.settings()
                 elif parsed.path == "/api/v1/plan-task":

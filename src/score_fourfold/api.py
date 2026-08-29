@@ -218,6 +218,9 @@ class DashboardAPI:
             "days": self.database.filtered_calendar_stats(year, month, filters),
         }
 
+    def analytics(self, query: dict[str, list[str]]) -> dict[str, object]:
+        return self.database.filtered_hit_rate_stats(self._filters(query))
+
     def summary_from_values(self, values: object) -> dict[str, int | str]:
         if not isinstance(values, dict):
             return self.database.filtered_summary({})

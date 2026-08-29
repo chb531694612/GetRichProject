@@ -1450,6 +1450,89 @@ class Database:
             "profit": str(_money(row["profit_cents"] or 0)),
         }
 
+    def filtered_hit_rate_stats(self, filters: dict[str, object]) -> dict[str, object]:
+        """Return daily and per-market settled-leg accuracy for dashboard charts."""
+        where, params = self._filtered_plan_where(filters)
+        settled_leg_where = (f"{where} AND" if where else " WHERE") + (
+            " l.result_status = 'final'"
+            " AND l.result_home IS NOT NULL"
+            " AND l.result_away IS NOT NULL"
+        )
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.recommendation_date, p.market, l.score_code, l.score_label,
+                       l.result_home, l.result_away
+                FROM plans p
+                JOIN plan_legs l ON l.plan_id = p.plan_id
+                {settled_leg_where}
+                ORDER BY p.recommendation_date, p.created_at, l.position
+                """,
+                params,
+            ).fetchall()
+
+        daily: dict[str, dict[str, int]] = {}
+        markets = {market.value: {"hit": 0, "settled": 0} for market in MarketType}
+        for row in rows:
+            hit = _settled_leg_hit(
+                str(row["market"]),
+                str(row["score_code"]),
+                str(row["score_label"]),
+                int(row["result_home"]),
+                int(row["result_away"]),
+            )
+            day = daily.setdefault(
+                str(row["recommendation_date"]), {"hit": 0, "settled": 0}
+            )
+            day["settled"] += 1
+            day["hit"] += int(hit)
+            market = markets[str(row["market"])]
+            market["settled"] += 1
+            market["hit"] += int(hit)
+
+        timeline: list[dict[str, object]] = []
+        dated_days = [(date.fromisoformat(day), values) for day, values in sorted(daily.items())]
+        for current_date, values in dated_days:
+            rolling_start = current_date - timedelta(days=6)
+            window = [
+                item for item_date, item in dated_days
+                if rolling_start <= item_date <= current_date
+            ]
+            rolling_hit = sum(item["hit"] for item in window)
+            rolling_settled = sum(item["settled"] for item in window)
+            timeline.append(
+                {
+                    "date": current_date.isoformat(),
+                    "hit": values["hit"],
+                    "settled": values["settled"],
+                    "hit_rate": round(values["hit"] * 100 / values["settled"], 1),
+                    "rolling_7d_rate": round(rolling_hit * 100 / rolling_settled, 1),
+                    "rolling_7d_settled": rolling_settled,
+                }
+            )
+
+        return {
+            "timeline": timeline,
+            "markets": [
+                {
+                    "market": market.value,
+                    "label": market.label_zh,
+                    "hit": markets[market.value]["hit"],
+                    "settled": markets[market.value]["settled"],
+                    "hit_rate": (
+                        round(
+                            markets[market.value]["hit"] * 100
+                            / markets[market.value]["settled"],
+                            1,
+                        )
+                        if markets[market.value]["settled"]
+                        else None
+                    ),
+                }
+                for market in MarketType
+            ],
+        }
+
     def filtered_calendar_stats(
         self,
         year: int,

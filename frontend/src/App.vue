@@ -15,6 +15,9 @@ const jumpPage = ref<number | ''>('')
 const loading = ref(true)
 const busy = ref('')
 const calendarOpen = ref(false)
+const analyticsOpen = ref(false)
+const analyticsLoading = ref(false)
+const analytics = ref<any>({ timeline: [], markets: [] })
 const settingsOpen = ref(false)
 const logsOpen = ref(false)
 const logsData = ref<any>({ items: [], total: 0 })
@@ -77,6 +80,39 @@ const legHitRate = computed(() => {
   if (!total) return '—'
   return `${(Number(summary.value.legs_hit || 0) / total * 100).toFixed(1)}%`
 })
+const chartLayout = { width: 900, height: 300, left: 54, right: 18, top: 22, bottom: 42 }
+const hitRateChart = computed(() => {
+  const items = analytics.value.timeline || []
+  const plotWidth = chartLayout.width - chartLayout.left - chartLayout.right
+  const plotHeight = chartLayout.height - chartLayout.top - chartLayout.bottom
+  const maxSettled = Math.max(1, ...items.map((item: any) => Number(item.settled || 0)))
+  const labelEvery = Math.max(1, Math.ceil(items.length / 8))
+  const points = items.map((item: any, index: number) => {
+    const x = items.length === 1
+      ? chartLayout.left + plotWidth / 2
+      : chartLayout.left + index * plotWidth / (items.length - 1)
+    return {
+      ...item,
+      x,
+      dailyY: chartLayout.top + (100 - Number(item.hit_rate)) * plotHeight / 100,
+      rollingY: chartLayout.top + (100 - Number(item.rolling_7d_rate)) * plotHeight / 100,
+      barHeight: Number(item.settled) * plotHeight / maxSettled,
+      showLabel: index === 0 || index === items.length - 1 || index % labelEvery === 0,
+      shortDate: String(item.date).slice(5),
+    }
+  })
+  const path = (key: 'dailyY' | 'rollingY') => points
+    .map((point: any, index: number) => `${index ? 'L' : 'M'}${point.x.toFixed(1)},${point[key].toFixed(1)}`)
+    .join(' ')
+  return { points, dailyPath: path('dailyY'), rollingPath: path('rollingY'), plotHeight }
+})
+const hitRateTicks = [100, 75, 50, 25, 0]
+const analyticsSampleWarning = computed(() => {
+  const small = (analytics.value.markets || [])
+    .filter((item: any) => Number(item.settled || 0) > 0 && Number(item.settled) < 20)
+    .map((item: any) => item.label)
+  return small.length ? `${small.join('、')}不足20场，当前比例波动可能较大。` : ''
+})
 const calendarTitle = computed(() => `${calendarDate.value.getFullYear()}年${calendarDate.value.getMonth() + 1}月`)
 const calendarCells = computed(() => {
   const year = calendarDate.value.getFullYear()
@@ -130,6 +166,16 @@ async function loadCalendar() {
 async function openCalendar() {
   calendarOpen.value = true
   await loadCalendar()
+}
+
+async function openAnalytics() {
+  analyticsOpen.value = true
+  analyticsLoading.value = true
+  const query = new URLSearchParams()
+  Object.entries(filters).forEach(([key, value]) => value && query.set(key, value))
+  try { analytics.value = await apiGet(`/api/v1/analytics?${query.toString()}`) }
+  catch (error) { toast((error as Error).message, 'error') }
+  finally { analyticsLoading.value = false }
 }
 
 async function moveCalendar(offset: number) {
@@ -628,7 +674,7 @@ onBeforeUnmount(() => {
       <div class="metric"><span>投入金额</span><strong>{{ money(summary.stake) }}</strong><small>已购买 {{ summary.plans_purchased || 0 }} 张</small></div>
       <div class="metric"><span>实际返还</span><strong>{{ money(summary.return) }}</strong><small>中奖 {{ summary.plans_won || 0 }} 张</small></div>
       <div class="metric"><span>净盈亏</span><strong :class="Number(summary.profit) >= 0 ? 'profit' : 'loss'">{{ money(summary.profit) }}</strong><small>未中 {{ summary.plans_lost || 0 }} 张</small></div>
-      <div class="metric"><span>单场命中率</span><strong>{{ legHitRate }}</strong><small>命中 {{ summary.legs_hit || 0 }} / {{ summary.legs_settled || 0 }} 场</small></div>
+      <div class="metric hit-rate-metric"><span>单场命中率 <button class="chart-icon" type="button" title="查看命中率趋势图" aria-label="查看命中率趋势图" @click="openAnalytics"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 16V4m0 12h14M5.5 13l3.2-3.4 2.6 2 4.2-6" /></svg></button></span><strong>{{ legHitRate }}</strong><small>命中 {{ summary.legs_hit || 0 }} / {{ summary.legs_settled || 0 }} 场</small></div>
       <div class="summary-action"><span>汇总随当前筛选实时变化</span><button :disabled="busy === 'recommend'" @click="recommend">{{ busy === 'recommend' ? '提交中…' : '生成今日推荐' }}</button></div>
     </section>
 
@@ -731,6 +777,49 @@ onBeforeUnmount(() => {
       </nav>
     </section>
   </main>
+
+  <div v-if="analyticsOpen" class="modal-layer" @click.self="analyticsOpen = false">
+    <section class="analytics-modal surface">
+      <header><div><h2>单场命中率趋势</h2><p>按推荐日期统计，数据随当前看板筛选条件变化</p></div><button class="modal-close" @click="analyticsOpen = false">×</button></header>
+      <div v-if="analyticsLoading" class="analytics-empty">正在计算图表…</div>
+      <div v-else-if="!analytics.timeline?.length" class="analytics-empty"><strong>暂无已结算单场</strong><span>完成结算后，这里会显示每日走势和各玩法对比。</span></div>
+      <div v-else class="analytics-body">
+        <section class="trend-panel">
+          <div class="chart-heading"><div><h3>命中率曲线</h3><p>柱形表示当日已结算场数，折线表示命中率</p></div><div class="chart-legend"><span class="daily">每日</span><span class="rolling">7日滚动</span><span class="sample">样本量</span></div></div>
+          <div class="chart-scroll">
+            <svg class="hit-rate-chart" :viewBox="`0 0 ${chartLayout.width} ${chartLayout.height}`" role="img" aria-label="单场命中率时间曲线">
+              <g v-for="tick in hitRateTicks" :key="tick">
+                <line class="chart-grid" :x1="chartLayout.left" :x2="chartLayout.width-chartLayout.right" :y1="chartLayout.top+(100-tick)*hitRateChart.plotHeight/100" :y2="chartLayout.top+(100-tick)*hitRateChart.plotHeight/100" />
+                <text class="chart-axis-label" :x="chartLayout.left-10" :y="chartLayout.top+(100-tick)*hitRateChart.plotHeight/100+4" text-anchor="end">{{ tick }}%</text>
+              </g>
+              <g v-for="point in hitRateChart.points" :key="point.date">
+                <rect class="sample-bar" :x="point.x-7" :y="chartLayout.top+hitRateChart.plotHeight-point.barHeight" width="14" :height="point.barHeight"><title>{{ point.date }}：{{ point.hit }}/{{ point.settled }}场命中（{{ point.hit_rate }}%）</title></rect>
+                <text v-if="point.showLabel" class="chart-date" :x="point.x" :y="chartLayout.height-13" text-anchor="middle">{{ point.shortDate }}</text>
+              </g>
+              <path v-if="hitRateChart.dailyPath" class="rate-line daily-line" :d="hitRateChart.dailyPath" />
+              <path v-if="hitRateChart.rollingPath" class="rate-line rolling-line" :d="hitRateChart.rollingPath" />
+              <g v-for="point in hitRateChart.points" :key="`dots-${point.date}`">
+                <circle class="daily-dot" :cx="point.x" :cy="point.dailyY" r="4"><title>{{ point.date }} 每日命中率 {{ point.hit_rate }}%（{{ point.hit }}/{{ point.settled }}）</title></circle>
+                <circle class="rolling-dot" :cx="point.x" :cy="point.rollingY" r="3"><title>{{ point.date }} 7日滚动命中率 {{ point.rolling_7d_rate }}%（{{ point.rolling_7d_settled }}场）</title></circle>
+              </g>
+            </svg>
+          </div>
+        </section>
+        <section class="market-panel">
+          <div class="chart-heading"><div><h3>各玩法命中率</h3><p>同一筛选范围内的横向对比</p></div></div>
+          <div class="market-bars">
+            <div v-for="item in analytics.markets" :key="item.market" class="market-row">
+              <span>{{ item.label }}</span>
+              <div class="market-track"><i :class="item.market" :style="{width:`${item.hit_rate ?? 0}%`}" /></div>
+              <b>{{ item.hit_rate === null ? '—' : `${item.hit_rate}%` }}</b>
+              <small>{{ item.hit }} / {{ item.settled }} 场</small>
+            </div>
+          </div>
+          <p class="analytics-note">7日滚动线按最近7个自然日内的已结算单场加权计算，不是每日比例的简单平均。{{ analyticsSampleWarning }}</p>
+        </section>
+      </div>
+    </section>
+  </div>
 
   <div v-if="calendarOpen" class="modal-layer" @click.self="calendarOpen = false">
     <section class="calendar-modal surface">

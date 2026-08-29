@@ -175,6 +175,26 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(leg["original_pick_code"], leg["pick_code"])
             self.assertEqual(leg["original_pick_label"], leg["pick_label"])
 
+            with self.database.connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE plan_legs
+                    SET result_status = 'final', result_home = 1, result_away = 0
+                    WHERE plan_id = ? AND position = 1
+                    """,
+                    (recommendation.plan_id,),
+                )
+            status, _, payload = self._request(
+                server,
+                "GET",
+                "/api/v1/analytics?market=CRS",
+            )
+            self.assertEqual(status, 200)
+            analytics = json.loads(payload)["data"]
+            self.assertEqual(analytics["timeline"][0]["date"], "2026-07-15")
+            self.assertEqual(analytics["markets"][0]["market"], "crs")
+            self.assertEqual(analytics["markets"][0]["settled"], 1)
+
             status, _, payload = self._request(
                 server,
                 "GET",

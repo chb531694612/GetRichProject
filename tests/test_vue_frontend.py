@@ -26,6 +26,16 @@ class VueFrontendSourceTests(unittest.TestCase):
         self.assertIn("@media(max-width:820px)", styles)
         self.assertIn("@media(max-width:520px)", styles)
 
+    def test_hit_rate_chart_opens_from_summary_and_compares_markets(self):
+        source = (ROOT / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
+        styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('aria-label="查看命中率趋势图"', source)
+        self.assertIn("/api/v1/analytics", source)
+        self.assertIn("7日滚动", source)
+        self.assertIn("各玩法命中率", source)
+        self.assertIn('class="hit-rate-chart"', source)
+        self.assertIn(".analytics-modal", styles)
+
 
 if __name__ == "__main__":
     unittest.main()

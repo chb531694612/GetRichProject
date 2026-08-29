@@ -785,6 +785,67 @@ class PaginationAndCalendarTests(unittest.TestCase):
             0,
         )
 
+    def test_filtered_hit_rate_stats_returns_timeline_rolling_rate_and_markets(self):
+        first = self._create_sent_plan(
+            plan_id="BF4-CHART-0001", business_date="2026-07-14"
+        )
+        second = self._create_sent_plan(
+            plan_id="BF4-CHART-0002", business_date="2026-07-15", day_offset=1
+        )
+        self.database.set_purchased(first.plan_id, True)
+        self.database.set_purchased(second.plan_id, True)
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', result_home = 1, result_away = 0
+                WHERE plan_id = ? AND position IN (1, 2)
+                """,
+                (first.plan_id,),
+            )
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', result_home = 0, result_away = 1
+                WHERE plan_id = ? AND position = 3
+                """,
+                (first.plan_id,),
+            )
+            connection.execute(
+                "UPDATE plans SET market = 'ttg' WHERE plan_id = ?",
+                (second.plan_id,),
+            )
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', score_code = 's1', score_label = '1',
+                    result_home = 1, result_away = 0
+                WHERE plan_id = ? AND position = 1
+                """,
+                (second.plan_id,),
+            )
+            connection.execute(
+                """
+                UPDATE plan_legs
+                SET result_status = 'final', score_code = 's3', score_label = '3',
+                    result_home = 1, result_away = 0
+                WHERE plan_id = ? AND position = 2
+                """,
+                (second.plan_id,),
+            )
+
+        stats = self.database.filtered_hit_rate_stats({"purchased": True})
+
+        self.assertEqual([item["date"] for item in stats["timeline"]], ["2026-07-14", "2026-07-15"])
+        self.assertEqual(stats["timeline"][0]["hit_rate"], 66.7)
+        self.assertEqual(stats["timeline"][1]["hit_rate"], 50.0)
+        self.assertEqual(stats["timeline"][1]["rolling_7d_rate"], 60.0)
+        by_market = {item["market"]: item for item in stats["markets"]}
+        self.assertEqual((by_market["crs"]["hit"], by_market["crs"]["settled"]), (2, 3))
+        self.assertEqual(by_market["ttg"]["hit_rate"], 50.0)
+        self.assertIsNone(by_market["had"]["hit_rate"])
+        self.assertEqual(self.database.filtered_hit_rate_stats({"purchased": False})["timeline"], [])
+
     def test_set_purchased_and_ticket_image_roundtrip(self):
         rec = self._create_sent_plan()
         plan = self.database.get_plan(rec.plan_id)

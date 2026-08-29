@@ -474,6 +474,11 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertNotIn("胆量", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("爆冷分析要求", DEFAULT_PLAN_REQUIREMENTS)
         self.assertIn("冷门风险", DEFAULT_SUMMARY_REQUIREMENTS)
+        self.assertIn("不得强行推荐冷门", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("不能机械比较信号数量", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertNotIn("爆冷信号多于顺势信号", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("进球数玩法专项要求", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("总进球逐场分布", DEFAULT_SUMMARY_REQUIREMENTS)
 
     def test_prompt_overrides_replace_default_requirements(self):
         self.addCleanup(set_prompt_overrides)
