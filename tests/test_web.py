@@ -1301,7 +1301,13 @@ class NewFeatureTests(unittest.TestCase):
 
     def test_queue_settle_plan_already_settled(self):
         rec = self._create_sent_plan()
-        # Settle the plan first
+        # Fully settle the plan: mark every leg FINAL so no PENDING legs remain.
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        leg_results = tuple(
+            MatchResult(leg.match_id, ResultStatus.FINAL, 1, 0)
+            for leg in plan.legs
+        )
         settlement = Settlement(
             plan_id=rec.plan_id,
             status=PlanStatus.WON,
@@ -1310,7 +1316,7 @@ class NewFeatureTests(unittest.TestCase):
             tax=Decimal("0"),
             net_prize=Decimal("100"),
             net_profit=Decimal("98"),
-            leg_results=(),
+            leg_results=leg_results,
         )
         self.database.settle_plan_with_mail(
             settlement,
@@ -1329,6 +1335,41 @@ class NewFeatureTests(unittest.TestCase):
         level, detail = app.queue_settle_plan(rec.plan_id)
         self.assertEqual(level, "warn")
         self.assertIn("已结算", detail)
+
+    def test_queue_settle_plan_allows_settled_plan_with_pending_legs(self):
+        """A settled (e.g. early-loss) plan with PENDING legs can be re-queued."""
+        rec = self._create_sent_plan()
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        # Settle early as LOST with only the first leg final; legs 1-3 stay PENDING.
+        settlement = Settlement(
+            plan_id=rec.plan_id,
+            status=PlanStatus.LOST,
+            settled_at=self.now,
+            gross_prize=Decimal("0"),
+            tax=Decimal("0"),
+            net_prize=Decimal("0"),
+            net_profit=Decimal("-2"),
+            leg_results=(MatchResult(plan.legs[0].match_id, ResultStatus.FINAL, 0, 0),),
+        )
+        self.database.settle_plan_with_mail(
+            settlement,
+            subject="lost",
+            text_body="lost",
+            html_body="lost",
+        )
+        called: list[str] = []
+        app = DashboardApplication(
+            self.settings,
+            self.database,
+            self._trigger,
+            secret=b"settle-pending-secret" * 2,
+            trigger_settle_plan=lambda plan_id: (called.append(plan_id) or ("ok", "done")),
+        )
+        level, detail = app.queue_settle_plan(rec.plan_id)
+        self.assertEqual(level, "ok")
+        self._wait_for(lambda: called == [rec.plan_id])
+        self.assertIn("已提交后台", detail)
 
     def test_queue_settle_plan_allows_void_plan_recheck(self):
         rec = self._create_sent_plan()

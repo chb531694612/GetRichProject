@@ -7,6 +7,7 @@ from decimal import Decimal
 from threading import Lock
 from typing import Callable
 
+from .ai_analyzer import query_results_via_ai
 from .config import Settings
 from .database import Database, StoredPlan
 from .domain import MarketType, MatchResult, PlanStatus, ResultStatus, Settlement
@@ -539,15 +540,30 @@ class ScoreFourfoldService:
             html_body=html_body,
         )
 
+    def _active_ai_runtime(self):
+        """Resolve the currently enabled AI runtime, or None when unavailable."""
+        if self.settings_repository is None:
+            return None
+        try:
+            return self.settings_repository.active_model_runtime()
+        except ValueError:
+            return None
+
     def settle_plan(self, plan_id: str, now: datetime | None = None) -> JobOutcome:
-        """Update and settle exactly one plan, with an official-page fallback."""
+        """Update and settle exactly one plan, with official-page and AI fallbacks.
+
+        A plan that is already settled (e.g. early-loss) is still accepted as
+        long as it has PENDING legs; those legs are filled in without re-settling.
+        """
         self.refresh_runtime_settings()
         wall_now = (now or self.now()).astimezone(self.settings.timezone)
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return JobOutcome("missing", f"计划 {plan_id} 不存在")
-        if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}:
-            return JobOutcome("duplicate", f"计划 {plan_id} 已结算，无需重复更新")
+        has_pending_legs = any(leg.result_status is ResultStatus.PENDING for leg in plan.legs)
+        already_settled = plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}
+        if already_settled and not has_pending_legs:
+            return JobOutcome("duplicate", f"计划 {plan_id} 已结算且无待定场次，无需重复更新")
 
         self.database.add_log("settle", f"开始结算计划{plan_id}", f"{len(plan.legs)}场比赛")
         start_date = min(leg.start_at.date() for leg in plan.legs)
@@ -606,26 +622,77 @@ class ScoreFourfoldService:
                 relevant[effective_id] = results[effective_id]
         if relevant:
             self.database.update_leg_results(plan_id, relevant)
-        else:
+
+        # AI fallback: for legs still PENDING after the fetched data, ask the AI
+        # (with mandatory web search) for their final result.
+        refreshed = self.database.get_plan(plan_id)
+        if refreshed is None:
+            return JobOutcome("missing", f"计划 {plan_id} 已不存在")
+        ai_count = 0
+        pending_after_fetch = [leg for leg in refreshed.legs if leg.result_status is ResultStatus.PENDING]
+        if pending_after_fetch:
+            runtime = self._active_ai_runtime()
+            if runtime is not None or self.settings.qwen_api_key:
+                ai_results = query_results_via_ai(pending_after_fetch, self.settings, runtime)
+                if ai_results:
+                    self.database.update_leg_results(plan_id, ai_results)
+                    ai_count = len(ai_results)
+                    self.database.add_log(
+                        "settle",
+                        f"计划{plan_id}通过AI联网查询更新{ai_count}场赛果",
+                        "、".join(ai_results.keys()),
+                    )
+                    refreshed = self.database.get_plan(plan_id)
+                    if refreshed is None:
+                        return JobOutcome("missing", f"计划 {plan_id} 已不存在")
+
+        updated_total = len(relevant) + ai_count
+        if already_settled:
+            # Already settled (e.g. early-loss): only fill remaining legs.
+            unresolved = [
+                leg.match_num or leg.match_id
+                for leg in refreshed.legs
+                if leg.result_status is ResultStatus.PENDING
+            ]
+            if updated_total == 0:
+                detail = f"计划 {plan_id} 未取得任何新赛果，请稍后重试"
+                if primary_error:
+                    detail += "；官方赛果接口暂时不可用"
+                self.database.add_log("settle", f"计划{plan_id}未取得新赛果", detail)
+                return JobOutcome("missing-results", detail)
+            if unresolved:
+                detail = (
+                    f"计划 {plan_id} 已更新 {updated_total} 场赛果，仍有 {len(unresolved)} 场未公布："
+                    + "、".join(unresolved)
+                )
+                self.database.add_log("settle", f"计划{plan_id}仍有{len(unresolved)}场未公布", detail)
+                return JobOutcome("partial", detail)
+            detail = f"计划 {plan_id} 已补齐 {updated_total} 场赛果（计划已结算，状态不变）"
+            self.database.add_log("settle", f"计划{plan_id}赛果已补齐", detail)
+            return JobOutcome("ok", detail)
+
+        if updated_total == 0:
             detail = f"计划 {plan_id} 未取得任何新赛果，请稍后重试"
             if primary_error:
                 detail += "；官方赛果接口暂时不可用"
             self.database.add_log("settle", f"计划{plan_id}未取得新赛果", detail)
             return JobOutcome("missing-results", detail)
 
-        refreshed = self.database.get_plan(plan_id)
-        if refreshed is None:
-            return JobOutcome("missing", f"计划 {plan_id} 已不存在")
         # Try settlement even when some legs are still PENDING — early loss
         # detection in _build_settlement may settle the plan as LOST immediately.
         created = self._store_settlement(refreshed, wall_now)
         if created:
             final_plan = self.database.get_plan(plan_id)
             if final_plan is not None and final_plan.status is not PlanStatus.PENDING:
-                source_note = f"，其中官网详情兜底 {fallback_count} 场" if fallback_count else ""
+                notes = []
+                if fallback_count:
+                    notes.append(f"官网详情兜底 {fallback_count} 场")
+                if ai_count:
+                    notes.append(f"AI联网查询 {ai_count} 场")
+                source_note = f"，其中{'、'.join(notes)}" if notes else ""
                 early = "（提前loss结算）" if any(leg.result_status == ResultStatus.PENDING for leg in refreshed.legs) else ""
                 self.database.add_log("settle", f"计划{plan_id}结算完成{early}", f"状态: {final_plan.status.value}{source_note}")
-                return JobOutcome("ok", f"计划 {plan_id} 已更新 {len(relevant)} 场并完成结算{source_note}，状态：{final_plan.status.value}")
+                return JobOutcome("ok", f"计划 {plan_id} 已更新 {updated_total} 场并完成结算{source_note}，状态：{final_plan.status.value}")
         unresolved = [
             leg.match_num or leg.match_id
             for leg in refreshed.legs
@@ -633,13 +700,13 @@ class ScoreFourfoldService:
         ]
         if unresolved:
             detail = (
-                f"计划 {plan_id} 已更新 {len(relevant)} 场，仍有 {len(unresolved)} 场未公布："
+                f"计划 {plan_id} 已更新 {updated_total} 场，仍有 {len(unresolved)} 场未公布："
                 + "、".join(unresolved)
             )
-            if primary_error and not relevant:
+            if primary_error and updated_total == 0:
                 detail += "；官方赛果接口暂时不可用"
             self.database.add_log("settle", f"计划{plan_id}仍有{len(unresolved)}场未公布", detail)
-            return JobOutcome("partial" if relevant else "missing-results", detail)
+            return JobOutcome("partial" if updated_total else "missing-results", detail)
         self.database.add_log("settle", f"计划{plan_id}结算写入失败")
         return JobOutcome("error", f"计划 {plan_id} 赛果已更新，但结算写入失败")
 

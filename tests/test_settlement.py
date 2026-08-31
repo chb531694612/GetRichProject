@@ -761,6 +761,108 @@ class DelayedSettlementTests(unittest.TestCase):
         for leg in plan.legs:
             self.assertTrue(leg.match_id.startswith("NEW-"))
 
+    def test_settle_plan_updates_settled_plan_with_pending_legs(self):
+        """A plan settled early as LOST with remaining PENDING legs can still
+        have those legs filled in via the per-plan settle action."""
+        # First: early-loss settlement leaves legs 1-3 pending.
+        provider1 = _FakeResultProvider(
+            {self.matches[0].match_id: MatchResult(self.matches[0].match_id, ResultStatus.FINAL, 0, 0)}
+        )
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome1 = self._service(provider1).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome1.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.LOST)
+
+        # Second: per-plan settle now fills the remaining legs without re-settling.
+        provider2 = _FakeResultProvider(
+            {
+                self.matches[i].match_id: MatchResult(self.matches[i].match_id, ResultStatus.FINAL, 1, 0)
+                for i in (1, 2, 3)
+            }
+        )
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ):
+            outcome2 = self._service(provider2).settle_plan(
+                self.recommendation.plan_id,
+                settle_at + timedelta(minutes=5),
+            )
+        self.assertEqual(outcome2.status, "ok")
+        self.assertIn("已补齐 3 场赛果", outcome2.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        # Still LOST (early loss is final), but every leg now has a result.
+        self.assertEqual(plan.status, PlanStatus.LOST)
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.FINAL)
+
+    def test_settle_plan_rejects_fully_settled_plan_without_pending_legs(self):
+        """A fully-settled plan with no PENDING legs is rejected as duplicate."""
+        provider = _FakeResultProvider(
+            {
+                match.match_id: MatchResult(match.match_id, ResultStatus.FINAL, 1, 0)
+                for match in self.matches
+            }
+        )
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle_plan(self.recommendation.plan_id, settle_at)
+        self.assertEqual(outcome.status, "ok")
+        # Second call: everything is FINAL, no PENDING legs left.
+        outcome2 = self._service(provider).settle_plan(self.recommendation.plan_id, settle_at)
+        self.assertEqual(outcome2.status, "duplicate")
+
+    def test_settle_plan_ai_fallback_fills_missing_results(self):
+        """When the fetched data can't update results, settle_plan asks the AI
+        (mandatory web search) for the final scores and updates the legs."""
+        settings = replace(self.settings, qwen_api_key="secret")
+        provider = _FakeResultProvider({})
+        ai_results = {
+            match.match_id: MatchResult(
+                match.match_id, ResultStatus.FINAL, 1, 0, official_status="AI联网确认"
+            )
+            for match in self.matches
+        }
+        service = ScoreFourfoldService(settings, self.database, provider, self.mailer)
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ), patch(
+            "score_fourfold.service.query_results_via_ai",
+            return_value=ai_results,
+        ) as ai_mock:
+            outcome = service.settle_plan(self.recommendation.plan_id, settle_at)
+
+        self.assertEqual(outcome.status, "ok")
+        self.assertIn("AI联网查询 4 场", outcome.detail)
+        # The AI fallback was asked about all four still-pending legs.
+        self.assertEqual(len(ai_mock.call_args.args[0]), 4)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, PlanStatus.WON)
+        for leg in plan.legs:
+            self.assertEqual(leg.result_status, ResultStatus.FINAL)
+            self.assertEqual(leg.official_status, "AI联网确认")
+
+    def test_settle_plan_ai_fallback_not_triggered_without_ai_config(self):
+        """Without any AI configuration, settle_plan skips the AI fallback."""
+        provider = _FakeResultProvider({})
+        settle_at = max(m.start_at for m in self.matches) + timedelta(hours=1)
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ), patch(
+            "score_fourfold.service.query_results_via_ai",
+        ) as ai_mock:
+            outcome = self._service(provider).settle_plan(
+                self.recommendation.plan_id, settle_at
+            )
+        ai_mock.assert_not_called()
+        self.assertEqual(outcome.status, "missing-results")
+
 
 if __name__ == "__main__":
     unittest.main()

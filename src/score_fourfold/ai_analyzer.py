@@ -16,7 +16,7 @@ from .ai_models import (
     prompt_overrides,
 )
 from .config import Settings
-from .domain import MarketType, ScoreOption
+from .domain import MarketType, MatchResult, ResultStatus, ScoreOption
 
 LOGGER = logging.getLogger(__name__)
 
@@ -526,3 +526,128 @@ def analyze_plan_from_leg_data(
             )
             prompt = _plan_format_retry_prompt(prompt, exc)
     raise AssertionError("unreachable")
+
+
+def _build_result_query_prompt(legs: Sequence[Any]) -> str:
+    """Build the prompt for an AI lookup of already-finished match results."""
+    lines = [
+        "你是一名足球赛果核查员。请对下面每场比赛联网搜索，确认其官方全场最终比分。",
+        "只允许报告已经结束并已官方确认的全场最终比分（含伤停补时，不含加时赛和点球大战）。",
+        "对每场比赛：",
+        "- 优先核对赛事官方、足协、俱乐部，以及 Sofascore、Flashscore、Soccerway、雷速体育、懂球帝、直播吧等权威数据平台；",
+        "- 用多个相互独立的来源交叉验证后再确认；",
+        "- 如果比赛尚未开始、正在进行、延期、取消或搜索不到可靠赛果，status 必须填 unknown，home_score 与 away_score 填 0，严禁猜测比分。",
+        "",
+        "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的任何文字。格式必须为：",
+        '{"results":[{"match_id":"原样返回","status":"final 或 unknown","home_score":0,"away_score":0,"note":"简短说明"}]}',
+        "",
+        "status 取值：final 表示已确认官方全场最终比分；unknown 表示无法确定（未开始/进行中/延期/取消/查不到）。",
+        "home_score 与 away_score 仅在 status=final 时填写非负整数，否则一律填 0。",
+        "",
+        "比赛列表（时间均为北京时间）：",
+    ]
+    for leg in legs:
+        lines.append(
+            f"- match_id={leg.match_id} | 比赛编号={leg.match_num} | 比赛日期={leg.business_date} | "
+            f"{leg.league} | {leg.home} vs {leg.away} | 开赛={leg.start_at.strftime('%Y-%m-%d %H:%M')}"
+        )
+    return "\n".join(lines)
+
+
+def _parse_result_query(content: str, legs: Sequence[Any]) -> dict[str, MatchResult]:
+    """Parse the AI result-query response into validated ``MatchResult`` objects.
+
+    Only legs the AI confirms as ``final`` with plausible scores are returned;
+    unknown, malformed, out-of-range and unknown-match entries are skipped.
+    """
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        first_newline = cleaned.find("\n")
+        cleaned = cleaned[first_newline + 1 :] if first_newline >= 0 else ""
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3].rstrip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise AIAnalysisError("AI result query response is not a JSON object")
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise AIAnalysisError("AI result query response contains invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AIAnalysisError("AI result query response must be a JSON object")
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        raise AIAnalysisError("AI result query response is missing results")
+
+    legs_by_id = {str(leg.match_id): leg for leg in legs}
+    results: dict[str, MatchResult] = {}
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        match_id = str(item.get("match_id", "")).strip()
+        if match_id not in legs_by_id:
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status != "final":
+            continue
+        home = item.get("home_score")
+        away = item.get("away_score")
+        if isinstance(home, bool) or isinstance(away, bool):
+            continue
+        if not isinstance(home, int) or not isinstance(away, int):
+            try:
+                home = int(home)
+                away = int(away)
+            except (TypeError, ValueError):
+                continue
+        if home < 0 or away < 0 or home > 30 or away > 30:
+            continue
+        leg = legs_by_id[match_id]
+        results[match_id] = MatchResult(
+            match_id=match_id,
+            status=ResultStatus.FINAL,
+            home_score=home,
+            away_score=away,
+            official_status="AI联网确认",
+            home_team=leg.home,
+            away_team=leg.away,
+            match_num=getattr(leg, "match_num", ""),
+            match_date=getattr(leg, "business_date", ""),
+        )
+    return results
+
+
+def query_results_via_ai(
+    legs: Sequence[Any],
+    settings: Settings,
+    runtime: AIModelRuntime | None = None,
+) -> dict[str, MatchResult]:
+    """Query the AI (with mandatory web search) for final match results.
+
+    Returns a mapping of ``match_id -> MatchResult`` for every leg the AI could
+    confirm as FINAL; legs the AI could not confirm are omitted.  Never raises:
+    a failed query simply yields no results, so the caller falls back to its
+    existing "still pending" reporting.
+    """
+    if not legs:
+        return {}
+    prompt = _build_result_query_prompt(legs)
+    try:
+        if runtime is not None:
+            content = call_with_web_search(
+                runtime,
+                prompt,
+                timeout_seconds=settings.ai_http_timeout_seconds,
+                max_output_tokens=4096,
+            )
+        else:
+            content = _qwen_response(prompt, settings, max_tokens=4096)
+    except (AIAnalysisError, AIModelError) as exc:
+        LOGGER.warning("AI result query failed: %s", exc)
+        return {}
+    try:
+        return _parse_result_query(content, legs)
+    except AIAnalysisError as exc:
+        LOGGER.warning("AI result query response could not be parsed: %s", exc)
+        return {}

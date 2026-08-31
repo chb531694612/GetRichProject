@@ -17,12 +17,15 @@ from score_fourfold.ai_analyzer import (
     analyze_plan_from_leg_data,
     probe_qwen,
     qwen_analyze,
+    query_results_via_ai,
+    _build_result_query_prompt,
+    _parse_result_query,
 )
 from score_fourfold.ai_models import (
     DEFAULT_SYSTEM_PROMPT,
     set_prompt_overrides,
 )
-from score_fourfold.domain import MarketType, ScoreOption
+from score_fourfold.domain import MarketType, ResultStatus, ScoreOption
 
 from .helpers import make_settings
 
@@ -533,6 +536,97 @@ class AIAnalyzerTests(unittest.TestCase):
         prompt = payload["input"][1]["content"]
         self.assertIn("自定义总结要求QRS", prompt)
         self.assertNotIn("空泛套话", prompt)
+
+    # --- 联网查赛果（结算兜底） ---
+
+    @staticmethod
+    def _result_legs():
+        return [
+            SimpleNamespace(
+                match_id="1001",
+                match_num="周二001",
+                business_date="2026-07-22",
+                league="测试联赛",
+                home="主队1",
+                away="客队1",
+                start_at=datetime(2026, 7, 22, 20, 0),
+            ),
+            SimpleNamespace(
+                match_id="1002",
+                match_num="周二002",
+                business_date="2026-07-22",
+                league="测试联赛",
+                home="主队2",
+                away="客队2",
+                start_at=datetime(2026, 7, 22, 21, 30),
+            ),
+        ]
+
+    def test_result_query_prompt_only_sends_basic_fixture_info(self):
+        legs = self._result_legs()
+        prompt = _build_result_query_prompt(legs)
+        self.assertIn("match_id=1001", prompt)
+        self.assertIn("周二002", prompt)
+        self.assertIn("主队1 vs 客队1", prompt)
+        self.assertIn("北京时间", prompt)
+        # 只允许发送编号/日期/联赛/球队/开赛时间，绝不能带赔率或概率。
+        self.assertNotIn("赔率", prompt)
+        self.assertNotIn("odds", prompt)
+        self.assertNotIn("probability", prompt)
+
+    def test_parse_result_query_returns_final_and_skips_unknown(self):
+        content = json.dumps(
+            {
+                "results": [
+                    {"match_id": "1001", "status": "final", "home_score": 2, "away_score": 1},
+                    {"match_id": "1002", "status": "unknown", "home_score": 0, "away_score": 0},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        results = _parse_result_query(content, self._result_legs())
+        self.assertEqual(set(results), {"1001"})
+        result = results["1001"]
+        self.assertEqual(result.status, ResultStatus.FINAL)
+        self.assertEqual(result.home_score, 2)
+        self.assertEqual(result.away_score, 1)
+        self.assertEqual(result.official_status, "AI联网确认")
+        self.assertEqual(result.home_team, "主队1")
+
+    def test_parse_result_query_rejects_bad_scores_and_unknown_ids(self):
+        content = json.dumps(
+            {
+                "results": [
+                    {"match_id": "1001", "status": "final", "home_score": 99, "away_score": 1},
+                    {"match_id": "9999", "status": "final", "home_score": 1, "away_score": 0},
+                    {"match_id": "1002", "status": "final", "home_score": -1, "away_score": 0},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        self.assertEqual(_parse_result_query(content, self._result_legs()), {})
+
+    def test_query_results_via_ai_never_raises_on_ai_failure(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        with patch(
+            "score_fourfold.ai_analyzer._qwen_response",
+            side_effect=AIAnalysisError("boom"),
+        ):
+            self.assertEqual(
+                query_results_via_ai(self._result_legs(), settings, runtime=None),
+                {},
+            )
+
+    def test_query_results_via_ai_never_raises_on_invalid_json(self):
+        settings = make_settings(Path("data"), qwen_api_key="secret")
+        with patch(
+            "score_fourfold.ai_analyzer._qwen_response",
+            return_value="这不是 JSON",
+        ):
+            self.assertEqual(
+                query_results_via_ai(self._result_legs(), settings, runtime=None),
+                {},
+            )
 
 
 if __name__ == "__main__":

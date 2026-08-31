@@ -24,7 +24,7 @@ from .config import Settings
 from .ai_analyzer import AIAnalysisError, analyze_plan_from_leg_data
 from .api import DashboardAPI, serialize_plan
 from .database import Database, StoredPlan
-from .domain import MarketType, PlanStatus
+from .domain import MarketType, PlanStatus, ResultStatus
 from .mail import render_stored_recommendation
 from .settings_store import SettingsRepository
 
@@ -469,8 +469,9 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
-        if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID}:
-            return ("warn", f"计划 {plan_id} 已结算，无需重复更新")
+        has_pending_legs = any(leg.result_status is ResultStatus.PENDING for leg in plan.legs)
+        if plan.status not in {PlanStatus.PENDING, PlanStatus.VOID} and not has_pending_legs:
+            return ("warn", f"计划 {plan_id} 已结算且无待定场次，无需重复更新")
         if self.trigger_settle_plan is None:
             return ("warn", "赛果手动更新未配置")
         started_at = self.now()
