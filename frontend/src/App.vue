@@ -592,6 +592,10 @@ function pendingHint(leg: any): string {
   if (ageH < 48) return `官方未公布 · 已过 ${ageH}h`
   return `官方未公布 · 已过 ${ageH / 24 | 0}d`
 }
+function hasPendingLegs(plan: any): boolean {
+  if (!plan || !Array.isArray(plan.legs)) return false
+  return plan.legs.some((leg: any) => leg && leg.result && leg.result.status === 'pending')
+}
 function formatResult(market: string, result: any) {
   if (result.status === 'pending') return '待公布'
   if (result.status === 'void') return '比赛无效'
@@ -726,7 +730,7 @@ onBeforeUnmount(() => {
           </div>
           <footer class="plan-actions">
             <div class="action-bar">
-              <button class="soft" :disabled="busy === `settle-${plan.plan_id}` || !['pending','void'].includes(plan.status)" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : '更新本计划赛果' }}</button>
+              <button class="soft" :disabled="busy === `settle-${plan.plan_id}` || (!['pending','void'].includes(plan.status) && !hasPendingLegs(plan))" :title="!['pending','void'].includes(plan.status) && hasPendingLegs(plan) ? '该计划已结算但仍有待定场次，可继续更新' : ''" @click="action('/api/v1/actions/settle-plan',{plan_id:plan.plan_id},`settle-${plan.plan_id}`)">{{ plan.status === 'void' ? '重新获取赛果' : (plan.status !== 'pending' && hasPendingLegs(plan) ? '补齐赛果' : '更新本计划赛果') }}</button>
               <button class="soft" @click="action('/api/v1/actions/analyze-plan',{plan_id:plan.plan_id},`ai-${plan.plan_id}`)">AI分析</button>
               <button class="screenshot-button" @click="screenshotPlan(plan).catch((error) => toast(`截图失败：${error.message}`, 'error'))">一键截图推荐</button>
               <button class="soft" @click="action('/api/v1/actions/mark-purchased',{plan_id:plan.plan_id,purchased:!plan.purchased},`buy-${plan.plan_id}`)">{{ plan.purchased ? '取消购买' : '标记购买' }}</button>
