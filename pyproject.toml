@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary - personal use" }
 authors = [{ name = "GetRichProject" }]
-dependencies = ["cryptography>=44,<50"]
+dependencies = ["cryptography>=44,<50", "Pillow>=11,<13"]
 
 [project.scripts]
 score-fourfold = "score_fourfold.cli:main"

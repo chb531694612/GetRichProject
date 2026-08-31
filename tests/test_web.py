@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gzip
 import http.client
+import io
 import json
 import re
+import shutil
 import threading
 import time
 import unittest
@@ -24,6 +26,7 @@ from score_fourfold.mail import Mailer, flush_outbox, render_recommendation, ren
 from score_fourfold.scheduler import slot_job_name
 from score_fourfold.service import ScoreFourfoldService
 from score_fourfold.web import DashboardApplication, DashboardServer
+from score_fourfold.api import serialize_plan
 
 from .helpers import make_match, make_recommendation, make_settings
 
@@ -1020,11 +1023,10 @@ class NewFeatureTests(unittest.TestCase):
             for child in self.preview.iterdir():
                 child.unlink()
             self.preview.rmdir()
+        # rmtree because ticket-images now also holds a thumbs/ subdirectory.
         ticket_dir = self.root / "ticket-images"
         if ticket_dir.exists():
-            for child in ticket_dir.iterdir():
-                child.unlink()
-            ticket_dir.rmdir()
+            shutil.rmtree(ticket_dir)
 
     def _trigger(self, request_id: str) -> tuple[str, str]:
         self.triggered.append(request_id)
@@ -1192,6 +1194,85 @@ class NewFeatureTests(unittest.TestCase):
         plan = self.database.get_plan(rec.plan_id)
         assert plan is not None
         self.assertEqual(plan.ticket_image, f"{rec.plan_id}.png")
+
+    # --- ticket thumbnails (list must never download the full photo) ---
+
+    def _real_jpeg(self, width: int = 1200, height: int = 900) -> bytes:
+        """A genuinely decodable JPEG; the upload tests above use stub bytes."""
+        try:
+            from PIL import Image
+        except ImportError:  # pragma: no cover
+            self.skipTest("Pillow is required for thumbnail tests")
+        buffer = io.BytesIO()
+        Image.effect_noise((width, height), 48).convert("RGB").save(buffer, "JPEG", quality=90)
+        return buffer.getvalue()
+
+    def _get(self, path: str) -> tuple[int, dict[str, str], bytes]:
+        server = DashboardServer(self.settings, self.application)
+        server.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.address[1], timeout=5)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            status = response.status
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            payload = response.read()
+            connection.close()
+        finally:
+            server.stop()
+        return status, headers, payload
+
+    def test_upload_ticket_pregenerates_thumbnail(self):
+        rec = self._create_sent_plan()
+        jpeg = self._real_jpeg()
+        level, _ = self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", jpeg)
+        self.assertEqual(level, "ok")
+        thumb = Path(self.settings.ticket_image_dir) / "thumbs" / f"{rec.plan_id}.jpg"
+        self.assertTrue(thumb.is_file(), "上传时应预生成缩略图，避免首次浏览付费")
+        self.assertLess(thumb.stat().st_size, len(jpeg) // 4)
+
+    def test_serve_ticket_thumbnail_returns_downscaled_image(self):
+        rec = self._create_sent_plan()
+        jpeg = self._real_jpeg()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", jpeg)
+        status, headers, payload = self._get(f"/tickets/thumbs/{rec.plan_id}.jpg")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"), "image/jpeg")
+        self.assertLess(len(payload), len(jpeg) // 4, "缩略图路由不能返回原图")
+
+    def test_serve_ticket_full_image_is_unchanged(self):
+        rec = self._create_sent_plan()
+        jpeg = self._real_jpeg()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", jpeg)
+        status, headers, payload = self._get(f"/tickets/{rec.plan_id}.jpg")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"), "image/jpeg")
+        self.assertEqual(payload, jpeg, "放大查看必须拿到完整原图")
+
+    def test_serve_ticket_thumbnail_falls_back_to_original_when_undecodable(self):
+        """A broken upload must still render rather than show a broken image."""
+        rec = self._create_sent_plan()
+        broken = b"\xff\xd8\xff" + b"\x00" * 120
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", broken)
+        status, headers, payload = self._get(f"/tickets/thumbs/{rec.plan_id}.jpg")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, broken, "无法生成缩略图时应回退到原图")
+
+    def test_serve_ticket_rejects_unsafe_names(self):
+        rec = self._create_sent_plan()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg())
+        for path in ("/tickets/../secret.jpg", "/tickets/thumbs/..%2f..%2fetc%2fpasswd"):
+            status, _, _ = self._get(path)
+            self.assertEqual(status, 404, f"应拒绝非法路径 {path}")
+
+    def test_serialize_plan_exposes_thumbnail_and_full_urls(self):
+        rec = self._create_sent_plan()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg())
+        plan = self.database.get_plan(rec.plan_id)
+        assert plan is not None
+        payload = serialize_plan(plan)
+        self.assertEqual(payload["ticket_image_url"], f"/tickets/{rec.plan_id}.jpg")
+        self.assertEqual(payload["ticket_thumb_url"], f"/tickets/thumbs/{rec.plan_id}.jpg")
 
     # --- manual settle ---
 

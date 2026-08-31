@@ -27,6 +27,7 @@ from .database import Database, StoredPlan
 from .domain import MarketType, PlanStatus, ResultStatus
 from .mail import render_stored_recommendation
 from .settings_store import SettingsRepository
+from .thumbnails import ensure_thumbnail, thumb_dir, thumb_name
 
 
 LOGGER = logging.getLogger("score_fourfold.web")
@@ -40,6 +41,12 @@ LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 5
 MAX_LOGIN_CLIENTS = 1024
 MAX_SESSIONS = 128
+TICKET_IMAGE_TYPES = {
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 LOGIN_STYLE = """
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#172033;background:#f4f6f9;--blue:#246bfd;--muted:#667085;--line:#e4e9f0;--card:#fff}
@@ -544,6 +551,9 @@ class DashboardApplication:
         self.ticket_image_dir.mkdir(parents=True, exist_ok=True)
         image_path = self.ticket_image_dir / safe_name
         image_path.write_bytes(data)
+        # Pre-generate the thumbnail so the dashboard list never pays for it on
+        # first render; on-demand generation still covers older images.
+        ensure_thumbnail(image_path, thumb_dir(self.ticket_image_dir) / thumb_name(safe_name))
         if self.database.set_ticket_image(plan_id, safe_name):
             return ("ok", f"实票图片已上传并标记购买计划 {plan_id}")
         return ("error", f"保存计划 {plan_id} 的实票图片失败")
@@ -1469,8 +1479,14 @@ def build_handler(application: DashboardApplication):
                 return None
             return {name: form[name][0] for name in names}
 
-        def _serve_ticket_image(self, filename: str) -> None:
-            """Serve a ticket image file from the configured directory."""
+        def _serve_ticket_image(self, filename: str, *, thumbnail: bool = False) -> None:
+            """Serve a ticket image file from the configured directory.
+
+            With ``thumbnail`` a downscaled JPEG is generated on demand and
+            cached on disk, so the dashboard list never downloads the
+            full-size phone photos. If no thumbnail can be produced the
+            original is served instead rather than showing a broken image.
+            """
             safe_pattern = re.compile(r"^[A-Za-z0-9_\-]+\.(jpg|png|gif|webp)$")
             if not safe_pattern.fullmatch(filename):
                 self._send(404, "<h1>404</h1>")
@@ -1479,19 +1495,22 @@ def build_handler(application: DashboardApplication):
             if not image_path.is_file():
                 self._send(404, "<h1>404</h1>")
                 return
-            ext = filename.rsplit(".", 1)[-1].lower()
-            content_types = {
-                "jpg": "image/jpeg",
-                "png": "image/png",
-                "gif": "image/gif",
-                "webp": "image/webp",
-            }
-            content_type = content_types.get(ext, "application/octet-stream")
-            try:
-                data = image_path.read_bytes()
-            except OSError:
-                self._send(404, "<h1>404</h1>")
-                return
+            content_type = "image/jpeg"
+            data: bytes | None = None
+            if thumbnail:
+                data = ensure_thumbnail(
+                    image_path,
+                    thumb_dir(application.ticket_image_dir) / thumb_name(filename),
+                )
+            if data is None:
+                content_type = TICKET_IMAGE_TYPES.get(
+                    filename.rsplit(".", 1)[-1].lower(), "application/octet-stream"
+                )
+                try:
+                    data = image_path.read_bytes()
+                except OSError:
+                    self._send(404, "<h1>404</h1>")
+                    return
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
@@ -1598,7 +1617,11 @@ def build_handler(application: DashboardApplication):
                 if not self._serve_dashboard_file(parsed.path.lstrip("/")):
                     self._send(404, "<h1>404</h1>")
                 return
-            # Serve ticket images
+            # Serve ticket images. The thumbnail route is matched first because
+            # the plain /tickets/ prefix would otherwise swallow it.
+            if parsed.path.startswith("/tickets/thumbs/"):
+                self._serve_ticket_image(parsed.path[len("/tickets/thumbs/"):], thumbnail=True)
+                return
             if parsed.path.startswith("/tickets/"):
                 self._serve_ticket_image(parsed.path[len("/tickets/"):])
                 return

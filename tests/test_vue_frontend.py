@@ -13,6 +13,16 @@ class VueFrontendSourceTests(unittest.TestCase):
         self.assertIn("handlePaste", source)
         self.assertIn("手机可选相册或拍照", source)
 
+    def test_ticket_list_uses_thumbnail_and_zoom_loads_full_image(self):
+        """The list may only request thumbnails; the full photo loads on zoom."""
+        source = (ROOT / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
+        self.assertIn("plan.ticket_thumb_url || plan.ticket_image_url", source)
+        self.assertIn("openTicketZoom", source)
+        # The lightbox tells the user the big photo is still downloading.
+        self.assertIn('class="zoom-loading"', source)
+        # The list thumbnail must not point straight at the full-size route.
+        self.assertNotIn('class="ticket-thumb" :src="plan.ticket_image_url"', source)
+
     def test_recommendation_screenshot_copies_or_downloads_png(self):
         source = (ROOT / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
         self.assertIn("async function screenshotPlan", source)

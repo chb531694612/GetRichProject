@@ -281,6 +281,21 @@ async function deletePlan(plan: any) {
 
 const pendingUploadPlan = ref<any>(null)
 const ticketZoomUrl = ref<string>('')
+const ticketZoomLoaded = ref(false)
+const ticketZoomFailed = ref(false)
+// The list always renders the cached thumbnail; the full-size photo is only
+// requested once the lightbox opens, which keeps the dashboard light on a
+// slow link.
+function openTicketZoom(plan: any) {
+  ticketZoomUrl.value = plan.ticket_image_url || ''
+  ticketZoomLoaded.value = false
+  ticketZoomFailed.value = false
+}
+function closeTicketZoom() {
+  ticketZoomUrl.value = ''
+  ticketZoomLoaded.value = false
+  ticketZoomFailed.value = false
+}
 function pickTicket(plan: any) {
   pendingUploadPlan.value = pendingUploadPlan.value === plan ? null : plan
   if (pendingUploadPlan.value) toast(`已就绪：可按 Ctrl+V 粘贴 ${plan.plan_id} 的实票截图`, 'info')
@@ -753,11 +768,11 @@ onBeforeUnmount(() => {
               <button class="link paste-button" :class="{ 'paste-waiting': pendingUploadPlan === plan }" @click="pickTicket(plan)">{{ pendingUploadPlan === plan ? '等待粘贴…' : '从剪贴板粘贴' }}</button>
             </div>
             <div v-if="plan.ticket_image_url" class="ticket-box">
-              <img class="ticket-thumb" :src="plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票图片`" loading="lazy" @click="ticketZoomUrl = plan.ticket_image_url" />
+              <img class="ticket-thumb" :src="plan.ticket_thumb_url || plan.ticket_image_url" :alt="`计划 ${plan.plan_id} 的实票缩略图`" loading="lazy" @click="openTicketZoom(plan)" />
               <div class="ticket-meta">
                 <span class="ticket-label">实票凭证</span>
                 <div class="ticket-ops">
-                  <button class="link" @click="ticketZoomUrl = plan.ticket_image_url">放大查看</button>
+                  <button class="link" @click="openTicketZoom(plan)">放大查看</button>
                   <button class="text-danger" @click="deleteTicket(plan)">移除实票</button>
                 </div>
               </div>
@@ -940,9 +955,17 @@ onBeforeUnmount(() => {
     </section>
   </div>
 
-  <div v-if="ticketZoomUrl" class="modal-layer zoom-layer" @click.self="ticketZoomUrl = ''">
-    <img class="zoom-img" :src="ticketZoomUrl" alt="实票大图" />
-    <button class="modal-close zoom-close" @click="ticketZoomUrl = ''">×</button>
+  <div v-if="ticketZoomUrl" class="modal-layer zoom-layer" @click.self="closeTicketZoom()">
+    <img
+      class="zoom-img"
+      :src="ticketZoomUrl"
+      alt="实票大图"
+      @load="ticketZoomLoaded = true"
+      @error="ticketZoomFailed = true"
+    />
+    <div v-if="!ticketZoomLoaded && !ticketZoomFailed" class="zoom-loading">大图加载中…</div>
+    <div v-else-if="ticketZoomFailed" class="zoom-loading">大图加载失败，请重试</div>
+    <button class="modal-close zoom-close" @click="closeTicketZoom()">×</button>
   </div>
 
   <div class="toasts"><div v-for="item in toasts" :key="item.id" :class="['toast',item.level]">{{ item.text }}</div></div>

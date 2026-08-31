@@ -94,6 +94,7 @@ def serialize_plan(plan: StoredPlan) -> dict[str, Any]:
         "delivery_status": plan.delivery_status,
         "purchased": plan.purchased,
         "ticket_image_url": f"/tickets/{plan.ticket_image}" if plan.ticket_image else "",
+        "ticket_thumb_url": f"/tickets/thumbs/{plan.ticket_image}" if plan.ticket_image else "",
         "stake": str(plan.stake),
         "combined_odds": str(plan.combined_odds),
         "joint_probability": str(plan.joint_probability),
