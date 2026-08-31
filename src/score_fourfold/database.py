@@ -322,6 +322,7 @@ class Database:
                     api_key_ciphertext TEXT NOT NULL DEFAULT '',
                     api_key_env TEXT NOT NULL DEFAULT '',
                     web_search_required INTEGER NOT NULL DEFAULT 1 CHECK (web_search_required IN (0, 1)),
+                    thinking_enabled INTEGER NOT NULL DEFAULT 0 CHECK (thinking_enabled IN (0, 1)),
                     last_test_status TEXT NOT NULL DEFAULT 'untested',
                     last_test_detail TEXT NOT NULL DEFAULT '',
                     last_tested_at TEXT,
@@ -610,6 +611,17 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_activity_logs_plan ON activity_logs(plan_id, id DESC)"
         )
 
+        # 深度思考必须由用户对每个模型明确开启；旧配置迁移后默认关闭，
+        # 避免输出额度较大时被隐式切换到高费用模式。
+        model_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(ai_model_configs)")
+        }
+        if "thinking_enabled" not in model_columns:
+            connection.execute(
+                "ALTER TABLE ai_model_configs ADD COLUMN thinking_enabled "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (thinking_enabled IN (0, 1))"
+            )
+
         # v0.8: AI 后台分析不再受固定 600 秒超时限制（0 表示不限制）。
         # 旧表 CHECK(http_timeout_seconds >= 1) 不允许 0，需要整表重建；
         # 仅当确实存在旧约束时执行一次，保持迁移幂等。旧默认值 600 同步
@@ -646,7 +658,7 @@ class Database:
                 "ALTER TABLE ai_runtime_settings_v2 RENAME TO ai_runtime_settings"
             )
 
-        connection.execute("PRAGMA user_version = 9")
+        connection.execute("PRAGMA user_version = 10")
 
     def count_plans_for_business_date(self, business_date: str) -> int:
         with self.connect() as connection:

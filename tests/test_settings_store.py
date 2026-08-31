@@ -112,6 +112,7 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(snapshot["runtime"]["recommendation_times"], ["10:00", "14:00", "17:30"])
         self.assertEqual(snapshot["ai"]["active_model_config_id"], "legacy-qwen")
         self.assertTrue(snapshot["ai"]["models"][0]["api_key_configured"])
+        self.assertFalse(snapshot["ai"]["models"][0]["thinking_enabled"])
         self.assertTrue(snapshot["secret_storage_ready"])
 
         with self.database.connect() as connection:
@@ -188,6 +189,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
             model_name="qwen3.7-max",
             api_key="new-key",
+            thinking_enabled=True,
             now=self.now,
         )
         called: list[str] = []
@@ -206,6 +208,7 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(called, [new_id])
         snapshot = repository.public_snapshot()
         self.assertEqual(snapshot["ai"]["active_model_config_id"], new_id)
+        self.assertTrue(repository.model_runtime(new_id).thinking_enabled)
         self.assertEqual(
             [model["last_test_status"] for model in snapshot["ai"]["models"] if model["id"] == new_id],
             ["passed"],

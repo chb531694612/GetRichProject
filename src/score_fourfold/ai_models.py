@@ -34,6 +34,7 @@ class AIModelRuntime:
     base_url: str
     model_name: str
     api_key: str
+    thinking_enabled: bool = False
 
 
 PROVIDERS: tuple[ProviderSpec, ...] = (
@@ -161,14 +162,13 @@ def call_with_web_search(
         "tools": [{"type": "web_search"}],
         "max_output_tokens": max_output_tokens,
     }
-    # 百炼思考模式不允许 tool_choice="required"；省略该参数并在响应端校验
-    # web_search_call，既保留思考能力，又保证没有实际联网时整次调用失败。
-    # 小输出配额（连接性探测）关闭思考，避免思考 token 耗尽输出预算造成假失败。
+    # 百炼思考模式不允许 tool_choice="required"；开启时省略该参数并在响应端校验
+    # web_search_call。深度思考由每个模型配置明确控制，不能再根据输出额度自动开启。
     # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
     # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
     # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
     if spec.code == "qwen":
-        thinking = max_output_tokens >= 2048
+        thinking = runtime.thinking_enabled
         tools = [{"type": "web_search"}]
         if thinking:
             tools.append({"type": "web_extractor"})

@@ -320,6 +320,7 @@ class DashboardAPI:
             base_url=str(payload.get("base_url", "")),
             model_name=str(payload.get("model_name", "")),
             api_key=str(payload.get("api_key", "")),
+            thinking_enabled=bool(payload.get("thinking_enabled", False)),
             model_config_id=str(payload.get("id", "")),
         )
         return {"model_config_id": model_id, "settings": self.settings()}

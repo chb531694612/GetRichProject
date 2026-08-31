@@ -132,12 +132,11 @@ def _build_prompt(
 def _qwen_response(prompt: str, settings: Settings, *, max_tokens: int) -> str:
     if not settings.qwen_api_key:
         raise AIAnalysisError("QWEN_API_KEY is not configured")
-    # 思考模式与 required 工具选择不兼容；调用后仍严格验证确实发生联网搜索。
-    # 探测请求关闭思考，避免思考 token 提前耗尽 max_output_tokens 造成假失败。
+    # 旧环境变量兼容路径固定使用 Normal 模式；可配置的深度思考只由数据库模型配置控制。
     # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
     # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
     # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
-    thinking = max_tokens >= 2048
+    thinking = False
     tools = [{"type": "web_search"}]
     if thinking:
         tools.append({"type": "web_extractor"})

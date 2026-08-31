@@ -470,7 +470,7 @@ class DatabaseSafetyTests(unittest.TestCase):
             self.assertEqual(legacy.summary()["baseline_return"], "32.00")
             self.assertEqual(legacy.summary()["baseline_profit"], "30.00")
             with legacy.connect() as migrated:
-                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 9)
+                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 10)
                 stale = migrated.execute(
                     "SELECT status FROM email_outbox WHERE dedupe_key = 'recommendation:STALE'"
                 ).fetchone()
@@ -525,7 +525,7 @@ class DatabaseSafetyTests(unittest.TestCase):
             legacy.initialize()
             with legacy.connect() as migrated:
                 self.assertEqual(
-                    migrated.execute("PRAGMA user_version").fetchone()[0], 9
+                    migrated.execute("PRAGMA user_version").fetchone()[0], 10
                 )
         finally:
             for suffix in ("", "-wal", "-shm"):

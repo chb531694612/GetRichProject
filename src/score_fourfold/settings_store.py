@@ -685,6 +685,7 @@ class SettingsRepository:
                         "display_name": row["display_name"],
                         "base_url": row["base_url"],
                         "model_name": row["model_name"],
+                        "thinking_enabled": bool(row["thinking_enabled"]),
                         "api_key_configured": bool(
                             row["api_key_ciphertext"] or row["api_key_env"]
                         ),
@@ -850,6 +851,7 @@ class SettingsRepository:
                 row["api_key_ciphertext"],
                 row["api_key_env"],
             ),
+            thinking_enabled=bool(row["thinking_enabled"]),
         )
 
     def active_model_runtime(self) -> AIModelRuntime | None:
@@ -869,6 +871,7 @@ class SettingsRepository:
         base_url: str,
         model_name: str,
         api_key: str = "",
+        thinking_enabled: bool = False,
         model_config_id: str = "",
         now: datetime | None = None,
     ) -> str:
@@ -902,7 +905,9 @@ class SettingsRepository:
             api_key_ciphertext = self._cipher.encrypt(api_key.strip())
             api_key_env = ""
         runtime_key = api_key.strip() or self.resolve_secret(api_key_ciphertext, api_key_env)
-        runtime = AIModelRuntime(config_id, provider, base_url, model_name, runtime_key)
+        runtime = AIModelRuntime(
+            config_id, provider, base_url, model_name, runtime_key, bool(thinking_enabled)
+        )
         # Saving may include providers that cannot yet be activated, but URL,
         # model and credential shape must still be safe and complete.
         parsed_url = urlsplit(base_url)
@@ -925,9 +930,9 @@ class SettingsRepository:
                     """
                     INSERT INTO ai_model_configs
                         (model_config_id, provider, display_name, base_url, model_name,
-                         api_key_ciphertext, api_key_env, web_search_required,
+                         api_key_ciphertext, api_key_env, web_search_required, thinking_enabled,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         config_id,
@@ -937,6 +942,7 @@ class SettingsRepository:
                         model_name,
                         api_key_ciphertext,
                         api_key_env,
+                        int(bool(thinking_enabled)),
                         timestamp,
                         timestamp,
                     ),
@@ -947,6 +953,7 @@ class SettingsRepository:
                     UPDATE ai_model_configs
                     SET provider = ?, display_name = ?, base_url = ?, model_name = ?,
                         api_key_ciphertext = ?, api_key_env = ?,
+                        thinking_enabled = ?,
                         last_test_status = 'untested', last_test_detail = '',
                         last_tested_at = NULL, updated_at = ?
                     WHERE model_config_id = ?
@@ -958,6 +965,7 @@ class SettingsRepository:
                         model_name,
                         api_key_ciphertext,
                         api_key_env,
+                        int(bool(thinking_enabled)),
                         timestamp,
                         config_id,
                     ),

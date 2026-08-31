@@ -500,7 +500,7 @@ function resetPrompts() {
   }
 }
 
-const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '' })
+const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '', thinking_enabled: false })
 function selectedProvider() { return settings.value?.providers?.find((item: any) => item.code === modelForm.provider) }
 function applyProviderDefaults() {
   const provider = selectedProvider()
@@ -512,8 +512,8 @@ function applyProviderDefaults() {
 function editModel(model?: any) {
   Object.assign(modelForm, model ? {
     id: model.id, provider: model.provider, display_name: model.display_name,
-    base_url: model.base_url, model_name: model.model_name, api_key: '',
-  } : { id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '' })
+    base_url: model.base_url, model_name: model.model_name, api_key: '', thinking_enabled: Boolean(model.thinking_enabled),
+  } : { id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '', thinking_enabled: false })
   if (!model) applyProviderDefaults()
 }
 async function saveModel() {
@@ -856,6 +856,7 @@ onBeforeUnmount(() => {
                 <div>
                   <b>{{ model.display_name }}</b>
                   <span>{{ model.provider }} · {{ model.model_name }}</span>
+                  <span>深度思考：{{ model.thinking_enabled ? '已开启' : '已关闭' }}</span>
                   <small :class="model.last_test_status">{{ model.last_test_detail || '尚未测试' }}</small>
                   <span v-if="settings.ai.active_model_config_id === model.id" class="active-badge">当前正在使用</span>
                 </div>
@@ -882,6 +883,7 @@ onBeforeUnmount(() => {
                 <label class="wide">API 地址<input v-model="modelForm.base_url" /></label>
                 <label>调用模型<input v-model="modelForm.model_name" /></label>
                 <label>API Key<input v-model="modelForm.api_key" type="password" :placeholder="modelForm.id ? '留空表示不修改' : '输入 API Key'" /></label>
+                <label class="switch-row wide"><input v-model="modelForm.thinking_enabled" type="checkbox" />开启深度思考（会显著增加 Token 消耗和费用）</label>
               </div>
               <p v-if="selectedProvider() && !selectedProvider().native_web_search" class="warning">该厂商当前标准接口不支持系统强制联网搜索，可保存配置，但“测试并启用”会明确失败。</p>
               <div class="form-actions">

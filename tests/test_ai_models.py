@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 import urllib.error
+from dataclasses import replace
 from unittest.mock import patch
 
 from score_fourfold.ai_models import (
@@ -80,7 +81,7 @@ class AIModelAdapterTests(unittest.TestCase):
         }
         with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
             call_with_web_search(
-                self.runtime,
+                replace(self.runtime, thinking_enabled=True),
                 "test",
                 timeout_seconds=10,
                 max_output_tokens=2048,
@@ -93,6 +94,23 @@ class AIModelAdapterTests(unittest.TestCase):
             body["tools"],
             [{"type": "web_search"}, {"type": "web_extractor"}],
         )
+
+    def test_qwen_analysis_defaults_to_normal_mode(self):
+        payload = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call"},
+                {"type": "message", "content": [{"type": "output_text", "text": "完成"}]},
+            ],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            call_with_web_search(
+                self.runtime, "test", timeout_seconds=10, max_output_tokens=16384
+            )
+        body = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertFalse(body["enable_thinking"])
+        self.assertEqual(body["tool_choice"], {"type": "web_search"})
+        self.assertEqual(body["tools"], [{"type": "web_search"}])
 
     def test_zero_timeout_disables_urlopen_deadline(self):
         # 0 表示不限制超时：思考模型的完整分析可能远超 600 秒，
