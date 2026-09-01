@@ -20,52 +20,35 @@ from .domain import MarketType, MatchResult, ResultStatus, ScoreOption
 
 LOGGER = logging.getLogger(__name__)
 
+# 2026-09-01 回退：恢复为 8/10 多源深度分析改造前的轻量要求。
+# 原先"每场核对 3 个独立来源 + 读取原文"会成倍放大 web_search 次数与输入 token，
+# 是 AI 费用的主要来源；这里只保留最低限度的交叉验证约束。
 SOURCE_REQUIREMENTS = [
-    "- 每场至少核对 3 个相互独立的来源；同一稿件的转载只算 1 个来源；",
-    "- 第一优先级：赛事官方、足协、俱乐部公告和赛前发布会；",
-    "- 第二优先级：雷速体育、懂球帝、直播吧、腾讯体育等中文平台；",
-    "- 第三优先级：Sofascore、Flashscore、Soccerway、Transfermarkt、BBC Sport、Opta 等国际数据或媒体；",
-    "- 至少包含 1 个中文来源（确实检索不到时须说明），并核对伤停、首发预测等易变信息的发布时间；",
-    "- 搜索摘要不足时读取原文；来源冲突时明确指出，不得擅自拼凑。",
+    "- 用至少 2 个相互独立的来源交叉验证关键事实，避免依赖单一媒体观点；",
 ]
 
 
 # 总结分析（自动推荐/总体分析）的内置默认分析要求，可被面板设置覆盖。
+# 2026-09-01 回退：恢复为 8/10 改造前的 3 条维度，并把总体判断从 300 字压回 120 字。
+# 仅保留一句极短的防幻觉约束（不得机械比较信号数量），成本近似为零但可避免乱推冷门。
 DEFAULT_SUMMARY_REQUIREMENTS = "\n".join(
     [
-        "1. 每场比赛必须引用至少 2 条具体搜索到的事实依据（如近期战绩、交锋数据、伤停信息），不得使用'双方实力接近''比赛难分胜负'等空泛套话；",
-        "2. 明确指出影响结果的关键变量和信息时效风险；",
-        "3. 必须客观评估冷门风险——强队是否存在伤停、疲劳或战术受克，弱队是否有状态回升、主场优势或阵容完整；不得为满足分析要求强行推荐冷门，也不能仅按信号数量决定方向，须按来源可靠性、证据强度、时效性及与结果的相关性加权判断；",
-        "4. 当前玩法为进球数时，必须重点核对双方近 5–10 场总进球逐场分布、主客场进失球、预期首发与攻防核心伤停、赛程体能及战术节奏；区分持续趋势与单场大比分异常，不能仅由强弱或胜负倾向推导总进球；",
-        "5. 给出一段不超过300字的中文总体判断，须体现实质性分析而非泛泛而谈。",
+        "1. 双方近期状态、伤停、赛程密度和主客场表现；",
+        "2. 可能影响结果的不确定因素和信息时效风险；",
+        "3. 不得仅凭实力差距或信号数量机械推导结论，须按证据强度与时效性判断；",
+        "4. 给出一段不超过120字的中文总体判断。",
     ]
 )
 
 # 计划推荐（AI分析并推荐）的内置默认分析要求，可被面板设置覆盖。
+# 2026-09-01 回退：删除 8/12 起的"爆冷分析要求"与"进球数玩法专项要求"两大段明细
+# （合计约 700 字、每场强制逐条自检，是输入与输出 token 的大头），
+# 恢复为 8/10 前的简短收尾要求，仅保留一句防乱推冷门的约束。
 DEFAULT_PLAN_REQUIREMENTS = "\n".join(
     [
-        "爆冷分析要求（每场比赛都必须执行，但不得强行推荐冷门）：",
-        "1. 如果纸面实力较强的队伍存在以下任一情况，必须审慎评估其输球或丢分的真实风险：",
-        "   - 核心球员伤停、停赛或大规模轮换；",
-        "   - 国内/洲际多线作战导致赛程密集、体能堪忧；",
-        "   - 对手擅长低位防守反击或大巴战术、克制其进攻体系；",
-        "   - 历史交锋处于劣势或主客场表现差异显著。",
-        "2. 如果纸面实力较弱的一方存在以下信号，应提高冷门方向的评估权重：",
-        "   - 近期状态持续回升（连胜、不败、进球稳定）；",
-        "   - 主场作战而对手客场战绩平庸；",
-        "   - 核心阵容整齐、战意明确（如保级、争冠关键节点）。",
-        "3. 禁止仅凭实力差距排除冷门，也不得为了体现爆冷分析而强行推荐冷门。不能机械比较信号数量，必须按来源可靠性、证据强度、时效性及与比赛结果的相关性加权；只有多项相互独立且足以实质改变结果判断的证据一致指向冷门时，才推荐冷门方向。",
-        "4. 如果冷门证据不充分或顺势证据更强，应顺势推荐；reason 中须简要说明冷门风险为何不足。",
-        "",
-        "进球数玩法专项要求（当前玩法为进球数时，每场必须执行）：",
-        "1. 核对双方近 5–10 场正式比赛的总进球逐场分布、主客场进失球、零封与被零封情况，不能只引用胜负战绩或场均值；",
-        "2. 核对预期首发、前锋/门将/中卫等攻防关键球员伤停、赛程间隔、轮换和战术节奏，并注明易变阵容信息的发布时间；",
-        "3. 识别红牌、加时、弱旅杯赛或单场极端大比分等异常样本，不得把异常值直接当作稳定趋势；",
-        "4. 推荐一个具体总进球数时，reason 必须说明该数字而非相邻数字的依据；资料不足时选择证据最一致的结果，不得用实力差距代替进球数分析。",
-        "",
-        "summary 须说明主要风险（含爆冷可能性）、关键信息依据和联网资料的时效性，禁止使用空泛套话。",
-        "每场 reason 必须引用至少 2 条具体搜索到的事实（如近期战绩、交锋数据、伤停信息），不得使用'双方实力接近'等笼统表述。",
-        "每场必须恰好返回一条建议；分析仅供辅助参考，不构成投注建议，不要建议增加投入。",
+        "summary 应说明主要风险和联网资料的时效性；每场必须恰好返回一条建议，reason 简述球队信息依据。",
+        "不得仅凭实力差距强行推荐冷门，也不得机械比较信号数量，须按证据强度与时效性加权判断。",
+        "分析仅供辅助参考，不构成投注建议，不要建议增加投入。",
     ]
 )
 
@@ -88,22 +71,33 @@ class AIPlanAnalysis:
     suggestions: tuple[AIOptionSuggestion, ...]
 
 
+def _output_token_budget(
+    runtime: AIModelRuntime | None, *, compact: int, thinking: int
+) -> int:
+    """按是否开启思考模式选择输出 token 上限。
+
+    思考模式下思维链会计入输出预算：历史上并发分析多个计划时曾因预算不足
+    产生空响应或不完整响应（见 web.py 的 _ai_analysis_semaphore 注释），
+    因此开启思考时沿用较大的上限；关闭思考时按精简后的提示词给较小上限，
+    以控制调用成本。旧环境变量路径不传 runtime，一律按非思考模式计。
+    """
+    if runtime is not None and getattr(runtime, "thinking_enabled", False):
+        return thinking
+    return compact
+
+
 def _build_prompt(
     matches: list[tuple[Any, ScoreOption]], market: MarketType, history_context: str = ""
 ) -> str:
     overrides = prompt_overrides()
     lines: list[str] = [
-        "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
-        "足球比赛充满变数；实力悬殊不等于结果确定。你必须主动识别和评估爆冷可能，不得默认选择强队或热门方向。",
-        "请先对每场比赛逐一联网搜索并读取关键原文，按以下规则交叉验证：",
+        # 2026-09-01 回退：恢复 8/10 前的简洁开头，信息源清单由 7 条压回 4 条。
+        "你是一名审慎的足球比赛分析师。请先联网搜索每场比赛双方球队的近期公开信息，再进行分析。",
         *SOURCE_REQUIREMENTS,
-        "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
-        "- 双方历史交锋记录（H2H）及主客场差异；",
-        "- 球队伤停、停赛、轮换情况和关键球员 availability；",
-        "- 近期赛程密度、体能状况及是否多线作战；",
-        "- 主客场表现差异、主场优势程度；",
-        "- 当前玩法为进球数时，额外核对近 5–10 场总进球逐场分布、主客场进失球、攻防关键伤停和战术节奏，识别单场极端比分，不能由胜负倾向直接推导总进球；",
-        "- 足球讨论区、球迷社区只能用于发现线索或观点分歧，不能单独作为事实依据。",
+        "- 双方近期战绩、进球/失球数据；",
+        "- 双方历史交锋记录（H2H）；",
+        "- 球队伤停、停赛和关键球员情况；",
+        "- 近期赛程密度与主客场表现差异。",
         "",
         f"玩法：{market.label_zh}串关",
         "",
@@ -244,7 +238,7 @@ def qwen_analyze(
     settings: Settings,
 ) -> str:
     """Call Qwen with mandatory web search to analyze selected matches."""
-    return _qwen_response(_build_prompt(matches, market), settings, max_tokens=2048)
+    return _qwen_response(_build_prompt(matches, market), settings, max_tokens=1024)
 
 
 def probe_qwen(settings: Settings) -> str:
@@ -270,9 +264,9 @@ def analyze_matches(
                 runtime,
                 _build_prompt(matches, market, history_context),
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=2048,
+                max_output_tokens=_output_token_budget(runtime, compact=1024, thinking=2048),
             )
-        return _qwen_response(_build_prompt(matches, market, history_context), settings, max_tokens=2048)
+        return _qwen_response(_build_prompt(matches, market, history_context), settings, max_tokens=1024)
     except (AIAnalysisError, AIModelError) as exc:
         LOGGER.warning("AI analysis skipped: %s", exc)
         return ""
@@ -329,24 +323,21 @@ def _build_plan_recommendation_prompt(
         MarketType.TTG: "pick 只能是 0、1、2、3、4、5、6、7+ 八者之一。",
     }[market]
     lines = [
-        "你是一名严谨、专业的足球比赛分析师，绝不允许敷衍了事。",
-        "足球比赛充满变数；实力悬殊不等于结果确定。你必须主动识别和评估爆冷可能，不得默认选择强队或热门方向。",
-        "必须先对每场比赛逐一联网搜索并读取关键原文，按以下规则交叉验证后再判断：",
+        # 2026-09-01 回退：恢复 8/10 前的简洁开头，信息源清单由 7 条压回 4 条，
+        # 输出字数上限由 300/100 字压回 160/60 字。
+        "你是一名审慎的足球比赛分析师。请先联网搜索每场比赛双方球队的近期公开信息，再进行分析。",
         *SOURCE_REQUIREMENTS,
-        "- 双方近 5–10 场正式比赛战绩、进球/失球数据；",
-        "- 双方历史交锋记录（H2H）及主客场差异；",
-        "- 球队伤停、停赛、轮换情况和关键球员 availability；",
-        "- 近期赛程密度、体能状况及是否多线作战；",
-        "- 主客场表现差异、主场优势程度；",
-        "- 当前玩法为进球数时，额外核对近 5–10 场总进球逐场分布、主客场进失球、攻防关键伤停和战术节奏，识别单场极端比分，不能由胜负倾向直接推导总进球；",
-        "- 足球讨论区、球迷社区只能用于发现线索或观点分歧，不能单独作为事实依据。",
+        "- 双方近期战绩、进球/失球数据；",
+        "- 双方历史交锋记录（H2H）；",
+        "- 球队伤停、停赛和关键球员情况；",
+        "- 近期赛程密度与主客场表现差异。",
         "",
         f"当前玩法：{pick_name}串关。你必须覆盖每一个 match_id。{pick_rule}",
         "系统不会向你提供赔率、概率、候选项或当前推荐；请不要讨论、猜测或反推这些信息。",
         "",
         "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要添加 JSON 以外的文字。格式必须为：",
-        '{"summary":"不超过300字的总体分析，须引用具体战绩和交锋数据","suggestions":['
-        '{"match_id":"原样返回","pick":"该玩法的具体结果","reason":"不超过100字，须引用至少2条具体搜索到的事实依据"}]}',
+        '{"summary":"不超过160字的总体分析","suggestions":['
+        '{"match_id":"原样返回","pick":"该玩法的具体结果","reason":"不超过60字"}]}',
         "",
         "基础赛程信息：",
     ]
@@ -501,16 +492,18 @@ def analyze_plan_from_leg_data(
     if not legs:
         raise AIAnalysisError("plan has no legs to analyze")
     prompt = _build_plan_recommendation_prompt(legs, market, history_context)
+    # 思考模式下思维链会占用输出预算，需沿用较大上限；非思考模式用精简上限控成本。
+    output_budget = _output_token_budget(runtime, compact=1800, thinking=16384)
     for attempt in (1, 2):
         if runtime is None:
-            content = _qwen_response(prompt, settings, max_tokens=16384)
+            content = _qwen_response(prompt, settings, max_tokens=output_budget)
         else:
             try:
                 content = call_with_web_search(
                     runtime,
                     prompt,
                     timeout_seconds=settings.ai_http_timeout_seconds,
-                    max_output_tokens=16384,
+                    max_output_tokens=output_budget,
                 )
             except AIModelError as exc:
                 raise AIAnalysisError(str(exc)) from exc
@@ -638,10 +631,10 @@ def query_results_via_ai(
                 runtime,
                 prompt,
                 timeout_seconds=settings.ai_http_timeout_seconds,
-                max_output_tokens=4096,
+                max_output_tokens=_output_token_budget(runtime, compact=1024, thinking=4096),
             )
         else:
-            content = _qwen_response(prompt, settings, max_tokens=4096)
+            content = _qwen_response(prompt, settings, max_tokens=1024)
     except (AIAnalysisError, AIModelError) as exc:
         LOGGER.warning("AI result query failed: %s", exc)
         return {}

@@ -40,12 +40,13 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(snapshot["ai_prompts"]["system_prompt"], "")
         self.assertEqual(snapshot["ai_prompts"]["plan_requirements"], "")
         self.assertEqual(snapshot["ai_prompts"]["summary_requirements"], "")
+        # 默认提示词回退为精简版，仅保留防乱推冷门的约束。
         self.assertIn(
-            "爆冷分析要求",
+            "不得仅凭实力差距强行推荐冷门",
             snapshot["ai_prompts"]["defaults"]["plan_requirements"],
         )
         self.assertIn(
-            "冷门风险",
+            "不得仅凭实力差距或信号数量机械推导结论",
             snapshot["ai_prompts"]["defaults"]["summary_requirements"],
         )
         # 空值 = 使用内置默认。

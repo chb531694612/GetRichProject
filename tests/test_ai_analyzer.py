@@ -13,6 +13,7 @@ from score_fourfold.ai_analyzer import (
     AIAnalysisError,
     DEFAULT_PLAN_REQUIREMENTS,
     DEFAULT_SUMMARY_REQUIREMENTS,
+    SOURCE_REQUIREMENTS,
     analyze_matches,
     analyze_plan_from_leg_data,
     probe_qwen,
@@ -59,9 +60,8 @@ def _qwen_payload(content: str, *, searched: bool = True) -> dict:
 
 
 class AIAnalyzerTests(unittest.TestCase):
-    def test_plan_analysis_allows_enough_output_for_thinking_and_search(self):
+    def _run_plan_analysis_with_runtime(self, runtime):
         settings = make_settings(Path("data"), qwen_api_key="secret")
-        runtime = SimpleNamespace(provider="qwen")
         content = json.dumps(
             {
                 "summary": "分析完成",
@@ -79,6 +79,21 @@ class AIAnalyzerTests(unittest.TestCase):
             analyze_plan_from_leg_data(
                 self._legs(), MarketType.CRS, settings, runtime=runtime
             )
+        return called
+
+    def test_plan_analysis_uses_compact_output_budget_without_thinking(self):
+        # 提示词回退后输出需求大幅下降，非思考模式用精简预算控制成本。
+        called = self._run_plan_analysis_with_runtime(
+            SimpleNamespace(provider="qwen", thinking_enabled=False)
+        )
+        self.assertEqual(called.call_args.kwargs["max_output_tokens"], 1800)
+
+    def test_plan_analysis_keeps_large_output_budget_for_thinking_models(self):
+        # 回归保护：思考模式下思维链会计入输出预算，预算不足曾导致空/不完整响应，
+        # 因此开启思考时必须沿用较大的上限。
+        called = self._run_plan_analysis_with_runtime(
+            SimpleNamespace(provider="qwen", thinking_enabled=True)
+        )
         self.assertEqual(called.call_args.kwargs["max_output_tokens"], 16384)
 
     def test_timeout_is_normalized_and_automatic_analysis_does_not_raise(self):
@@ -179,7 +194,8 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("周二001", prompt)
         self.assertIn("主队 vs 客队", prompt)
         self.assertIn("历史交锋", prompt)
-        self.assertIn("讨论区", prompt)
+        # 回退后不再逐一点名来源平台，但仍要求独立来源交叉验证。
+        self.assertIn("相互独立的来源", prompt)
         self.assertNotIn("SECRET-PICK", prompt)
         self.assertNotIn("9.99", prompt)
         self.assertNotIn("0.12345", prompt)
@@ -234,13 +250,14 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("match_id=1001", prompt)
         self.assertIn("比赛日期=2026-07-22", prompt)
         self.assertIn("历史交锋", prompt)
-        self.assertIn("讨论区", prompt)
+        # 回退后不再逐一点名来源平台，但仍要求独立来源交叉验证。
+        self.assertIn("相互独立的来源", prompt)
         self.assertNotIn("option_code", prompt)
         self.assertNotIn("SP", prompt)
         self.assertNotIn("5.00", prompt)
         self.assertNotIn("0.20", prompt)
 
-    def test_plan_prompt_includes_diverse_sources_and_anonymous_history(self):
+    def test_plan_prompt_includes_source_check_and_anonymous_history(self):
         settings = make_settings(Path("data"), qwen_api_key="secret")
         content = json.dumps({"summary": "有依据。", "suggestions": [
             {"match_id": "1001", "pick": "1:0", "reason": "来源充分"},
@@ -252,10 +269,12 @@ class AIAnalyzerTests(unittest.TestCase):
             analyze_plan_from_leg_data(self._legs(), MarketType.CRS, settings,
                                        history_context=history)
         prompt = json.loads(mocked.call_args.args[0].data.decode("utf-8"))["input"][1]["content"]
-        self.assertIn("雷速体育", prompt)
-        self.assertIn("懂球帝", prompt)
-        self.assertIn("Sofascore", prompt)
-        self.assertIn("至少核对 3 个", prompt)
+        # 回退后不再逐一点名来源平台、也不再要求每场核对 3 个来源，
+        # 但仍保留独立来源交叉验证这一底线要求。
+        self.assertIn("相互独立的来源", prompt)
+        self.assertNotIn("雷速体育", prompt)
+        self.assertNotIn("至少核对 3 个", prompt)
+        # 匿名历史统计仍作为弱参考注入。
         self.assertIn(history, prompt)
 
     def test_plan_analysis_rejects_invented_or_missing_options(self):
@@ -400,7 +419,9 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertNotIn("大胆", prompt)
         self.assertNotIn("胆量", prompt)
         self.assertIn("7+", prompt)
-        self.assertIn("爆冷", prompt)
+        # 成本回退后不再包含爆冷/进球数专项长段落。
+        self.assertNotIn("爆冷分析要求", prompt)
+        self.assertNotIn("进球数玩法专项要求", prompt)
 
     def test_ttg_plan_analysis_normalizes_goal_variants(self):
         settings = make_settings(Path("data"), qwen_api_key="secret")
@@ -475,13 +496,23 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertNotIn("大胆", DEFAULT_PLAN_REQUIREMENTS)
         self.assertNotIn("胆量", DEFAULT_SUMMARY_REQUIREMENTS)
         self.assertNotIn("胆量", DEFAULT_SYSTEM_PROMPT)
-        self.assertIn("爆冷分析要求", DEFAULT_PLAN_REQUIREMENTS)
-        self.assertIn("冷门风险", DEFAULT_SUMMARY_REQUIREMENTS)
-        self.assertIn("不得强行推荐冷门", DEFAULT_PLAN_REQUIREMENTS)
-        self.assertIn("不能机械比较信号数量", DEFAULT_PLAN_REQUIREMENTS)
         self.assertNotIn("爆冷信号多于顺势信号", DEFAULT_PLAN_REQUIREMENTS)
-        self.assertIn("进球数玩法专项要求", DEFAULT_PLAN_REQUIREMENTS)
-        self.assertIn("总进球逐场分布", DEFAULT_SUMMARY_REQUIREMENTS)
+
+    def test_default_prompts_stay_compact_after_cost_rollback(self):
+        # 回归保护：8/12 起的爆冷/进球数专项长段落与多来源逐场核对要求
+        # 会成倍抬高 token 成本，回退后不得再出现。
+        self.assertNotIn("爆冷分析要求", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertNotIn("进球数玩法专项要求", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertNotIn("总进球逐场分布", DEFAULT_SUMMARY_REQUIREMENTS)
+        self.assertNotIn("每场至少核对 3 个相互独立的来源", "\n".join(SOURCE_REQUIREMENTS))
+        # 总体判断字数已压回 120 字（提示词内声明为 160 字上限的 JSON 输出）。
+        self.assertIn("不超过120字", DEFAULT_SUMMARY_REQUIREMENTS)
+        # 回退仍保留极短的防幻觉约束，避免 AI 乱推冷门。
+        self.assertIn("不得仅凭实力差距强行推荐冷门", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("不得机械比较信号数量", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn(
+            "不得仅凭实力差距或信号数量机械推导结论", DEFAULT_SUMMARY_REQUIREMENTS
+        )
 
     def test_prompt_overrides_replace_default_requirements(self):
         self.addCleanup(set_prompt_overrides)
