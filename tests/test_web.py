@@ -34,6 +34,23 @@ from .helpers import make_match, make_recommendation, make_settings
 TZ = ZoneInfo("Asia/Shanghai")
 
 
+def _unlink_with_retry(path: Path, attempts: int = 5) -> None:
+    """删除测试临时文件，容忍 Windows 上 SQLite 句柄未释放造成的占用。
+
+    Windows 下 unlink 一个仍被 SQLite 持有的 .db 文件会抛
+    PermissionError(WinError 32)，直接失败会让 tearDown 误报测试错误；
+    短暂重试即可等到句柄释放。
+    """
+    for attempt in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.2)
+
+
 class FixedClock:
     def __init__(self, value: datetime):
         self.value = value
@@ -85,10 +102,10 @@ class DashboardTests(unittest.TestCase):
 
     def _clean(self):
         for suffix in ("", "-wal", "-shm"):
-            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+            _unlink_with_retry(Path(f"{self.database_path}{suffix}"))
         if self.preview.exists():
             for child in self.preview.iterdir():
-                child.unlink()
+                _unlink_with_retry(child)
             self.preview.rmdir()
 
     def _trigger(self, request_id: str) -> tuple[str, str]:
@@ -437,12 +454,14 @@ class DashboardTests(unittest.TestCase):
             # 放行第一个任务，其余排队任务随后串行完成。
             gate.set()
             for plan_id in (recommendation.plan_id, second.plan_id, third.plan_id):
+                # 三个任务经信号量串行执行，机器负载高时单个任务可能数秒才完成。
+                # 该超时只在失败时才等满，成功会立即返回，因此放宽不影响正常速度。
                 self._wait_for(
                     lambda pid=plan_id: (
                         application.analysis_task(pid) is not None
                         and application.analysis_task(pid).status == "finished"
                     ),
-                    timeout=5.0,
+                    timeout=30.0,
                 )
             for plan_id in (recommendation.plan_id, second.plan_id, third.plan_id):
                 stored = self.database.get_plan(plan_id)
@@ -608,10 +627,10 @@ class ManualActionAndDatabaseGateTests(unittest.TestCase):
 
     def _clean(self):
         for suffix in ("", "-wal", "-shm"):
-            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+            _unlink_with_retry(Path(f"{self.database_path}{suffix}"))
         if self.preview.exists():
             for child in self.preview.iterdir():
-                child.unlink()
+                _unlink_with_retry(child)
             self.preview.rmdir()
 
     def _service(self):
@@ -761,10 +780,10 @@ class PublicDashboardSecurityTests(unittest.TestCase):
 
     def _clean(self):
         for suffix in ("", "-wal", "-shm"):
-            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+            _unlink_with_retry(Path(f"{self.database_path}{suffix}"))
         if self.preview.exists():
             for child in self.preview.iterdir():
-                child.unlink()
+                _unlink_with_retry(child)
             self.preview.rmdir()
 
     def _trigger(self, request_id: str) -> tuple[str, str]:
@@ -1018,10 +1037,10 @@ class NewFeatureTests(unittest.TestCase):
 
     def _clean(self):
         for suffix in ("", "-wal", "-shm"):
-            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+            _unlink_with_retry(Path(f"{self.database_path}{suffix}"))
         if self.preview.exists():
             for child in self.preview.iterdir():
-                child.unlink()
+                _unlink_with_retry(child)
             self.preview.rmdir()
         # rmtree because ticket-images now also holds a thumbs/ subdirectory.
         ticket_dir = self.root / "ticket-images"
