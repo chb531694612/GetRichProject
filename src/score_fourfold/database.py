@@ -356,6 +356,8 @@ class Database:
                     system_prompt TEXT NOT NULL DEFAULT '',
                     plan_requirements TEXT NOT NULL DEFAULT '',
                     summary_requirements TEXT NOT NULL DEFAULT '',
+                    result_requirements TEXT NOT NULL DEFAULT '',
+                    retry_requirements TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
 
@@ -378,6 +380,14 @@ class Database:
     def _migrate(connection: sqlite3.Connection) -> None:
         """Apply small, forward-only SQLite migrations for existing volumes."""
         plan_columns = {row["name"] for row in connection.execute("PRAGMA table_info(plans)")}
+        prompt_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(ai_prompt_settings)")
+        }
+        for name in ("result_requirements", "retry_requirements"):
+            if name not in prompt_columns:
+                connection.execute(
+                    f"ALTER TABLE ai_prompt_settings ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
         for name in (
             "settled_gross_prize_cents",
             "settled_tax_cents",

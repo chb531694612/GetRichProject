@@ -22,6 +22,8 @@ from .ai_models import (
 )
 from .ai_analyzer import (
     DEFAULT_PLAN_REQUIREMENTS,
+    DEFAULT_RESULT_REQUIREMENTS,
+    DEFAULT_RETRY_REQUIREMENTS,
     DEFAULT_SUMMARY_REQUIREMENTS,
 )
 from .config import Settings
@@ -95,8 +97,9 @@ class SettingsRepository:
                 """
                 INSERT OR IGNORE INTO ai_prompt_settings
                     (singleton_id, system_prompt, plan_requirements,
-                     summary_requirements, updated_at)
-                VALUES (1, '', '', '', ?)
+                     summary_requirements, result_requirements,
+                     retry_requirements, updated_at)
+                VALUES (1, '', '', '', '', '', ?)
                 """,
                 (timestamp,),
             )
@@ -110,6 +113,8 @@ class SettingsRepository:
             "system_prompt": row["system_prompt"],
             "plan_requirements": row["plan_requirements"],
             "summary_requirements": row["summary_requirements"],
+            "result_requirements": row["result_requirements"],
+            "retry_requirements": row["retry_requirements"],
             "updated_at": row["updated_at"],
         }
 
@@ -123,6 +128,8 @@ class SettingsRepository:
             ("system_prompt", "系统提示词"),
             ("plan_requirements", "计划推荐分析要求"),
             ("summary_requirements", "总结分析要求"),
+            ("result_requirements", "赛果联网核查要求"),
+            ("retry_requirements", "格式错误重试要求"),
         )
         cleaned: dict[str, str] = {}
         for key, label in fields:
@@ -137,8 +144,9 @@ class SettingsRepository:
                 """
                 INSERT INTO ai_prompt_settings
                     (singleton_id, system_prompt, plan_requirements,
-                     summary_requirements, updated_at)
-                VALUES (1, '', '', '', ?)
+                     summary_requirements, result_requirements,
+                     retry_requirements, updated_at)
+                VALUES (1, '', '', '', '', '', ?)
                 ON CONFLICT(singleton_id) DO NOTHING
                 """,
                 (timestamp,),
@@ -147,13 +155,16 @@ class SettingsRepository:
                 """
                 UPDATE ai_prompt_settings
                 SET system_prompt = ?, plan_requirements = ?,
-                    summary_requirements = ?, updated_at = ?
+                    summary_requirements = ?, result_requirements = ?,
+                    retry_requirements = ?, updated_at = ?
                 WHERE singleton_id = 1
                 """,
                 (
                     cleaned["system_prompt"],
                     cleaned["plan_requirements"],
                     cleaned["summary_requirements"],
+                    cleaned["result_requirements"],
+                    cleaned["retry_requirements"],
                     timestamp,
                 ),
             )
@@ -165,6 +176,8 @@ class SettingsRepository:
             row["system_prompt"],
             row["plan_requirements"],
             row["summary_requirements"],
+            row["result_requirements"],
+            row["retry_requirements"],
         )
 
     @staticmethod
@@ -646,6 +659,8 @@ class SettingsRepository:
                 "system_prompt": "",
                 "plan_requirements": "",
                 "summary_requirements": "",
+                "result_requirements": "",
+                "retry_requirements": "",
                 "updated_at": "",
             }
         return {
@@ -714,11 +729,15 @@ class SettingsRepository:
                 "system_prompt": prompt_row["system_prompt"],
                 "plan_requirements": prompt_row["plan_requirements"],
                 "summary_requirements": prompt_row["summary_requirements"],
+                "result_requirements": prompt_row["result_requirements"],
+                "retry_requirements": prompt_row["retry_requirements"],
                 "updated_at": prompt_row["updated_at"],
                 "defaults": {
                     "system_prompt": DEFAULT_SYSTEM_PROMPT,
                     "plan_requirements": DEFAULT_PLAN_REQUIREMENTS,
                     "summary_requirements": DEFAULT_SUMMARY_REQUIREMENTS,
+                    "result_requirements": DEFAULT_RESULT_REQUIREMENTS,
+                    "retry_requirements": DEFAULT_RETRY_REQUIREMENTS,
                 },
             },
             "secret_storage_ready": self._cipher is not None,

@@ -68,17 +68,23 @@ DEFAULT_SYSTEM_PROMPT = (
 # 提示词覆盖注册表：空字符串表示使用内置默认。
 # 由 SettingsRepository 在启动和设置更新时写入；放在模块级是为了让
 # strategy/service 等无法穿透传参的调用链也能即时读到最新配置。
-_PROMPT_OVERRIDES: dict[str, str] = {"system": "", "plan": "", "summary": ""}
+_PROMPT_OVERRIDES: dict[str, str] = {
+    "system": "", "plan": "", "summary": "", "result": "", "retry": ""
+}
 
 
 def set_prompt_overrides(
     system_prompt: str = "",
     plan_requirements: str = "",
     summary_requirements: str = "",
+    result_requirements: str = "",
+    retry_requirements: str = "",
 ) -> None:
     _PROMPT_OVERRIDES["system"] = (system_prompt or "").strip()
     _PROMPT_OVERRIDES["plan"] = (plan_requirements or "").strip()
     _PROMPT_OVERRIDES["summary"] = (summary_requirements or "").strip()
+    _PROMPT_OVERRIDES["result"] = (result_requirements or "").strip()
+    _PROMPT_OVERRIDES["retry"] = (retry_requirements or "").strip()
 
 
 def prompt_overrides() -> dict[str, str]:

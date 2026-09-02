@@ -40,14 +40,34 @@ DEFAULT_SUMMARY_REQUIREMENTS = "\n".join(
     ]
 )
 
+DEFAULT_RESULT_REQUIREMENTS = "\n".join(
+    [
+        "- 只接受已经结束且可确认的常规时间全场比分（含伤停补时，不含加时赛和点球大战）；",
+        "- 优先核对赛事官方、足协或俱乐部，再用至少一个独立权威数据平台交叉验证；",
+        "- 必须核对比赛日期、主客队和赛事，不能仅凭相似队名认定是同一场比赛；",
+        "- 未开始、进行中、延期、取消、来源冲突或证据不足时必须返回 unknown，严禁猜测。",
+    ]
+)
+
+DEFAULT_RETRY_REQUIREMENTS = "\n".join(
+    [
+        "上一次回答未通过系统结构校验。请重新联网核对并从头生成完整答案。",
+        "只能输出一个完整且可严格解析的 JSON 对象，不要输出解释、前后缀或 Markdown 代码块。",
+        "suggestions 必须覆盖列出的每一个 match_id，不能遗漏、重复或增加比赛。",
+    ]
+)
+
 # 计划推荐（AI分析并推荐）的内置默认分析要求，可被面板设置覆盖。
 # 2026-09-01 回退：删除 8/12 起的"爆冷分析要求"与"进球数玩法专项要求"两大段明细
 # （合计约 700 字、每场强制逐条自检，是输入与输出 token 的大头），
 # 恢复为 8/10 前的简短收尾要求，仅保留一句防乱推冷门的约束。
 DEFAULT_PLAN_REQUIREMENTS = "\n".join(
     [
-        "summary 应说明主要风险和联网资料的时效性；每场必须恰好返回一条建议，reason 简述球队信息依据。",
-        "不得仅凭实力差距强行推荐冷门，也不得机械比较信号数量，须按证据强度与时效性加权判断。",
+        "先确认比赛日期、赛事和主客队无误，再依据可核实的近期资料独立预测每场结果。",
+        "综合近期攻防表现、主客场差异、赛程密度、伤停停赛、预计阵容和交锋背景；旧闻和传闻降低权重。",
+        "不得仅凭名气、实力差距或信号数量机械下结论；来源冲突时采用更权威、更新且能相互印证的信息。",
+        "比分预测应与分析依据一致，避免无依据地追逐极端比分或冷门；但也不能为了保守而固定选择热门结果。",
+        "summary 应指出整组预测最重要的依据、最大不确定性和资料时效；每场恰好返回一条建议，reason 写出最关键的可核实依据。",
         "分析仅供辅助参考，不构成投注建议，不要建议增加投入。",
     ]
 )
@@ -469,16 +489,8 @@ def _parse_plan_analysis(
 
 def _plan_format_retry_prompt(prompt: str, error: AIAnalysisError) -> str:
     """Ask for one fresh, complete response without echoing the invalid output."""
-    return "\n".join(
-        [
-            prompt,
-            "",
-            "上一次回答未通过系统的结构校验。请重新联网核对并从头生成完整答案。",
-            f"需要修正的问题：{error}",
-            "这次只能输出一个完整、可被严格解析的 JSON 对象；不要输出解释、前后缀或 Markdown 代码块。",
-            "suggestions 必须覆盖上面列出的每一个 match_id，不能遗漏、重复或增加比赛。",
-        ]
-    )
+    requirements = prompt_overrides()["retry"] or DEFAULT_RETRY_REQUIREMENTS
+    return "\n".join([prompt, "", requirements, f"需要修正的问题：{error}"])
 
 
 def analyze_plan_from_leg_data(
@@ -524,11 +536,7 @@ def _build_result_query_prompt(legs: Sequence[Any]) -> str:
     """Build the prompt for an AI lookup of already-finished match results."""
     lines = [
         "你是一名足球赛果核查员。请对下面每场比赛联网搜索，确认其官方全场最终比分。",
-        "只允许报告已经结束并已官方确认的全场最终比分（含伤停补时，不含加时赛和点球大战）。",
-        "对每场比赛：",
-        "- 优先核对赛事官方、足协、俱乐部，以及 Sofascore、Flashscore、Soccerway、雷速体育、懂球帝、直播吧等权威数据平台；",
-        "- 用多个相互独立的来源交叉验证后再确认；",
-        "- 如果比赛尚未开始、正在进行、延期、取消或搜索不到可靠赛果，status 必须填 unknown，home_score 与 away_score 填 0，严禁猜测比分。",
+        prompt_overrides()["result"] or DEFAULT_RESULT_REQUIREMENTS,
         "",
         "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的任何文字。格式必须为：",
         '{"results":[{"match_id":"原样返回","status":"final 或 unknown","home_score":0,"away_score":0,"note":"简短说明"}]}',

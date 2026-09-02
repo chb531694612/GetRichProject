@@ -40,9 +40,11 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(snapshot["ai_prompts"]["system_prompt"], "")
         self.assertEqual(snapshot["ai_prompts"]["plan_requirements"], "")
         self.assertEqual(snapshot["ai_prompts"]["summary_requirements"], "")
+        self.assertEqual(snapshot["ai_prompts"]["result_requirements"], "")
+        self.assertEqual(snapshot["ai_prompts"]["retry_requirements"], "")
         # 默认提示词回退为精简版，仅保留防乱推冷门的约束。
         self.assertIn(
-            "不得仅凭实力差距强行推荐冷门",
+            "不能为了保守而固定选择热门结果",
             snapshot["ai_prompts"]["defaults"]["plan_requirements"],
         )
         self.assertIn(
@@ -60,6 +62,8 @@ class SettingsRepositoryTests(unittest.TestCase):
                 "system_prompt": "自定义系统提示词",
                 "plan_requirements": "自定义计划要求",
                 "summary_requirements": "",
+                "result_requirements": "自定义赛果核查要求",
+                "retry_requirements": "自定义重试要求",
             },
             now=self.now,
         )
@@ -67,10 +71,14 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(snapshot["ai_prompts"]["system_prompt"], "自定义系统提示词")
         self.assertEqual(snapshot["ai_prompts"]["plan_requirements"], "自定义计划要求")
         self.assertEqual(snapshot["ai_prompts"]["summary_requirements"], "")
+        self.assertEqual(snapshot["ai_prompts"]["result_requirements"], "自定义赛果核查要求")
+        self.assertEqual(snapshot["ai_prompts"]["retry_requirements"], "自定义重试要求")
         # 保存后立即同步到运行时提示词覆盖。
         self.assertEqual(ai_models.effective_system_prompt(), "自定义系统提示词")
         self.assertEqual(ai_models.prompt_overrides()["plan"], "自定义计划要求")
         self.assertEqual(ai_models.prompt_overrides()["summary"], "")
+        self.assertEqual(ai_models.prompt_overrides()["result"], "自定义赛果核查要求")
+        self.assertEqual(ai_models.prompt_overrides()["retry"], "自定义重试要求")
 
         # 重新构造仓库（模拟进程重启）会从数据库恢复覆盖。
         SettingsRepository(self.database, settings)

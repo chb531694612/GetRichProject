@@ -20,6 +20,7 @@ from score_fourfold.ai_analyzer import (
     qwen_analyze,
     query_results_via_ai,
     _build_result_query_prompt,
+    _plan_format_retry_prompt,
     _parse_result_query,
 )
 from score_fourfold.ai_models import (
@@ -324,7 +325,7 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 2)
         retry_payload = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
         retry_prompt = retry_payload["input"][1]["content"]
-        self.assertIn("上一次回答未通过系统的结构校验", retry_prompt)
+        self.assertIn("上一次回答未通过系统结构校验", retry_prompt)
         self.assertIn("只能输出一个完整", retry_prompt)
         self.assertNotIn("我先说明一下分析过程", retry_prompt)
 
@@ -508,8 +509,8 @@ class AIAnalyzerTests(unittest.TestCase):
         # 总体判断字数已压回 120 字（提示词内声明为 160 字上限的 JSON 输出）。
         self.assertIn("不超过120字", DEFAULT_SUMMARY_REQUIREMENTS)
         # 回退仍保留极短的防幻觉约束，避免 AI 乱推冷门。
-        self.assertIn("不得仅凭实力差距强行推荐冷门", DEFAULT_PLAN_REQUIREMENTS)
-        self.assertIn("不得机械比较信号数量", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("不能为了保守而固定选择热门结果", DEFAULT_PLAN_REQUIREMENTS)
+        self.assertIn("不得仅凭名气、实力差距或信号数量机械下结论", DEFAULT_PLAN_REQUIREMENTS)
         self.assertIn(
             "不得仅凭实力差距或信号数量机械推导结论", DEFAULT_SUMMARY_REQUIREMENTS
         )
@@ -604,6 +605,20 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertNotIn("赔率", prompt)
         self.assertNotIn("odds", prompt)
         self.assertNotIn("probability", prompt)
+
+    def test_result_and_retry_prompt_overrides_are_used(self):
+        self.addCleanup(set_prompt_overrides)
+        set_prompt_overrides(
+            result_requirements="自定义赛果核查规则ABC",
+            retry_requirements="自定义格式修正规则XYZ",
+        )
+        self.assertIn(
+            "自定义赛果核查规则ABC",
+            _build_result_query_prompt(self._result_legs()),
+        )
+        retry = _plan_format_retry_prompt("原始提示", AIAnalysisError("格式错误"))
+        self.assertIn("自定义格式修正规则XYZ", retry)
+        self.assertIn("需要修正的问题：格式错误", retry)
 
     def test_parse_result_query_returns_final_and_skips_unknown(self):
         content = json.dumps(

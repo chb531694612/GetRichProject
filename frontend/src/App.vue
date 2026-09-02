@@ -463,8 +463,10 @@ function saveRuntime() {
 
 const promptFields = [
   { field: 'system_prompt', label: '系统提示词', help: '每次 AI 调用的角色设定（system 消息）' },
-  { field: 'plan_requirements', label: '计划推荐分析要求', help: '「AI分析并推荐」每场推荐时附加到提示词末尾的分析规则' },
-  { field: 'summary_requirements', label: '总结分析要求', help: '生成计划总体分析（ai_summary）时使用的分析要求' },
+  { field: 'plan_requirements', label: '计划预测要求', help: '自动生成正式计划及「AI分析并推荐」逐场预测时使用' },
+  { field: 'summary_requirements', label: '总体摘要要求', help: '仅生成比赛总体分析摘要时使用' },
+  { field: 'result_requirements', label: '赛果联网核查要求', help: '手动更新单张计划、官方赛果缺失时的 AI 联网核查规则' },
+  { field: 'retry_requirements', label: '格式错误重试要求', help: '计划预测首次返回格式不合格时，第二次调用附加的修正规则' },
 ] as const
 
 const promptDrafts = reactive<Record<string, string>>({})
@@ -909,7 +911,7 @@ onBeforeUnmount(() => {
           </section>
           <section v-else-if="settingsTab === 'prompts'">
             <h3>AI 提示词</h3>
-            <p class="hint">下方文本框已预填当前内置默认内容，可直接在默认基础上微调。留空保存 = 仍使用默认；保存后立即影响后续自动推荐和手动 AI 分析；JSON 输出格式、赛程拼接等安全结构不在可编辑范围内。</p>
+            <p class="hint">这里列出所有业务 AI 调用会使用的提示词规则。文本框已预填当前默认内容，可直接微调；恢复默认后保存即清除自定义覆盖。比赛清单、强制 JSON 格式和真实选项校验属于安全结构，固定由程序拼接，不能在设置页关闭。</p>
             <div v-for="pf in promptFields" :key="pf.field" class="prompt-field">
               <label>
                 <b>{{ pf.label }}</b>
