@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.database import Database
@@ -12,6 +13,7 @@ from score_fourfold.mail import Mailer, render_recommendation, render_settlement
 from score_fourfold.provider import _had_options, parse_normalized_matches
 from score_fourfold.service import ScoreFourfoldService
 from score_fourfold.strategy import select_accumulator, select_had_accumulator
+from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
 
 from .helpers import make_match, make_recommendation, make_settings
 
@@ -78,6 +80,7 @@ class HadStrategyTests(unittest.TestCase):
             database_path=database_path,
             mail_preview_dir=preview,
             min_had_joint_probability=0.001,
+            qwen_api_key="secret",
         )
         database = Database(database_path)
         database.initialize()
@@ -89,7 +92,15 @@ class HadStrategyTests(unittest.TestCase):
             Mailer(settings, clock=FixedClock(self.now)),
             clock=FixedClock(self.now),
         )
-        outcome = service.recommend(self.now)
+        def prediction(legs, market, *_args, **_kwargs):
+            code, label = ("h", "主胜") if market is MarketType.HAD else ("s01s00", "1:0")
+            return AIPlanAnalysis(
+                "AI联网预测摘要",
+                tuple(AIOptionSuggestion(leg.match_id, code, label, "联网分析") for leg in legs),
+            )
+
+        with patch("score_fourfold.strategy.analyze_plan_from_leg_data", side_effect=prediction):
+            outcome = service.recommend(self.now)
         self.assertEqual(outcome.status, "created")
         self.assertEqual(database.count_plans_for_recommendation_date("2026-07-14"), 2)
         self.assertEqual(

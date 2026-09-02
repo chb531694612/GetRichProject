@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.database import Database
@@ -13,6 +14,7 @@ from score_fourfold.scheduler import (
     slot_job_name,
 )
 from score_fourfold.service import ScoreFourfoldService
+from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
 
 from .helpers import make_match, make_recommendation, make_settings
 
@@ -120,7 +122,30 @@ class ScheduleSafetyTests(unittest.TestCase):
             [make_match(i, created_at, business_date="2026-07-15") for i in range(1, 7)]
         )
         service = self._service(clock, provider)
-        self.assertIn(service.recommend(created_at).status, {"created", "partial"})
+        service.settings = make_settings(
+            Path("data"),
+            database_path=self.path,
+            mail_preview_dir=self.preview,
+            qwen_api_key="secret",
+        )
+        service.provider.settings = service.settings
+        service.mailer.settings = service.settings
+        with patch(
+            "score_fourfold.strategy.analyze_plan_from_leg_data",
+            side_effect=lambda legs, market, *_args, **_kwargs: AIPlanAnalysis(
+                "AI联网预测摘要",
+                tuple(
+                    AIOptionSuggestion(
+                        leg.match_id,
+                        "h" if market.value == "had" else "s01s00",
+                        "主胜" if market.value == "had" else "1:0",
+                        "联网分析",
+                    )
+                    for leg in legs
+                ),
+            ),
+        ):
+            self.assertIn(service.recommend(created_at).status, {"created", "partial"})
 
         self.assertEqual(service.send_mail(created_at).status, "ok")
         self.assertFalse(self.preview.exists())

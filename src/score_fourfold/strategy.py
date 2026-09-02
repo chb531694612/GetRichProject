@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 
-from .ai_analyzer import analyze_matches
+from .ai_analyzer import analyze_matches, analyze_plan_from_leg_data
 from .ai_models import AIModelRuntime
 from .analyzer import analyze_had_options, analyze_score_options, estimate_expected_goals
 from .config import Settings
@@ -23,6 +23,9 @@ TTG_STRATEGY_VERSION = "ttg-market-poisson-hybrid-v1"
 MARKET_ONLY_STRATEGY_VERSION = "market-implied-v3"
 HAD_MARKET_ONLY_STRATEGY_VERSION = "had-market-implied-v1"
 TTG_MARKET_ONLY_STRATEGY_VERSION = "ttg-market-implied-v1"
+AI_CRS_STRATEGY_VERSION = "ai-web-search-crs-v1"
+AI_HAD_STRATEGY_VERSION = "ai-web-search-had-v1"
+AI_TTG_STRATEGY_VERSION = "ai-web-search-ttg-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,9 +210,67 @@ def _build_recommendation(
     *,
     market: MarketType,
     ai_runtime: AIModelRuntime | None = None,
+    ai_required: bool = False,
+    history_context: str = "",
 ) -> SelectionResult:
     joint_probability, combined_odds, raw_combination = selected
     combination = tuple(sorted(raw_combination, key=lambda item: (item[0].start_at, item[0].match_num)))
+    ai_summary = ""
+    if ai_required:
+        proxy_legs = []
+        for match, score in combination:
+            options = {
+                MarketType.CRS: match.score_options,
+                MarketType.HAD: match.had_options,
+                MarketType.TTG: match.ttg_options,
+            }[market]
+            if market is MarketType.CRS and not settings.allow_other_scores:
+                options = tuple(option for option in options if not option.is_other)
+            proxy_legs.append(
+                type(
+                    "_AIPlanLeg",
+                    (),
+                    {
+                        "match_id": match.match_id,
+                        "match_num": match.match_num,
+                        "business_date": match.business_date,
+                        "league": match.league,
+                        "home": match.home,
+                        "away": match.away,
+                        "start_at": match.start_at,
+                        "options": options,
+                        "score_code": score.code,
+                        "score_label": score.label,
+                        "odds": score.odds,
+                        "probability": score.probability,
+                    },
+                )()
+            )
+        analysis = analyze_plan_from_leg_data(
+            proxy_legs,
+            market,
+            settings,
+            runtime=ai_runtime,
+            history_context=history_context,
+        )
+        suggestions = {item.match_id: item for item in analysis.suggestions}
+        combination = tuple(
+            (
+                match,
+                next(
+                    option
+                    for option in proxy.options
+                    if option.code == suggestions[match.match_id].option_code
+                ),
+            )
+            for (match, _), proxy in zip(combination, proxy_legs, strict=True)
+        )
+        joint_probability = Decimal("1")
+        combined_odds = Decimal("1")
+        for _, option in combination:
+            joint_probability *= option.probability
+            combined_odds *= option.odds
+        ai_summary = analysis.summary
     pass_size = len(combination)
     issue_date = max(_business_day(match, now) for match, _ in combination).isoformat()
     recommendation_date = now.date().isoformat()
@@ -229,17 +290,19 @@ def _build_recommendation(
         and any(estimate_expected_goals(match) is not None for match, _ in combination)
     )
     analysis_note = (
-        f"已启用本地泊松自动分析：数据完整时根据比分市场估算双方预期进球，"
-        f"模型权重{settings.poisson_model_weight:.0%}；数据不足的场次自动回退市场概率"
-        if analysis_active
-        else "本地泊松自动分析已关闭，本次仅使用市场隐含概率"
+        "本计划的逐场结果由AI联网分析基础赛程信息后预测；赔率和概率仅用于预测落地后的奖金展示"
+        if ai_required
+        else (
+            f"已启用本地泊松自动分析：数据完整时根据比分市场估算双方预期进球，"
+            f"模型权重{settings.poisson_model_weight:.0%}；数据不足的场次自动回退市场概率"
+            if analysis_active
+            else "本地泊松自动分析已关闭，本次仅使用市场隐含概率"
+        )
     )
     if market is MarketType.HAD:
         plan_id = f"HAD{pass_size}-{now:%Y%m%d}-{digest}"
-        strategy_version = (
-            HAD_STRATEGY_VERSION
-            if analysis_active
-            else HAD_MARKET_ONLY_STRATEGY_VERSION
+        strategy_version = AI_HAD_STRATEGY_VERSION if ai_required else (
+            HAD_STRATEGY_VERSION if analysis_active else HAD_MARKET_ONLY_STRATEGY_VERSION
         )
         notes = [
             "每场仅选择胜平负中的一个结果：主胜、平或客胜",
@@ -250,10 +313,8 @@ def _build_recommendation(
         reason = f"已生成一张2元胜平负{pass_size}串1基准计划"
     elif market is MarketType.TTG:
         plan_id = f"TTG{pass_size}-{now:%Y%m%d}-{digest}"
-        strategy_version = (
-            TTG_STRATEGY_VERSION
-            if analysis_active
-            else TTG_MARKET_ONLY_STRATEGY_VERSION
+        strategy_version = AI_TTG_STRATEGY_VERSION if ai_required else (
+            TTG_STRATEGY_VERSION if analysis_active else TTG_MARKET_ONLY_STRATEGY_VERSION
         )
         notes = [
             "每场仅选择一个总进球数结果：0至6球或7+",
@@ -264,10 +325,8 @@ def _build_recommendation(
         reason = f"已生成一张2元进球数{pass_size}串1基准计划"
     else:
         plan_id = f"BF{pass_size}-{now:%Y%m%d}-{digest}"
-        strategy_version = (
-            STRATEGY_VERSION
-            if analysis_active
-            else MARKET_ONLY_STRATEGY_VERSION
+        strategy_version = AI_CRS_STRATEGY_VERSION if ai_required else (
+            STRATEGY_VERSION if analysis_active else MARKET_ONLY_STRATEGY_VERSION
         )
         notes = [
             "每场仅选择一个明确比分，排除胜其他、平其他、负其他",
@@ -280,8 +339,7 @@ def _build_recommendation(
     days = {_business_day(match, now) for match, _ in combination}
     if len(days) > 1:
         notes.append("本计划包含两个比赛编号日期，必须在最早一场停止销售前一次性到实体终端确认并购买")
-    ai_summary = ""
-    if settings.ai_analysis_enabled or ai_runtime is not None:
+    if not ai_required and (settings.ai_analysis_enabled or ai_runtime is not None):
         ai_summary = analyze_matches(combination, market, settings, ai_runtime)
     recommendation = Recommendation(
         plan_id=plan_id,
@@ -398,6 +456,8 @@ def select_market_plans(
     max_pass_size: int,
     plan_count: int,
     ai_runtime: AIModelRuntime | None = None,
+    ai_required: bool = False,
+    history_context: str = "",
 ) -> list[SelectionResult]:
     """Generate unique plans at the highest currently available pass size."""
     if now.tzinfo is None:
@@ -438,6 +498,17 @@ def select_market_plans(
             )
             inspected += count
             if valid_combinations:
+                if ai_required:
+                    # The matches sent to AI must not be chosen by a hidden
+                    # odds/probability preference. Keep fixture selection
+                    # deterministic; odds are used only after AI picks map to
+                    # real options, for display and prize calculation.
+                    valid_combinations.sort(
+                        key=lambda item: tuple(
+                            (match.start_at, match.match_num, match.match_id)
+                            for match, _ in item[2]
+                        )
+                    )
                 break
         if valid_combinations:
             return [
@@ -449,6 +520,8 @@ def select_market_plans(
                     inspected,
                     market=market,
                     ai_runtime=ai_runtime,
+                    ai_required=ai_required,
+                    history_context=history_context,
                 )
                 for selected in valid_combinations[:plan_count]
             ]

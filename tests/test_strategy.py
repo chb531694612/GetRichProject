@@ -9,6 +9,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from score_fourfold.domain import MarketType
+from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
 from score_fourfold.strategy import calculate_prize, select_fourfold, select_market_plans
 
 from .helpers import make_match, make_settings
@@ -156,6 +157,44 @@ class StrategyTests(unittest.TestCase):
         mocked.assert_called_once()
         self.assertEqual(recommendation.ai_summary, "球队近期状态正常，仍需注意临场变化。")
         self.assertFalse(any("AI 分析摘要" in note for note in recommendation.notes))
+
+    def test_ai_required_uses_ai_picks_for_the_generated_plan(self):
+        settings = make_settings(self.tmp_path, qwen_api_key="secret")
+        matches = [make_match(i, self.now) for i in range(1, 5)]
+
+        def prediction(legs, *_args, **_kwargs):
+            return AIPlanAnalysis(
+                summary="AI联网预测摘要",
+                suggestions=tuple(
+                    AIOptionSuggestion(leg.match_id, "s01s01", "1:1", "联网分析")
+                    for leg in legs
+                ),
+            )
+
+        with patch(
+            "score_fourfold.strategy.analyze_plan_from_leg_data",
+            side_effect=prediction,
+        ) as mocked:
+            result = select_market_plans(
+                matches,
+                self.now,
+                settings,
+                market=MarketType.CRS,
+                min_pass_size=4,
+                max_pass_size=4,
+                plan_count=1,
+                ai_required=True,
+                history_context="匿名历史统计",
+            )[0]
+
+        recommendation = result.recommendation
+        assert recommendation is not None
+        mocked.assert_called_once()
+        self.assertTrue(all(leg.score.label == "1:1" for leg in recommendation.legs))
+        self.assertEqual(recommendation.ai_summary, "AI联网预测摘要")
+        self.assertEqual(recommendation.strategy_version, "ai-web-search-crs-v1")
+        self.assertEqual(recommendation.combined_odds, Decimal("3164.06250000"))
+        self.assertTrue(any("逐场结果由AI联网分析" in note for note in recommendation.notes))
 
     def test_tax_threshold_and_cap(self):
         gross, tax, net = calculate_prize(Decimal("4999"))

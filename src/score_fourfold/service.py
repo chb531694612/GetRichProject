@@ -7,7 +7,7 @@ from decimal import Decimal
 from threading import Lock
 from typing import Callable
 
-from .ai_analyzer import query_results_via_ai
+from .ai_analyzer import AIAnalysisError, query_results_via_ai
 from .config import Settings
 from .database import Database, StoredPlan
 from .domain import MarketType, MatchResult, PlanStatus, ResultStatus, Settlement
@@ -146,16 +146,34 @@ class ScoreFourfoldService:
                 # A model or secret configuration problem must never block the
                 # core recommendation flow.
                 ai_runtime = None
-        selections = select_market_plans(
-            matches,
-            wall_after_fetch,
-            self.settings,
-            market=market,
-            min_pass_size=profile.min_pass_size,
-            max_pass_size=profile.max_pass_size,
-            plan_count=remaining,
-            ai_runtime=ai_runtime,
-        )
+        if ai_runtime is None and not self.settings.qwen_api_key:
+            return JobOutcome(
+                "no-recommendation",
+                f"{market.label_zh}计划需要 AI 预测，但当前没有启用可用的大模型",
+            )
+        try:
+            selections = select_market_plans(
+                matches,
+                wall_after_fetch,
+                self.settings,
+                market=market,
+                min_pass_size=profile.min_pass_size,
+                max_pass_size=profile.max_pass_size,
+                plan_count=remaining,
+                ai_runtime=ai_runtime,
+                ai_required=True,
+                history_context=self.database.ai_history_context(market),
+            )
+        except AIAnalysisError as exc:
+            self.database.add_log(
+                "ai",
+                f"{market.label_zh}计划未生成：AI预测失败",
+                str(exc),
+            )
+            return JobOutcome(
+                "no-recommendation",
+                f"{market.label_zh}计划未生成：AI预测失败（{exc}）",
+            )
         created_plans: list[str] = []
         no_recommendation_reasons: list[str] = []
         for selection in selections:

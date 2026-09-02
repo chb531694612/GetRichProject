@@ -10,6 +10,8 @@ from score_fourfold.database import Database
 from score_fourfold.mail import Mailer
 from score_fourfold.provider import JsonProvider
 from score_fourfold.service import ScoreFourfoldService
+from score_fourfold.ai_analyzer import AIOptionSuggestion, AIPlanAnalysis
+from unittest.mock import patch
 
 from .helpers import make_settings
 
@@ -65,6 +67,7 @@ class FullFlowTests(unittest.TestCase):
             database_path=database_path,
             mail_preview_dir=tmp_path,
             had_enabled=False,
+            qwen_api_key="secret",
         )
         database = Database(settings.database_path)
         database.initialize()
@@ -78,7 +81,20 @@ class FullFlowTests(unittest.TestCase):
             clock=clock,
         )
 
-        recommendation_outcome = service.recommend(now)
+        def prediction(legs, *_args, **_kwargs):
+            return AIPlanAnalysis(
+                summary="AI联网预测摘要",
+                suggestions=tuple(
+                    AIOptionSuggestion(leg.match_id, "s01s00", "1:0", "联网分析")
+                    for leg in legs
+                ),
+            )
+
+        with patch(
+            "score_fourfold.strategy.analyze_plan_from_leg_data",
+            side_effect=prediction,
+        ):
+            recommendation_outcome = service.recommend(now)
         self.assertEqual(recommendation_outcome.status, "created")
         early = service.send_mail(now)
         self.assertIn("无待发", early.detail)

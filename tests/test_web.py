@@ -650,11 +650,24 @@ class ManualActionAndDatabaseGateTests(unittest.TestCase):
 
     def test_manual_request_replay_runs_provider_once_and_marks_due_slot(self):
         service, provider = self._service()
+        service.settings = replace(service.settings, qwen_api_key="secret")
+        service.provider.settings = service.settings
+        service.mailer.settings = service.settings
         wake = threading.Event()
         trigger = _build_manual_trigger(service, wake)
         request_id = "manual-request-20260715-0001"
 
-        first = trigger(request_id)
+        with patch(
+            "score_fourfold.strategy.analyze_plan_from_leg_data",
+            side_effect=lambda legs, *_args, **_kwargs: AIPlanAnalysis(
+                "AI联网预测摘要",
+                tuple(
+                    AIOptionSuggestion(leg.match_id, "s01s00", "1:0", "联网分析")
+                    for leg in legs
+                ),
+            ),
+        ):
+            first = trigger(request_id)
         second = trigger(request_id)
 
         self.assertEqual(first[0], "created")
