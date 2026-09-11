@@ -339,7 +339,8 @@ class SettingsRepositoryTests(unittest.TestCase):
                 )
         with self.assertRaises(ValueError) as ctx:
             repository.set_active_model_config(zhipu_id, now=self.now)
-        self.assertIn("联网搜索", str(ctx.exception))
+        # 智谱没有 Responses 适配器，无法满足强制联网，无论如何都不能启用。
+        self.assertIn("无法作为当前模型", str(ctx.exception))
 
     def test_updates_business_settings_and_exposes_effective_runtime(self):
         settings = make_settings(self.root, database_path=self.database_path)

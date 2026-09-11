@@ -647,6 +647,7 @@ class Database:
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
                     active_model_config_id TEXT REFERENCES ai_model_configs(model_config_id),
+                    search_model_config_id TEXT,
                     http_timeout_seconds INTEGER NOT NULL CHECK (http_timeout_seconds >= 0),
                     updated_at TEXT NOT NULL
                 )
@@ -666,6 +667,18 @@ class Database:
             connection.execute("DROP TABLE ai_runtime_settings")
             connection.execute(
                 "ALTER TABLE ai_runtime_settings_v2 RENAME TO ai_runtime_settings"
+            )
+
+        # 联网检索层：可指定另一个模型先联网检索资料，再把资料作为参考上下文
+        # 喂给当前模型。这样即使主模型自身不执行 web_search（例如 DeepSeek 官方
+        # flash），也能拿到联网信息。旧库升级时补列，保持幂等。
+        ai_runtime_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(ai_runtime_settings)")
+        }
+        if "search_model_config_id" not in ai_runtime_columns:
+            connection.execute(
+                "ALTER TABLE ai_runtime_settings ADD COLUMN search_model_config_id TEXT"
             )
 
         connection.execute("PRAGMA user_version = 10")

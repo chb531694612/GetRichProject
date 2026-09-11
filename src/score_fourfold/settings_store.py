@@ -692,6 +692,7 @@ class SettingsRepository:
             "ai": {
                 "enabled": bool(ai_runtime["enabled"]),
                 "active_model_config_id": ai_runtime["active_model_config_id"],
+                "search_model_config_id": ai_runtime["search_model_config_id"] or "",
                 "http_timeout_seconds": int(ai_runtime["http_timeout_seconds"]),
                 "models": [
                     {
@@ -701,6 +702,7 @@ class SettingsRepository:
                         "base_url": row["base_url"],
                         "model_name": row["model_name"],
                         "thinking_enabled": bool(row["thinking_enabled"]),
+                        "web_search_required": bool(row["web_search_required"]),
                         "api_key_configured": bool(
                             row["api_key_ciphertext"] or row["api_key_env"]
                         ),
@@ -853,14 +855,8 @@ class SettingsRepository:
                     )
         return rewritten
 
-    def model_runtime(self, model_config_id: str) -> AIModelRuntime:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM ai_model_configs WHERE model_config_id = ?",
-                (model_config_id,),
-            ).fetchone()
-        if row is None:
-            raise ValueError("模型配置不存在")
+    def _runtime_from_row(self, row: Any) -> AIModelRuntime:
+        """把 ai_model_configs 行转成运行时对象（不含外部检索提供者）。"""
         return AIModelRuntime(
             config_id=row["model_config_id"],
             provider=row["provider"],
@@ -871,7 +867,37 @@ class SettingsRepository:
                 row["api_key_env"],
             ),
             thinking_enabled=bool(row["thinking_enabled"]),
+            web_search_required=bool(row["web_search_required"]),
         )
+
+    @staticmethod
+    def _search_config_id(connection: Any) -> str:
+        row = connection.execute(
+            "SELECT search_model_config_id FROM ai_runtime_settings WHERE singleton_id = 1"
+        ).fetchone()
+        return (row["search_model_config_id"] or "") if row is not None else ""
+
+    def model_runtime(self, model_config_id: str) -> AIModelRuntime:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_model_configs WHERE model_config_id = ?",
+                (model_config_id,),
+            ).fetchone()
+            # 检索提供者只在最外层挂一次：它自身不再挂提供者，避免自引用或互相
+            # 引用导致无限递归。
+            search_id = self._search_config_id(connection)
+            search_row = None
+            if search_id and search_id != model_config_id:
+                search_row = connection.execute(
+                    "SELECT * FROM ai_model_configs WHERE model_config_id = ?",
+                    (search_id,),
+                ).fetchone()
+        if row is None:
+            raise ValueError("模型配置不存在")
+        runtime = self._runtime_from_row(row)
+        if search_row is not None:
+            runtime = replace(runtime, reference_provider=self._runtime_from_row(search_row))
+        return runtime
 
     def active_model_runtime(self) -> AIModelRuntime | None:
         with self.database.connect() as connection:
@@ -891,6 +917,7 @@ class SettingsRepository:
         model_name: str,
         api_key: str = "",
         thinking_enabled: bool = False,
+        web_search_required: bool | None = None,
         model_config_id: str = "",
         now: datetime | None = None,
     ) -> str:
@@ -915,6 +942,10 @@ class SettingsRepository:
             ).fetchone()
         if model_config_id and existing is None:
             raise ValueError("模型配置不存在")
+
+        # 未显式传入时沿用该配置原有的联网要求；新建配置默认要求联网。
+        if web_search_required is None:
+            web_search_required = bool(existing["web_search_required"]) if existing else True
 
         api_key_ciphertext = existing["api_key_ciphertext"] if existing else ""
         api_key_env = existing["api_key_env"] if existing else ""
@@ -951,7 +982,7 @@ class SettingsRepository:
                         (model_config_id, provider, display_name, base_url, model_name,
                          api_key_ciphertext, api_key_env, web_search_required, thinking_enabled,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         config_id,
@@ -961,6 +992,7 @@ class SettingsRepository:
                         model_name,
                         api_key_ciphertext,
                         api_key_env,
+                        int(bool(web_search_required)),
                         int(bool(thinking_enabled)),
                         timestamp,
                         timestamp,
@@ -972,7 +1004,7 @@ class SettingsRepository:
                     UPDATE ai_model_configs
                     SET provider = ?, display_name = ?, base_url = ?, model_name = ?,
                         api_key_ciphertext = ?, api_key_env = ?,
-                        thinking_enabled = ?,
+                        web_search_required = ?, thinking_enabled = ?,
                         last_test_status = 'untested', last_test_detail = '',
                         last_tested_at = NULL, updated_at = ?
                     WHERE model_config_id = ?
@@ -984,6 +1016,7 @@ class SettingsRepository:
                         model_name,
                         api_key_ciphertext,
                         api_key_env,
+                        int(bool(web_search_required)),
                         int(bool(thinking_enabled)),
                         timestamp,
                         config_id,
@@ -1060,7 +1093,8 @@ class SettingsRepository:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT provider, last_test_status FROM ai_model_configs WHERE model_config_id = ?",
+                "SELECT provider, last_test_status, web_search_required "
+                "FROM ai_model_configs WHERE model_config_id = ?",
                 (config_id,),
             ).fetchone()
             if row is None:
@@ -1070,9 +1104,11 @@ class SettingsRepository:
                     "该模型尚未通过测试，请先点击“测试并启用”验证后再切换"
                 )
             spec = PROVIDER_BY_CODE.get(row["provider"])
-            if spec is None or not spec.native_web_search or spec.protocol != "responses":
+            if spec is None or spec.protocol != "responses":
+                raise ValueError("该供应商当前没有可用的调用适配器，无法作为当前模型")
+            if bool(row["web_search_required"]) and not spec.native_web_search:
                 raise ValueError(
-                    "该供应商当前不支持项目要求的强制联网搜索，无法作为当前模型"
+                    "该配置要求模型自己联网，但该供应商的官方接口不支持，无法作为当前模型"
                 )
             connection.execute(
                 """
@@ -1083,14 +1119,62 @@ class SettingsRepository:
                 (config_id, timestamp),
             )
 
+    def set_search_model_config(
+        self,
+        model_config_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """设置「联网检索模型」。传空字符串表示关闭外部检索。
+
+        该模型负责在主模型调用前先联网检索公开资料，再把资料作为参考上下文
+        喂给主模型；因此它自己必须是一个已通过测试、具备联网搜索能力的配置。
+        """
+        config_id = model_config_id.strip()
+        timestamp = (now or datetime.now(self.legacy.timezone)).isoformat()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if config_id:
+                row = connection.execute(
+                    "SELECT provider, last_test_status, web_search_required "
+                    "FROM ai_model_configs WHERE model_config_id = ?",
+                    (config_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("模型配置不存在")
+                if row["last_test_status"] != "passed":
+                    raise ValueError("该模型尚未通过测试，不能作为联网检索模型")
+                if not bool(row["web_search_required"]):
+                    raise ValueError("该模型已被设为不自行联网，不能作为联网检索模型")
+                spec = PROVIDER_BY_CODE.get(row["provider"])
+                if (
+                    spec is None
+                    or not spec.native_web_search
+                    or spec.protocol != "responses"
+                ):
+                    raise ValueError("该模型不具备联网搜索能力，不能作为联网检索模型")
+            connection.execute(
+                "UPDATE ai_runtime_settings SET search_model_config_id = ?, updated_at = ? "
+                "WHERE singleton_id = 1",
+                (config_id or None, timestamp),
+            )
+
     def delete_model_config(self, model_config_id: str) -> bool:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             runtime = connection.execute(
-                "SELECT active_model_config_id FROM ai_runtime_settings WHERE singleton_id = 1"
+                "SELECT active_model_config_id, search_model_config_id "
+                "FROM ai_runtime_settings WHERE singleton_id = 1"
             ).fetchone()
             if runtime and runtime["active_model_config_id"] == model_config_id:
                 raise ValueError("当前启用模型不能删除，请先测试并启用另一个模型")
+            # 被删掉的模型如果正作为联网检索来源，直接清空该设置，避免主模型
+            # 每次调用都去查一个不存在的配置。
+            if runtime and runtime["search_model_config_id"] == model_config_id:
+                connection.execute(
+                    "UPDATE ai_runtime_settings SET search_model_config_id = NULL "
+                    "WHERE singleton_id = 1"
+                )
             cursor = connection.execute(
                 "DELETE FROM ai_model_configs WHERE model_config_id = ?",
                 (model_config_id,),

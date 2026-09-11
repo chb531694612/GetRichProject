@@ -322,6 +322,7 @@ class DashboardAPI:
             model_name=str(payload.get("model_name", "")),
             api_key=str(payload.get("api_key", "")),
             thinking_enabled=bool(payload.get("thinking_enabled", False)),
+            web_search_required=bool(payload.get("web_search_required", True)),
             model_config_id=str(payload.get("id", "")),
         )
         return {"model_config_id": model_id, "settings": self.settings()}
@@ -398,6 +399,13 @@ class DashboardAPI:
         if self.settings_repository is None:
             raise RuntimeError("settings repository is unavailable")
         self.settings_repository.set_active_model_config(model_config_id)
+        return self.settings()
+
+    def set_search_model(self, model_config_id: str) -> dict[str, Any]:
+        """设置「联网检索模型」；传空字符串表示关闭外部检索。"""
+        if self.settings_repository is None:
+            raise RuntimeError("settings repository is unavailable")
+        self.settings_repository.set_search_model_config(model_config_id)
         return self.settings()
 
     def upload_ticket(self, plan_id: str, filename: str, data: bytes) -> tuple[str, str]:

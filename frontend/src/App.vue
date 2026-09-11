@@ -517,7 +517,7 @@ function resetPrompts() {
   }
 }
 
-const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '', thinking_enabled: false })
+const modelForm = reactive({ id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '', thinking_enabled: false, web_search_required: true })
 function selectedProvider() { return settings.value?.providers?.find((item: any) => item.code === modelForm.provider) }
 function applyProviderDefaults() {
   const provider = selectedProvider()
@@ -529,9 +529,34 @@ function applyProviderDefaults() {
 function editModel(model?: any) {
   Object.assign(modelForm, model ? {
     id: model.id, provider: model.provider, display_name: model.display_name,
-    base_url: model.base_url, model_name: model.model_name, api_key: '', thinking_enabled: Boolean(model.thinking_enabled),
-  } : { id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '', thinking_enabled: false })
+    base_url: model.base_url, model_name: model.model_name, api_key: '',
+    thinking_enabled: Boolean(model.thinking_enabled),
+    web_search_required: model.web_search_required !== false,
+  } : {
+    id: '', provider: 'qwen', display_name: '', base_url: '', model_name: '', api_key: '',
+    thinking_enabled: false, web_search_required: true,
+  })
   if (!model) applyProviderDefaults()
+}
+function searchModelName(id: string) {
+  const model = settings.value?.ai?.models?.find((item: any) => item.id === id)
+  return model ? model.display_name : id
+}
+function modelSearchLabel(model: any) {
+  if (model.web_search_required) return '由本模型联网搜索'
+  const searchId = settings.value?.ai?.search_model_config_id
+  if (searchId && searchId !== model.id) return `由「${searchModelName(searchId)}」检索后提供`
+  return '不联网'
+}
+async function saveSearchModel(event: Event) {
+  const modelConfigId = (event.target as HTMLSelectElement).value
+  busy.value = 'search-model'
+  try {
+    const response = await apiPost<any>('/api/v1/settings/search-model', { model_config_id: modelConfigId })
+    settings.value = response.data
+    toast(response.detail || '已更新联网检索模型')
+  } catch (error) { toast((error as Error).message, 'error') }
+  finally { busy.value = '' }
 }
 async function saveModel() {
   busy.value = 'model-save'
@@ -867,13 +892,23 @@ onBeforeUnmount(() => {
           </section>
           <section v-else-if="settingsTab === 'models'">
             <h3>大模型</h3>
-            <p class="hint">可添加多个模型，但同一时间只启用一个。点击“测试并启用”会真实调用 API 并核验联网搜索能力，失败不会替换当前模型。已通过测试的模型可随时“切换为当前”。</p>
+            <p class="hint">可添加多个模型，但同一时间只启用一个。点击“测试并启用”会真实调用 API，失败不会替换当前模型。已通过测试的模型可随时“切换为当前”。</p>
+            <div class="form-grid">
+              <label class="wide">联网检索模型
+                <select :value="settings.ai.search_model_config_id || ''" :disabled="busy === 'search-model'" @change="saveSearchModel">
+                  <option value="">不额外检索（由当前模型自己联网）</option>
+                  <option v-for="model in settings.ai.models" :key="model.id" :value="model.id" :disabled="!model.web_search_required">{{ model.display_name }}{{ model.web_search_required ? '' : '（未开启自行联网）' }}</option>
+                </select>
+              </label>
+              <p class="hint wide">指定后，每次 AI 分析都会先让该模型联网检索资料，再把资料作为参考上下文交给当前启用的模型。适合当前模型自己不执行联网搜索的情况（例如 DeepSeek 官方 flash）。</p>
+            </div>
             <div class="model-list">
               <article v-for="model in settings.ai.models" :key="model.id" :class="{ active: settings.ai.active_model_config_id === model.id }">
                 <div>
                   <b>{{ model.display_name }}</b>
                   <span>{{ model.provider }} · {{ model.model_name }}</span>
                   <span>深度思考：{{ model.thinking_enabled ? '已开启' : '已关闭' }}</span>
+                  <span>联网：{{ modelSearchLabel(model) }}</span>
                   <small :class="model.last_test_status">{{ model.last_test_detail || '尚未测试' }}</small>
                   <span v-if="settings.ai.active_model_config_id === model.id" class="active-badge">当前正在使用</span>
                 </div>
@@ -901,8 +936,10 @@ onBeforeUnmount(() => {
                 <label>调用模型<input v-model="modelForm.model_name" /></label>
                 <label>API Key<input v-model="modelForm.api_key" type="password" :placeholder="modelForm.id ? '留空表示不修改' : '输入 API Key'" /></label>
                 <label class="switch-row wide"><input v-model="modelForm.thinking_enabled" type="checkbox" />开启深度思考（会显著增加 Token 消耗和费用）</label>
+                <label class="switch-row wide"><input v-model="modelForm.web_search_required" type="checkbox" />要求该模型自己联网搜索</label>
               </div>
-              <p v-if="selectedProvider() && !selectedProvider().native_web_search" class="warning">该厂商当前标准接口不支持系统强制联网搜索，可保存配置，但“测试并启用”会明确失败。</p>
+              <p v-if="modelForm.web_search_required && selectedProvider() && !selectedProvider().native_web_search" class="warning">该厂商的标准接口不支持联网搜索，勾选“要求该模型自己联网搜索”时无法启用。取消勾选后可保存启用，但需要在上方指定“联网检索模型”，否则分析将完全依赖模型自身记忆。</p>
+              <p v-else-if="!modelForm.web_search_required && !settings.ai.search_model_config_id" class="warning">该模型不会自己联网。当前没有指定“联网检索模型”，AI 分析将拿不到近期公开资料（AI 联网查赛果也会不可用）。</p>
               <div class="form-actions">
                 <button class="soft" @click="editModel()">取消编辑</button>
                 <button @click="saveModel">{{ modelForm.id ? '保存修改' : '新增模型' }}</button>

@@ -1252,6 +1252,13 @@ def build_handler(application: DashboardApplication):
                     elif section == "model-activate":
                         data = dashboard_api.activate_model(str(payload.get("model_config_id", "")))
                         detail = "已切换为当前使用的大模型"
+                    elif section == "search-model":
+                        data = dashboard_api.set_search_model(str(payload.get("model_config_id", "")))
+                        detail = (
+                            "已设置联网检索模型"
+                            if str(payload.get("model_config_id", "")).strip()
+                            else "已关闭外部联网检索"
+                        )
                     else:
                         data = dashboard_api.update_settings_section(section, payload)
                         detail = "设置已保存并立即生效"

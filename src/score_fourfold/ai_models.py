@@ -35,6 +35,13 @@ class AIModelRuntime:
     model_name: str
     api_key: str
     thinking_enabled: bool = False
+    # 该模型是否必须由自己完成联网搜索。置 False 时允许使用不联网的模型
+    # （例如 DeepSeek 官方 flash 不执行 web_search），改由 reference_provider
+    # 先检索资料、再把资料作为参考上下文喂给它。
+    web_search_required: bool = True
+    # 可选的「检索提供者」：在调用本模型之前，先用它联网检索并产出一份资料
+    # 简报，拼进提示词。为空表示不做外部检索，行为与历史版本完全一致。
+    reference_provider: "AIModelRuntime | None" = None
 
 
 PROVIDERS: tuple[ProviderSpec, ...] = (
@@ -97,8 +104,19 @@ def prompt_overrides() -> dict[str, str]:
     return dict(_PROMPT_OVERRIDES)
 
 
-def effective_system_prompt() -> str:
-    return _PROMPT_OVERRIDES["system"] or DEFAULT_SYSTEM_PROMPT
+# 不要求模型自己联网时使用的默认系统提示词：此时资料由检索提供者供给，
+# 再让模型「先联网检索」会自相矛盾。
+DEFAULT_SYSTEM_PROMPT_WITH_REFERENCE = (
+    "你是一名足球比赛信息分析师。请严格依据已提供的参考资料和用户要求输出，"
+    "不得编造参考资料中没有的信息。"
+)
+
+
+def effective_system_prompt(web_search_required: bool = True) -> str:
+    override = _PROMPT_OVERRIDES["system"]
+    if override:
+        return override
+    return DEFAULT_SYSTEM_PROMPT if web_search_required else DEFAULT_SYSTEM_PROMPT_WITH_REFERENCE
 
 
 def validate_runtime(runtime: AIModelRuntime) -> ProviderSpec:
@@ -112,7 +130,9 @@ def validate_runtime(runtime: AIModelRuntime) -> ProviderSpec:
         raise AIModelError("调用模型不能为空")
     if not runtime.api_key:
         raise AIModelError("API Key 未配置")
-    if not spec.native_web_search:
+    # 只有在该模型被要求「自己联网」时才校验供应商的联网能力；关掉该要求后
+    # 允许启用不联网的模型，由检索提供者供给资料。
+    if runtime.web_search_required and not spec.native_web_search:
         raise AIModelError(
             f"{spec.name} 当前配置的官方接口不支持本项目要求的强制联网搜索，不能启用"
         )
@@ -149,6 +169,128 @@ def _response_text_and_search(payload: dict[str, Any]) -> tuple[str, bool]:
     return text, searched
 
 
+# 外部检索用的提示词。只要求产出可核实的资料，不给预测，便于安全地作为
+# 参考上下文拼进主模型的提示词。
+RETRIEVAL_INSTRUCTION = (
+    "你是足球资料检索员。请联网检索下面这些比赛的公开信息，输出一份客观的资料简报，"
+    "供另一位分析师参考。\n\n"
+    "严格要求：\n"
+    "1. 逐场输出并标注比赛编号，与清单一一对应；\n"
+    "2. 只写检索到的可核实事实：双方近期战绩、历史交锋、伤停与停赛、关键球员状态、"
+    "赛程密度与主客场表现；\n"
+    "3. 信息注明来源日期；确实检索不到就写「未检索到」，严禁编造；\n"
+    "4. 只输出资料简报，不要给预测、推荐或投注建议；\n"
+    "5. 不要讨论赔率、SP值、概率或系统策略。\n\n"
+    "= = = 比赛清单 = = =\n\n"
+)
+
+
+def _post_responses(
+    base_url: str, api_key: str, payload: dict[str, Any], timeout_seconds: int
+) -> dict[str, Any]:
+    """发送一次 Responses 请求，返回已校验状态与错误的 JSON 结果。"""
+    # 0 或负数表示不限制超时：思考模型 + 强制联网搜索的完整分析
+    # （例如 6 场比赛的 HAD 计划）可能远超 600 秒，由后台任务耐心等待。
+    timeout = timeout_seconds if timeout_seconds > 0 else None
+    request = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ScoreFourfold/0.7.0 (required-web-search)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+        except Exception:
+            detail = ""
+        raise AIModelError(f"模型接口返回 HTTP {exc.code}：{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise AIModelError(f"无法连接模型接口：{exc.reason}") from exc
+    except TimeoutError as exc:
+        if timeout is None:
+            raise AIModelError("模型调用超时") from exc
+        raise AIModelError(f"模型调用超过 {timeout_seconds} 秒") from exc
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AIModelError("模型返回的不是 JSON") from exc
+    if not isinstance(result, dict):
+        raise AIModelError("模型返回结构无效")
+    if result.get("error"):
+        raise AIModelError(f"模型接口错误：{result['error']}")
+    status = result.get("status")
+    if status not in {None, "completed"}:
+        details = result.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else ""
+        if status == "incomplete" and reason == "max_output_tokens":
+            raise AIModelError("模型输出达到长度上限，未能生成完整推荐，请重试")
+        suffix = f"（原因：{reason}）" if reason else ""
+        raise AIModelError(f"模型任务状态异常：{status}{suffix}")
+    return result
+
+
+def _retrieve_reference(
+    search_runtime: AIModelRuntime, prompt: str, timeout_seconds: int
+) -> str:
+    """先用具备联网能力的模型做一次检索，返回资料简报；失败返回空字符串。
+
+    检索只是给主模型补充外部事实，任何失败都不应该阻断分析主流程。
+    """
+    try:
+        result = _post_responses(
+            search_runtime.base_url,
+            search_runtime.api_key,
+            {
+                "model": search_runtime.model_name,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": "你是严谨的足球资料检索员，只输出可核实的事实。",
+                    },
+                    {"role": "user", "content": RETRIEVAL_INSTRUCTION + prompt},
+                ],
+                "tools": [{"type": "web_search"}],
+                "tool_choice": {"type": "web_search"},
+                "max_output_tokens": 4096,
+            },
+            timeout_seconds,
+        )
+        text, searched = _response_text_and_search(result)
+        if not searched:
+            LOGGER.warning(
+                "检索模型 %s 没有执行联网搜索，本次不带外部资料继续分析",
+                search_runtime.model_name,
+            )
+            return ""
+        LOGGER.info(
+            "检索模型 %s 已产出资料简报（%d 字）", search_runtime.model_name, len(text)
+        )
+        return text
+    except Exception as exc:  # noqa: BLE001 - 检索失败必须降级而不是中断
+        LOGGER.warning("检索模型 %s 调用失败：%s", search_runtime.model_name, exc)
+        return ""
+
+
+def _merge_reference(prompt: str, reference: str) -> str:
+    """把资料简报拼进提示词，并明确要求模型不得越过资料编造事实。"""
+    return (
+        f"{prompt}\n\n"
+        "============ 以下是检索员刚刚联网核实到的公开资料 ============\n"
+        f"{reference}\n"
+        "======================= 资料结束 =======================\n"
+        "请以上述资料中可核实的信息作为比赛分析依据。资料未覆盖的部分请明确说明"
+        "「资料未提供」，禁止凭记忆补充或编造具体战绩、比分、伤停信息。"
+    )
+
+
 def call_with_web_search(
     runtime: AIModelRuntime,
     prompt: str,
@@ -156,85 +298,48 @@ def call_with_web_search(
     timeout_seconds: int,
     max_output_tokens: int,
 ) -> str:
-    # 0 或负数表示不限制超时：思考模型 + 强制联网搜索的完整分析
-    # （例如 6 场比赛的 HAD 计划）可能远超 600 秒，由后台任务耐心等待。
-    timeout = timeout_seconds if timeout_seconds > 0 else None
     spec = validate_runtime(runtime)
+
+    # 外部检索：先用具备联网能力的模型产出资料简报，再拼进提示词。检索失败
+    # 不影响主流程，只是让主模型在缺少外部资料的情况下作答。
+    if runtime.reference_provider is not None:
+        reference = _retrieve_reference(runtime.reference_provider, prompt, timeout_seconds)
+        if reference:
+            prompt = _merge_reference(prompt, reference)
+
+    needs_own_search = runtime.web_search_required
     payload: dict[str, Any] = {
         "model": runtime.model_name,
         "input": [
-            {
-                "role": "system",
-                "content": effective_system_prompt(),
-            },
+            {"role": "system", "content": effective_system_prompt(needs_own_search)},
             {"role": "user", "content": prompt},
         ],
-        "tools": [{"type": "web_search"}],
         "max_output_tokens": max_output_tokens,
     }
-    # 百炼思考模式不允许 tool_choice="required"；开启时省略该参数并在响应端校验
-    # web_search_call。深度思考由每个模型配置明确控制，不能再根据输出额度自动开启。
-    # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
-    # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
-    # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
-    if spec.code == "qwen":
-        thinking = runtime.thinking_enabled
-        tools = [{"type": "web_search"}]
-        if thinking:
-            tools.append({"type": "web_extractor"})
-        payload["tools"] = tools
-        payload["enable_thinking"] = thinking
-        if not thinking:
+    if needs_own_search:
+        # 百炼思考模式不允许 tool_choice="required"；开启时省略该参数并在响应端校验
+        # web_search_call。深度思考由每个模型配置明确控制，不能再根据输出额度自动开启。
+        # 百炼 qwen3 系列 Normal 模式（enable_thinking=false）不支持 web_extractor，
+        # 且不会主动调用 web_search，因此 Normal 模式仅保留 web_search 并显式指定
+        # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
+        payload["tools"] = [{"type": "web_search"}]
+        if spec.code == "qwen":
+            thinking = runtime.thinking_enabled
+            tools = [{"type": "web_search"}]
+            if thinking:
+                tools.append({"type": "web_extractor"})
+            payload["tools"] = tools
+            payload["enable_thinking"] = thinking
+            if not thinking:
+                payload["tool_choice"] = {"type": "web_search"}
+        else:
             payload["tool_choice"] = {"type": "web_search"}
-    else:
-        payload["tool_choice"] = {"type": "web_search"}
 
     def _attempt(attempt: int) -> str:
         started_at = time.monotonic()
-        request = urllib.request.Request(
-            runtime.base_url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {runtime.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "ScoreFourfold/0.7.0 (required-web-search)",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = exc.read().decode("utf-8", errors="ignore")[:300]
-            except Exception:
-                detail = ""
-            raise AIModelError(f"模型接口返回 HTTP {exc.code}：{detail}") from exc
-        except urllib.error.URLError as exc:
-            raise AIModelError(f"无法连接模型接口：{exc.reason}") from exc
-        except TimeoutError as exc:
-            if timeout is None:
-                raise AIModelError("模型调用超时") from exc
-            raise AIModelError(f"模型调用超过 {timeout_seconds} 秒") from exc
-        try:
-            result = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AIModelError("模型返回的不是 JSON") from exc
-        if not isinstance(result, dict):
-            raise AIModelError("模型返回结构无效")
-        if result.get("error"):
-            raise AIModelError(f"模型接口错误：{result['error']}")
-        status = result.get("status")
-        if status not in {None, "completed"}:
-            details = result.get("incomplete_details")
-            reason = details.get("reason") if isinstance(details, dict) else ""
-            if status == "incomplete" and reason == "max_output_tokens":
-                raise AIModelError("模型输出达到长度上限，未能生成完整推荐，请重试")
-            suffix = f"（原因：{reason}）" if reason else ""
-            raise AIModelError(f"模型任务状态异常：{status}{suffix}")
+        result = _post_responses(runtime.base_url, runtime.api_key, payload, timeout_seconds)
         text, searched = _response_text_and_search(result)
-        if not searched:
+        if needs_own_search and not searched:
             raise AIModelError("模型连接正常，但没有执行项目要求的联网搜索")
         LOGGER.info(
             "AI model %s attempt %s completed in %.1f seconds",
@@ -272,9 +377,16 @@ def call_with_web_search(
 
 
 def test_model(runtime: AIModelRuntime, timeout_seconds: int) -> str:
+    # 要求模型自己联网时，用一条必须联网才能答对的提示词；否则只验证连通性，
+    # 因为不联网的模型无法知道当前时间。
+    prompt = (
+        "请联网查询当前北京时间。完成搜索后只回复：AI连接正常"
+        if runtime.web_search_required
+        else "只回复：AI连接正常"
+    )
     result = call_with_web_search(
         runtime,
-        "请联网查询当前北京时间。完成搜索后只回复：AI连接正常",
+        prompt,
         timeout_seconds=timeout_seconds,
         # 不能用 256：DeepSeek V4 系列默认开启思考模式，光 reasoning 就要吃掉
         # 200+ tokens，会把「没联网」误报成「输出达到长度上限」。1024 给思考
@@ -283,7 +395,11 @@ def test_model(runtime: AIModelRuntime, timeout_seconds: int) -> str:
     )
     if "AI连接正常" not in result.replace(" ", ""):
         raise AIModelError("模型已响应，但测试口令不正确")
-    return "API、模型和强制联网搜索测试通过"
+    if runtime.web_search_required:
+        return "API、模型和强制联网搜索测试通过"
+    if runtime.reference_provider is not None:
+        return "API、模型和联网检索资料测试通过"
+    return "API、模型和基础连通性测试通过"
 
 
 def public_provider_catalog() -> list[dict[str, Any]]:

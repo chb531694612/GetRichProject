@@ -201,6 +201,126 @@ class AIModelAdapterTests(unittest.TestCase):
         # qwen 专属字段不应出现在 DeepSeek 请求中。
         self.assertNotIn("enable_thinking", body)
 
+    def test_model_without_own_search_skips_web_search_tool(self):
+        """不要求模型自己联网时：请求不带搜索工具，也不再校验搜索结果。"""
+        runtime = AIModelRuntime(
+            config_id="deepseek-official",
+            provider="deepseek",
+            base_url="https://api.deepseek.com/responses",
+            model_name="deepseek-flash",
+            api_key="secret",
+            web_search_required=False,
+        )
+        payload = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "AI连接正常"}],
+                },
+            ],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            self.assertIn("测试通过", probe_model(runtime, 10))
+        body = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertNotIn("tools", body)
+        self.assertNotIn("tool_choice", body)
+
+    def test_reference_provider_feeds_retrieved_notes_to_main_model(self):
+        """配了检索提供者时：先由它联网检索，资料再作为参考上下文喂给主模型。"""
+        search_runtime = AIModelRuntime(
+            config_id="bailian-search",
+            provider="deepseek",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+            model_name="deepseek-v4-flash",
+            api_key="bailian-key",
+        )
+        main_runtime = AIModelRuntime(
+            config_id="deepseek-official",
+            provider="deepseek",
+            base_url="https://api.deepseek.com/responses",
+            model_name="deepseek-flash",
+            api_key="official-key",
+            web_search_required=False,
+            reference_provider=search_runtime,
+        )
+        search_payload = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"type": "search", "query": "阿森纳"},
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "资料：阿森纳近5场3胜2平。"}
+                    ],
+                },
+            ],
+        }
+        main_payload = {
+            "status": "completed",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "分析完成"}]}
+            ],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[_Response(search_payload), _Response(main_payload)],
+        ) as opened:
+            result = call_with_web_search(
+                main_runtime, "比赛清单", timeout_seconds=10, max_output_tokens=64
+            )
+        self.assertEqual(result, "分析完成")
+        self.assertEqual(opened.call_count, 2)
+        search_body = json.loads(opened.call_args_list[0].args[0].data.decode("utf-8"))
+        main_body = json.loads(opened.call_args_list[1].args[0].data.decode("utf-8"))
+        # 检索请求必须强制联网；主模型不自行联网，因此不带搜索工具。
+        self.assertEqual(search_body["tools"], [{"type": "web_search"}])
+        self.assertNotIn("tools", main_body)
+        # 检索到的资料必须真的出现在主模型的提示词里。
+        self.assertIn("阿森纳近5场3胜2平", main_body["input"][1]["content"])
+
+    def test_retrieval_failure_does_not_block_main_analysis(self):
+        """检索失败必须降级：主模型仍然照常分析。"""
+        broken_search = AIModelRuntime(
+            config_id="broken-search",
+            provider="deepseek",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+            model_name="deepseek-v4-flash",
+            api_key="bailian-key",
+        )
+        main_runtime = AIModelRuntime(
+            config_id="deepseek-official",
+            provider="deepseek",
+            base_url="https://api.deepseek.com/responses",
+            model_name="deepseek-flash",
+            api_key="official-key",
+            web_search_required=False,
+            reference_provider=broken_search,
+        )
+        main_payload = {
+            "status": "completed",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "分析完成"}]}
+            ],
+        }
+
+        def flaky(request, timeout=None):
+            if flaky.calls == 0:
+                flaky.calls += 1
+                raise _http_error(503)
+            flaky.calls += 1
+            return _Response(main_payload)
+
+        flaky.calls = 0
+        with patch("urllib.request.urlopen", side_effect=flaky):
+            result = call_with_web_search(
+                main_runtime, "比赛清单", timeout_seconds=10, max_output_tokens=64
+            )
+        self.assertEqual(result, "分析完成")
+
 
 class _ErrorResponse:
     def __init__(self, code, body=""):
