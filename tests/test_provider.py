@@ -85,6 +85,64 @@ class ProviderParsingTests(unittest.TestCase):
             with self.assertRaises(ProviderError):
                 provider.get_result_for_leg(leg)
 
+    def test_official_detail_page_fallback_accepts_next_day_kickoff(self):
+        """跨零点开赛（业务日次日的凌晨）必须通过官网详情兜底的日期校验。"""
+        provider = SportteryPageResultProvider(make_settings(Path("data")))
+        leg = SimpleNamespace(
+            match_id="2041389",
+            match_num="周五004",
+            business_date="2026-09-11",
+            home="赫根",
+            away="米亚尔比",
+            start_at=datetime(2026, 9, 12, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        head = {
+            "success": True,
+            "errorCode": "0",
+            "value": {
+                "sportteryMatchId": 2041389,
+                "matchNum": "周五004",
+                "matchDateTime": "2026-09-12 01:00",
+                "homeTeamShortName": "赫根",
+                "awayTeamShortName": "米亚尔比",
+                "fullCourtGoal": "1:0",
+            },
+        }
+        bonus = {
+            "success": True,
+            "errorCode": "0",
+            "value": {"matchId": 2041389, "isCancel": 0, "sectionsNo999": "1:0"},
+        }
+        with patch.object(provider, "_get_json", side_effect=[head, bonus]):
+            result = provider.get_result_for_leg(leg)
+        assert result is not None
+        self.assertEqual((result.home_score, result.away_score), (1, 0))
+
+    def test_official_detail_page_fallback_rejects_far_off_date(self):
+        """详情页返回的日期与业务日相差很远时仍然必须拒绝。"""
+        provider = SportteryPageResultProvider(make_settings(Path("data")))
+        leg = SimpleNamespace(
+            match_id="2040698",
+            match_num="周日011",
+            business_date="2026-08-02",
+            home="奥勒松",
+            away="特罗姆瑟",
+        )
+        head = {
+            "success": True,
+            "errorCode": "0",
+            "value": {
+                "sportteryMatchId": 2040698,
+                "matchNum": "周日011",
+                "matchDateTime": "2026-07-12 23:00",
+                "homeTeamShortName": "奥勒松",
+                "awayTeamShortName": "特罗姆瑟",
+            },
+        }
+        with patch.object(provider, "_get_json", return_value=head):
+            with self.assertRaises(ProviderError):
+                provider.get_result_for_leg(leg)
+
     def test_okooo_html_accepts_reordered_attributes_and_single_quotes(self):
         page = """
         <div data-hname='主队' id='match_123' data-aname='客队'

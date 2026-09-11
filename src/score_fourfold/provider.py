@@ -1007,6 +1007,37 @@ class SportteryPageResultProvider(SportteryProvider):
     def _normal_text(value: object) -> str:
         return re.sub(r"\s+", "", _str(value)).casefold()
 
+    @staticmethod
+    def _allowed_kickoff_dates(leg: Any) -> set[str]:
+        """Calendar dates on which a leg's fixture may legally kick off.
+
+        ``business_date`` is the 竞彩 sales date, but late-night European
+        fixtures kick off in the small hours of the *next* calendar day — which
+        is exactly what the detail page reports as ``matchDateTime``.  Comparing
+        the two as a plain prefix rejected every such fixture, so the official
+        detail fallback never worked for them.
+        """
+        allowed: set[str] = set()
+        business_date = _str(getattr(leg, "business_date", ""))[:10]
+        if business_date:
+            allowed.add(business_date)
+            try:
+                allowed.add(
+                    (date.fromisoformat(business_date) + timedelta(days=1)).isoformat()
+                )
+            except ValueError:
+                pass
+        start_at = getattr(leg, "start_at", None)
+        if isinstance(start_at, datetime):
+            allowed.add(start_at.date().isoformat())
+        return allowed
+
+    def _verify_match_date(self, leg: Any, actual_datetime: str) -> None:
+        actual_date = _str(actual_datetime)[:10]
+        allowed = self._allowed_kickoff_dates(leg)
+        if actual_date and allowed and actual_date not in allowed:
+            raise ProviderError("official detail page returned a different match date")
+
     def get_result_for_leg(self, leg: Any) -> MatchResult | None:
         """Return a verified official-page result for one stored plan leg."""
         match_id = _str(getattr(leg, "match_id", ""))
@@ -1023,10 +1054,7 @@ class SportteryPageResultProvider(SportteryProvider):
         if _str(head.get("sportteryMatchId")) != match_id:
             raise ProviderError("official detail page returned a different match ID")
 
-        expected_date = _str(getattr(leg, "business_date", ""))
-        actual_datetime = _str(head.get("matchDateTime"))
-        if expected_date and not actual_datetime.startswith(expected_date):
-            raise ProviderError("official detail page returned a different match date")
+        self._verify_match_date(leg, _str(head.get("matchDateTime")))
 
         expected_num = self._normal_text(getattr(leg, "match_num", ""))
         actual_num = self._normal_text(head.get("matchNum"))

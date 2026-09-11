@@ -36,6 +36,7 @@ class _ResultIndexes:
     team_index: dict[tuple[str, str], str]
     partial_index: list[tuple[str, str, str, str]]
     num_date_index: dict[tuple[str, str], str]
+    dates: dict[str, str]
 
 
 class ScoreFourfoldService:
@@ -356,6 +357,65 @@ class ScoreFourfoldService:
         """Extract the numeric part from a match number (e.g. '周二004' -> '004')."""
         return re.sub(r"\D", "", match_num)
 
+    @staticmethod
+    def _leg_business_date(leg) -> str:
+        """Return a leg's business date, falling back to its kickoff date."""
+        value = str(getattr(leg, "business_date", "") or "")
+        if value:
+            return value[:10]
+        start_at = getattr(leg, "start_at", None)
+        return start_at.date().isoformat() if isinstance(start_at, datetime) else ""
+
+    @staticmethod
+    def _dates_within_one_day(left: str, right: str) -> bool:
+        """True when two ISO dates are equal, one day apart, or uncheckable.
+
+        Kickoff may legitimately land one day after the 竞彩 business date
+        (late-night European matches), so the tolerance is ±1 day.  Missing or
+        malformed values return True — callers must rely on the other evidence.
+        """
+        if not left or not right:
+            return True
+        try:
+            return abs(
+                date.fromisoformat(left[:10]) - date.fromisoformat(right[:10])
+            ) <= timedelta(days=1)
+        except ValueError:
+            return True
+
+    @classmethod
+    def _match_num_matches(cls, result_num: str, leg_num: str) -> bool:
+        """Compare match numbers, preferring the full weekday + digits form.
+
+        ``周五004`` must never be treated as ``周一004``: the results feed
+        repeats the numeric part in every sales period, so a digits-only
+        comparison silently links a leg to a fixture from weeks earlier.
+        Historical legs that stored the digits alone (``001``) keep working
+        through the digits fallback, which the date check now backstops.
+        """
+        left = re.sub(r"\s+", "", str(result_num or ""))
+        right = re.sub(r"\s+", "", str(leg_num or ""))
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        if left.isdigit() or right.isdigit():
+            return cls._match_num_digits(left) == cls._match_num_digits(right)
+        return False
+
+    @staticmethod
+    def _has_kicked_off(leg, now: datetime) -> bool:
+        """A fixture that has not kicked off cannot have a settled result."""
+        start_at = getattr(leg, "start_at", None)
+        if not isinstance(start_at, datetime):
+            return True
+        reference = now
+        if start_at.tzinfo is None and reference.tzinfo is not None:
+            start_at = start_at.replace(tzinfo=reference.tzinfo)
+        elif start_at.tzinfo is not None and reference.tzinfo is None:
+            reference = reference.replace(tzinfo=start_at.tzinfo)
+        return start_at <= reference
+
     @classmethod
     def _result_matches_leg(cls, result: MatchResult, leg) -> bool:
         """Guard against match_id collisions between the odds and results feeds.
@@ -367,6 +427,17 @@ class ScoreFourfoldService:
         previous sales period vs 周日016 of the next).  Only accept a result
         for a leg when the fixtures plausibly match.
         """
+        # A result whose own match date is far from the leg's date belongs to
+        # another sales period: 周三004 佐加顿斯 vs 米亚尔比 of 09-01 must never
+        # settle 周五004 赫根 vs 米亚尔比 of 09-12.  The results feed always
+        # publishes matchDate, which is the only field that separates two
+        # fixtures between the same teams.
+        if not cls._dates_within_one_day(result.match_date, cls._leg_business_date(leg)):
+            return False
+        if not (result.home_team or result.away_team or result.match_num):
+            # Only the match_id links the record to the leg and nothing
+            # contradicts it (legacy normalized feeds carry no fixture fields).
+            return True
         if result.home_team and result.away_team:
             home_ok = cls._team_names_match(
                 cls._normalize_team(result.home_team), cls._normalize_team(leg.home)
@@ -376,20 +447,15 @@ class ScoreFourfoldService:
             )
             if home_ok and away_ok:
                 return True
-            # Partial transliteration variance (e.g. 雷克维京 vs 雷克雅未克维京人):
-            # one team matches exactly AND the match number digits agree.
-            if result.match_num and leg.match_num:
-                digits_ok = cls._match_num_digits(result.match_num) == cls._match_num_digits(
-                    leg.match_num
-                )
-                if digits_ok and (home_ok or away_ok):
-                    return True
+            # A single matching team name is only a transliteration fallback
+            # (e.g. 雷克维京 vs 雷克雅未克维京人) and needs the whole match
+            # number to agree as well — one team plus "004" is far too weak,
+            # since popular clubs appear in several fixtures per month.
+            if home_ok or away_ok:
+                return cls._match_num_matches(result.match_num, leg.match_num)
             return False
-        # Results without team names (e.g. a degraded third-party feed) can
-        # only be cross-checked by the match number digits.
-        if result.match_num and leg.match_num:
-            return cls._match_num_digits(result.match_num) == cls._match_num_digits(leg.match_num)
-        return True
+        # Results without team names can only be cross-checked by match number.
+        return cls._match_num_matches(result.match_num, leg.match_num)
 
     @staticmethod
     def _team_names_match(a: str, b: str) -> bool:
@@ -415,6 +481,8 @@ class ScoreFourfoldService:
         leg_match_num: str,
         team_index: dict[tuple[str, str], str],
         partial_index: list[tuple[str, str, str, str]],
+        leg_date: str = "",
+        dates: dict[str, str] | None = None,
     ) -> str | None:
         """Find a result match_id by team name, with a partial-match fallback.
 
@@ -422,18 +490,25 @@ class ScoreFourfoldService:
         * Partial match: one team name matches AND the numeric part of the
           match number matches.  This handles transliteration differences
           like 沙巴巴库 vs 萨巴赫 and abbreviations like 巴黎圣曼 vs 巴黎圣日尔曼.
+
+        Every candidate must also sit within one day of the leg's business
+        date; without that check the same club pairing from an earlier round
+        (赫根 vs 米亚尔比 on 08-22) would be accepted for a later fixture.
         """
+        dates = dates or {}
         norm_home = cls._normalize_team(leg_home)
         norm_away = cls._normalize_team(leg_away)
         full_key = (norm_home, norm_away)
-        if full_key in team_index:
-            return team_index[full_key]
+        full_mid = team_index.get(full_key)
+        if full_mid and cls._dates_within_one_day(dates.get(full_mid, ""), leg_date):
+            return full_mid
         leg_digits = cls._match_num_digits(leg_match_num)
         # Both team names containment-match (abbreviation) — strongest team signal.
         for res_home, res_away, res_num, res_mid in partial_index:
             if cls._team_names_match(norm_home, res_home) and cls._team_names_match(norm_away, res_away):
                 if leg_digits and res_num and leg_digits == res_num:
-                    return res_mid
+                    if cls._dates_within_one_day(dates.get(res_mid, ""), leg_date):
+                        return res_mid
         if not leg_digits:
             return None
         for res_home, res_away, res_num, res_mid in partial_index:
@@ -443,7 +518,8 @@ class ScoreFourfoldService:
             home_match = cls._team_names_match(norm_home, res_home)
             away_match = cls._team_names_match(norm_away, res_away)
             if (home_match or away_match) and num_match:
-                return res_mid
+                if cls._dates_within_one_day(dates.get(res_mid, ""), leg_date):
+                    return res_mid
         return None
 
     @classmethod
@@ -452,7 +528,10 @@ class ScoreFourfoldService:
         team_index: dict[tuple[str, str], str] = {}
         partial_index: list[tuple[str, str, str, str]] = []
         num_date_index: dict[tuple[str, str], str] = {}
+        dates: dict[str, str] = {}
         for mid, res in results.items():
+            if res.match_date:
+                dates[mid] = res.match_date
             if res.home_team and res.away_team:
                 key = (cls._normalize_team(res.home_team), cls._normalize_team(res.away_team))
                 team_index.setdefault(key, mid)
@@ -460,7 +539,7 @@ class ScoreFourfoldService:
             digits = cls._match_num_digits(res.match_num)
             if digits and res.match_date:
                 num_date_index.setdefault((digits, res.match_date), mid)
-        return _ResultIndexes(team_index, partial_index, num_date_index)
+        return _ResultIndexes(team_index, partial_index, num_date_index, dates)
 
     @classmethod
     def _resolve_leg_match_id(cls, leg, indexes: _ResultIndexes) -> str | None:
@@ -478,7 +557,13 @@ class ScoreFourfoldService:
             if mid:
                 return mid
         return cls._match_by_team(
-            leg.home, leg.away, leg.match_num, indexes.team_index, indexes.partial_index
+            leg.home,
+            leg.away,
+            leg.match_num,
+            indexes.team_index,
+            indexes.partial_index,
+            cls._leg_business_date(leg),
+            indexes.dates,
         )
 
     @classmethod
@@ -620,6 +705,11 @@ class ScoreFourfoldService:
         for leg in plan.legs:
             if leg.match_id in results and results[leg.match_id].status not in {ResultStatus.PENDING, ResultStatus.VOID}:
                 continue
+            # Never reconcile the match_id of a fixture that has not kicked off:
+            # no result can exist yet, so any "fallback match" is a coincidental
+            # same-team/same-number fixture from another sales period.
+            if not self._has_kicked_off(leg, wall_now):
+                continue
             matched_mid = self._resolve_leg_match_id(leg, indexes)
             if matched_mid and matched_mid in results and self._result_matches_leg(results[matched_mid], leg):
                 if leg.match_id != matched_mid:
@@ -648,10 +738,16 @@ class ScoreFourfoldService:
             return JobOutcome("missing", f"计划 {plan_id} 已不存在")
         ai_count = 0
         pending_after_fetch = [leg for leg in refreshed.legs if leg.result_status is ResultStatus.PENDING]
-        if pending_after_fetch:
+        # Only ask the AI about fixtures that have already kicked off; a match
+        # that has not started has no final score to find and any "confirmed"
+        # answer would be a hallucination.
+        ai_candidates = [
+            leg for leg in pending_after_fetch if self._has_kicked_off(leg, wall_now)
+        ]
+        if ai_candidates:
             runtime = self._active_ai_runtime()
             if runtime is not None or self.settings.qwen_api_key:
-                ai_results = query_results_via_ai(pending_after_fetch, self.settings, runtime)
+                ai_results = query_results_via_ai(ai_candidates, self.settings, runtime)
                 if ai_results:
                     self.database.update_leg_results(plan_id, ai_results)
                     ai_count = len(ai_results)
@@ -806,6 +902,11 @@ class ScoreFourfoldService:
             unmatched = [leg for leg in plan.legs if leg.match_id not in relevant]
             migrated = 0
             for leg in unmatched:
+                # Fixtures that have not kicked off never have a result; skipping
+                # them also stops the fallback from linking the leg to a
+                # same-team/same-number fixture from an earlier sales period.
+                if not self._has_kicked_off(leg, now):
+                    continue
                 matched_mid = self._resolve_leg_match_id(leg, indexes)
                 if matched_mid and matched_mid in results and self._result_matches_leg(results[matched_mid], leg):
                     self.database.update_leg_match_id(plan.plan_id, leg.match_id, matched_mid)

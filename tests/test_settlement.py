@@ -473,6 +473,126 @@ class DelayedSettlementTests(unittest.TestCase):
         self.assertEqual(collided.result_status, ResultStatus.PENDING)
         self.assertIsNone(collided.result_home)
 
+    @staticmethod
+    def _fixture_results(matches, *, match_date: str = "2026-07-14") -> dict[str, MatchResult]:
+        """Build realistic final results (team names + match number + date)."""
+        return {
+            match.match_id: MatchResult(
+                match.match_id,
+                ResultStatus.FINAL,
+                1,
+                0,
+                home_team=match.home,
+                away_team=match.away,
+                match_num=match.match_num,
+                match_date=match_date,
+            )
+            for match in matches
+        }
+
+    def test_result_from_earlier_sales_period_is_rejected(self):
+        """同队名 + 同场次号数字、但日期相差数周的赛果必须被拒。
+
+        Production case: 周五004 赫根 vs 米亚尔比 (2026-09-12) picked up the
+        result of 周一004 佐加顿斯 vs 米亚尔比 (2026-09-01) because only the away
+        team and the trailing "004" agreed, so a match that had not kicked off
+        was settled as lost.
+        """
+        victim = self.matches[0]
+        results = self._fixture_results(self.matches[1:])
+        results[victim.match_id] = MatchResult(
+            victim.match_id,
+            ResultStatus.FINAL,
+            4,
+            0,
+            home_team="别的球队",
+            away_team=victim.away,
+            match_num=f"周一{victim.match_num[-3:]}",
+            match_date="2026-06-01",
+        )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成0张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        collided = next(leg for leg in plan.legs if leg.match_id == victim.match_id)
+        self.assertEqual(collided.result_status, ResultStatus.PENDING)
+        self.assertIsNone(collided.result_home)
+
+    def test_settle_plan_keeps_unstarted_leg_unmatched(self):
+        """未开赛的腿一律不做 match_id 兜底迁移。"""
+        victim = self.matches[0]
+        results = self._fixture_results(self.matches[1:])
+        results["DECOY-1"] = MatchResult(
+            "DECOY-1",
+            ResultStatus.FINAL,
+            4,
+            0,
+            home_team="别的球队",
+            away_team=victim.away,
+            match_num=f"周一{victim.match_num[-3:]}",
+            match_date="2026-06-01",
+        )
+        provider = _FakeResultProvider(results)
+        # Every fixture is still ~3 hours away, so no result can exist yet.
+        settle_at = self.now + timedelta(minutes=30)
+        with patch(
+            "score_fourfold.service.SportteryPageResultProvider.get_result_for_leg",
+            return_value=None,
+        ):
+            outcome = self._service(provider).settle_plan(self.recommendation.plan_id, settle_at)
+        self.assertEqual(outcome.status, "partial")
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.status, PlanStatus.PENDING)
+        victim_leg = next(leg for leg in plan.legs if leg.match_id == victim.match_id)
+        self.assertEqual(victim_leg.result_status, ResultStatus.PENDING)
+        self.assertIsNone(victim_leg.result_home)
+        with self.database.connect() as connection:
+            migrated = connection.execute(
+                "SELECT COUNT(*) FROM activity_logs WHERE message LIKE '%兜底匹配%'"
+            ).fetchone()[0]
+        self.assertEqual(migrated, 0)
+
+    def test_settle_does_not_migrate_kicked_off_leg_to_earlier_fixture(self):
+        """已开赛但赛果未出时，兜底匹配也不许跨日期挑旧赛期的同号比赛。"""
+        victim = self.matches[0]
+        results = self._fixture_results(self.matches[1:])
+        results["DECOY-2"] = MatchResult(
+            "DECOY-2",
+            ResultStatus.FINAL,
+            4,
+            0,
+            home_team="别的球队",
+            away_team=victim.away,
+            match_num=f"周一{victim.match_num[-3:]}",
+            match_date="2026-06-01",
+        )
+        provider = _FakeResultProvider(results)
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成0张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        assert plan is not None
+        victim_leg = next(leg for leg in plan.legs if leg.match_id == victim.match_id)
+        self.assertEqual(victim_leg.match_id, victim.match_id)
+        self.assertEqual(victim_leg.result_status, ResultStatus.PENDING)
+        self.assertIsNone(victim_leg.result_home)
+
+    def test_result_one_day_after_business_date_is_accepted(self):
+        """跨零点开赛（开赛日期在业务日期次日）的赛果仍必须被接受。"""
+        provider = _FakeResultProvider(
+            self._fixture_results(self.matches, match_date="2026-07-15")
+        )
+        settle_at = max(match.start_at for match in self.matches) + timedelta(hours=1)
+        outcome = self._service(provider).settle(settle_at)
+        self.assertIn("完成1张计划结算", outcome.detail)
+        plan = self.database.get_plan(self.recommendation.plan_id)
+        assert plan is not None
+        self.assertEqual(plan.status, PlanStatus.WON)
+
     def test_match_num_digits_only_still_accepted_when_teams_absent(self):
         """Results without team names fall back to match-number validation."""
         results = {
