@@ -46,7 +46,13 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         "qwen3.7-max",
         True,
     ),
-    ProviderSpec("deepseek", "DeepSeek", "responses", "https://api.deepseek.com/responses", "deepseek-v4-flash", True),
+    # 2026-09-11 实测：DeepSeek 官方合法名只剩 deepseek-flash（=V4.1-Flash）与
+    # deepseek-v4-pro；旧名 deepseek-v4-flash 仍可调用但已路由到 V4.1-Flash。
+    # 注意 deepseek-flash 实测不执行 web_search（开/关思考、带/不带 tool_choice
+    # 均无 web_search_call），只有 deepseek-v4-pro 能通过强制联网校验，而官方
+    # 公告 2026-09-14 12:00 起 v4-pro 也路由到 V4.1-Flash。默认值填官方长期
+    # 合法名，避免用户被 400「模型名不存在」误导。
+    ProviderSpec("deepseek", "DeepSeek", "responses", "https://api.deepseek.com/responses", "deepseek-flash", True),
     ProviderSpec("zhipu", "智谱 GLM", "chat", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4.5", False),
     ProviderSpec("moonshot", "Moonshot Kimi", "chat", "https://api.moonshot.cn/v1/chat/completions", "kimi-k2", False),
     ProviderSpec("doubao", "火山方舟豆包", "chat", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao", False),
@@ -270,7 +276,10 @@ def test_model(runtime: AIModelRuntime, timeout_seconds: int) -> str:
         runtime,
         "请联网查询当前北京时间。完成搜索后只回复：AI连接正常",
         timeout_seconds=timeout_seconds,
-        max_output_tokens=256,
+        # 不能用 256：DeepSeek V4 系列默认开启思考模式，光 reasoning 就要吃掉
+        # 200+ tokens，会把「没联网」误报成「输出达到长度上限」。1024 给思考
+        # 留出余量，测试仍然只是一句话，不会真的多花多少输出费用。
+        max_output_tokens=1024,
     )
     if "AI连接正常" not in result.replace(" ", ""):
         raise AIModelError("模型已响应，但测试口令不正确")
