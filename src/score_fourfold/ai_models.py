@@ -141,6 +141,29 @@ def validate_runtime(runtime: AIModelRuntime) -> ProviderSpec:
     return spec
 
 
+def thinking_control_payload(base_url: str, runtime: AIModelRuntime) -> dict[str, Any]:
+    """按接口实际宿主返回「关闭/开启思考模式」所需的请求参数。
+
+    思考模式的开关参数在各家 Responses 接口上并不统一，而且写错参数不会报错，
+    只会被静默忽略——表现为「以为关了思考、其实还在思考」，思考 token 会先吃掉
+    max_output_tokens，业务路径只给 1024~1800，于是读到一半就 incomplete
+    （2026-09-11 实测：DeepSeek 官方加 thinking.disabled / enable_thinking=false
+    后 reasoning_tokens 仍有 113 / 57，只有 reasoning.effort=none 真正归零）。
+
+    必须按 base_url 判定而不是按供应商：项目允许把 deepseek 供应商指向百炼地址，
+    同一个参数名在两家并不通用（百炼不认 reasoning.effort，会直接 400）。
+    """
+    host = urlsplit(base_url).netloc.lower()
+    if host.endswith("dashscope.aliyuncs.com"):
+        # 百炼：沿用 Chat 兼容的 enable_thinking。
+        return {"enable_thinking": runtime.thinking_enabled}
+    if host.endswith("deepseek.com"):
+        # DeepSeek 官方 Responses：reasoning.effort，none 表示关闭思考。
+        return {"reasoning": {"effort": "high" if runtime.thinking_enabled else "none"}}
+    # 其余供应商（含 OpenAI、自定义兼容接口）不擅自注入参数，避免未知字段被拒。
+    return {}
+
+
 def _response_text_and_search(payload: dict[str, Any]) -> tuple[str, bool]:
     output = payload.get("output")
     if not isinstance(output, list):
@@ -259,7 +282,9 @@ def _retrieve_reference(
                 ],
                 "tools": [{"type": "web_search"}],
                 "tool_choice": {"type": "web_search"},
-                "max_output_tokens": 4096,
+                # 检索本身不做思考模式开关：不同宿主对此参数的兼容性不一致，关错
+                # 可能导致模型干脆不联网。这里给足额度让它带思考输出完整简报。
+                "max_output_tokens": 8192,
             },
             timeout_seconds,
         )
@@ -324,16 +349,18 @@ def call_with_web_search(
         # tool_choice 强制联网；思考模式则附加 web_extractor 且不带 tool_choice。
         payload["tools"] = [{"type": "web_search"}]
         if spec.code == "qwen":
-            thinking = runtime.thinking_enabled
             tools = [{"type": "web_search"}]
-            if thinking:
+            if runtime.thinking_enabled:
                 tools.append({"type": "web_extractor"})
             payload["tools"] = tools
-            payload["enable_thinking"] = thinking
-            if not thinking:
+            if not runtime.thinking_enabled:
                 payload["tool_choice"] = {"type": "web_search"}
         else:
             payload["tool_choice"] = {"type": "web_search"}
+
+    # 思考模式必须由请求显式控制。DeepSeek V4 系列默认开启思考，而业务路径只给
+    # 1024~1800 个输出 token，思考还没结束就被 max_output_tokens 截断。
+    payload.update(thinking_control_payload(runtime.base_url, runtime))
 
     def _attempt(attempt: int) -> str:
         started_at = time.monotonic()
@@ -389,8 +416,9 @@ def test_model(runtime: AIModelRuntime, timeout_seconds: int) -> str:
         prompt,
         timeout_seconds=timeout_seconds,
         # 不能用 256：DeepSeek V4 系列默认开启思考模式，光 reasoning 就要吃掉
-        # 200+ tokens，会把「没联网」误报成「输出达到长度上限」。1024 给思考
-        # 留出余量，测试仍然只是一句话，不会真的多花多少输出费用。
+        # 200+ tokens，会把「没联网」误报成「输出达到长度上限」。现在请求会按
+        # 接口宿主显式关闭思考（reasoning.effort=none / enable_thinking=false），
+        # 但 1024 的余量仍是必要的保险，测试只回一句话，花费可忽略。
         max_output_tokens=1024,
     )
     if "AI连接正常" not in result.replace(" ", ""):

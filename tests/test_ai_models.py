@@ -201,6 +201,74 @@ class AIModelAdapterTests(unittest.TestCase):
         # qwen 专属字段不应出现在 DeepSeek 请求中。
         self.assertNotIn("enable_thinking", body)
 
+    def test_thinking_switch_uses_host_specific_parameter(self):
+        """思考开关必须按接口宿主挑参数：参数写错会被静默忽略，思考吃光输出额度。
+
+        2026-09-11 实测：DeepSeek 官方只认 reasoning.effort（none=关闭），
+        给它 thinking.disabled / enable_thinking=false 都会照旧思考；百炼则相反，
+        只认 enable_thinking。两边参数不能混用，所以判定依据是 base_url 宿主。
+        """
+        cases = (
+            ("https://api.deepseek.com/responses", False, "reasoning", {"effort": "none"}, "enable_thinking"),
+            ("https://api.deepseek.com/responses", True, "reasoning", {"effort": "high"}, "enable_thinking"),
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+                False,
+                "enable_thinking",
+                False,
+                "reasoning",
+            ),
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+                True,
+                "enable_thinking",
+                True,
+                "reasoning",
+            ),
+        )
+        for base_url, thinking, key, expected, forbidden in cases:
+            with self.subTest(base_url=base_url, thinking=thinking):
+                runtime = AIModelRuntime(
+                    config_id="thinking-probe",
+                    provider="deepseek",
+                    base_url=base_url,
+                    model_name="deepseek-flash",
+                    api_key="secret",
+                    thinking_enabled=thinking,
+                    web_search_required=False,
+                )
+                payload = {
+                    "status": "completed",
+                    "output": [
+                        {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}
+                    ],
+                }
+                with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+                    call_with_web_search(runtime, "问题", timeout_seconds=10, max_output_tokens=64)
+                body = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+                self.assertEqual(body[key], expected)
+                self.assertNotIn(forbidden, body)
+
+    def test_unknown_host_gets_no_thinking_parameter(self):
+        """未知接口不注入思考参数，避免被当成非法字段直接 400。"""
+        runtime = AIModelRuntime(
+            config_id="custom-probe",
+            provider="custom",
+            base_url="https://example.invalid/v1/responses",
+            model_name="some-model",
+            api_key="secret",
+            web_search_required=False,
+        )
+        payload = {
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+        }
+        with patch("urllib.request.urlopen", return_value=_Response(payload)) as opened:
+            call_with_web_search(runtime, "问题", timeout_seconds=10, max_output_tokens=64)
+        body = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertNotIn("reasoning", body)
+        self.assertNotIn("enable_thinking", body)
+
     def test_model_without_own_search_skips_web_search_tool(self):
         """不要求模型自己联网时：请求不带搜索工具，也不再校验搜索结果。"""
         runtime = AIModelRuntime(
