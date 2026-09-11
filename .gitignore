@@ -25,3 +25,4 @@ data/00000?.txt
 *.tar.gz
 *.zip
 .web-login-password-once.txt
+.workbuddy/
