@@ -31,9 +31,11 @@ class MutableClock:
 
 
 class FakeProvider:
-    def __init__(self, matches, after_fetch=None):
+    def __init__(self, matches, after_fetch=None, sale_stop=None):
         self.matches = matches
         self.after_fetch = after_fetch
+        self.sale_stop = sale_stop
+        self.last_sale_stop_message = sale_stop
         self.match_calls = 0
 
     def get_matches(self):
@@ -41,6 +43,9 @@ class FakeProvider:
         if self.after_fetch is not None:
             self.after_fetch()
         return self.matches
+
+    def sale_stop_message(self):
+        return self.sale_stop
 
     def get_results(self, *_):
         return {}
@@ -282,6 +287,24 @@ class ScheduleSafetyTests(unittest.TestCase):
         self.assertEqual(service.finalize_recommendation_day(now).status, "created")
         self.assertEqual(service.finalize_recommendation_day(now).status, "duplicate")
         self.assertEqual(service.database.summary()["emails_pending"], 1)
+
+    def test_holiday_closure_skips_recommendation_without_error_notice(self):
+        now = datetime(2026, 10, 2, 14, 0, tzinfo=TZ)
+        clock = MutableClock(now)
+        provider = FakeProvider([], sale_stop="抱歉，本彩种已停止销售")
+        service = self._service(clock, provider)
+        outcome = service.recommend(now)
+        self.assertEqual(outcome.status, "no-recommendation")
+        self.assertIn("官方停售", outcome.detail)
+        self.assertEqual(service.database.summary()["emails_pending"], 0)
+
+    def test_holiday_closure_suppresses_day_end_no_recommendation_notice(self):
+        now = datetime(2026, 10, 2, 18, 0, tzinfo=TZ)
+        clock = MutableClock(now)
+        provider = FakeProvider([], sale_stop="抱歉，本彩种已停止销售")
+        service = self._service(clock, provider)
+        self.assertEqual(service.finalize_recommendation_day(now).status, "idle")
+        self.assertEqual(service.database.summary()["emails_pending"], 0)
 
 
 if __name__ == "__main__":

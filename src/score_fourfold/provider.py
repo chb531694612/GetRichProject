@@ -257,6 +257,34 @@ def _ttg_options(raw: dict[str, Any]) -> tuple[ScoreOption, ...]:
     )
 
 
+def _sale_stop_message(payload: dict[str, Any]) -> str | None:
+    """Return the official stop-sale notice when the whole pool is closed.
+
+    During national holiday closures (Spring Festival, National Day) the
+    calculator endpoint still answers ``success: true``, but its ``value``
+    carries only ``vtoolsConfig`` with an explicit stop-sale message and no
+    match list at all.  That is a normal business state, not a schema change,
+    so it must never be reported as a data-source error.
+    """
+
+    value = payload.get("value")
+    if not isinstance(value, dict):
+        return None
+    # A serving pool always ships a non-empty match/calculator list.  Anything
+    # present here (even an unexpected shape) is a real payload difference and
+    # must keep raising the schema error instead of being read as a closure.
+    if value.get("matchInfoList") or value.get("allUpList"):
+        return None
+    config = value.get("vtoolsConfig")
+    if not isinstance(config, dict):
+        return None
+    for message_key in ("onLineStopMessage", "offLineStopMessage"):
+        message = _str(config.get(message_key))
+        if message:
+            return message
+    return None
+
+
 def _pass_size(formula: Any) -> int | None:
     normalized = _str(formula).lower().replace("×", "x").replace("*", "x").replace("串", "x")
     match = re.fullmatch(r"\s*([2-8])\s*x\s*1\s*", normalized)
@@ -777,6 +805,9 @@ class SportteryProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.include_ttg = False
+        # Filled by ``get_matches`` when the official pool is closed for a
+        # holiday, so callers can tell "closed" apart from "no data".
+        self.last_sale_stop_message: str | None = None
 
     def _get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         import time
@@ -854,6 +885,7 @@ class SportteryProvider:
 
     def get_matches(self) -> list[Match]:
         fetched_at = datetime.now(self.settings.timezone)
+        self.last_sale_stop_message = None
         payload = self._get_json(self.settings.sporttery_odds_url, {"poolCode": "crs", "channel": "c"})
         if payload.get("success") is not True or _str(payload.get("errorCode")) != "0":
             raise ProviderError("official odds wrapper did not report success")
@@ -867,6 +899,13 @@ class SportteryProvider:
         else:
             crs_all_up = all_up_list
         if not isinstance(groups, list) or not isinstance(crs_all_up, list):
+            stop_message = _sale_stop_message(payload)
+            if stop_message is not None:
+                # Holiday closure: the pool is closed, so there is nothing to
+                # parse.  Report zero usable matches and keep the reason for the
+                # caller's activity log instead of raising a schema error.
+                self.last_sale_stop_message = stop_message
+                return []
             raise ProviderError("official odds schema changed: matchInfoList/allUpList is invalid")
         supported_pass_sizes = {
             size
@@ -946,6 +985,19 @@ class SportteryProvider:
                 )
             )
         return merged
+
+    def sale_stop_message(self) -> str | None:
+        """Probe the official pool state and return the closure notice.
+
+        Used by the day-end step so a holiday closure does not look like a day
+        with no qualifying matches.  Returns ``None`` while pools are serving,
+        and lets network errors propagate so callers keep their old behaviour.
+        """
+
+        payload = self._get_json(self.settings.sporttery_odds_url, {"poolCode": "crs", "channel": "c"})
+        if payload.get("success") is not True or _str(payload.get("errorCode")) != "0":
+            return None
+        return _sale_stop_message(payload)
 
     def get_results(self, start_date: date, end_date: date) -> dict[str, MatchResult]:
         results: dict[str, MatchResult] = {}

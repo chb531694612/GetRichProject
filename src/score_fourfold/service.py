@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -23,6 +24,9 @@ from .mail import (
 from .provider import ProviderError, SportteryPageResultProvider
 from .settings_store import RecommendationProfile, SettingsRepository
 from .strategy import BASE_STAKE, calculate_prize, select_market_plans
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +246,16 @@ class ScoreFourfoldService:
 
         self.database.add_log("recommend", f"开始生成{recommendation_date}推荐", f"待生成玩法: {', '.join(p.market.upper() for p in pending_profiles)}")
         all_matches = self.provider.get_matches()
+        stop_message = getattr(self.provider, "last_sale_stop_message", None)
+        if stop_message:
+            # Official holiday closure (Spring Festival / National Day): the pool
+            # is closed, so this is a normal skip — no plan, no error notice.
+            self.database.add_log(
+                "recommend",
+                "官方停售，未生成推荐（不发送运行异常通知）",
+                stop_message,
+            )
+            return JobOutcome("no-recommendation", f"官方停售：{stop_message}")
         self.database.add_log("recommend", f"数据源返回{len(all_matches)}场比赛")
 
         # The provider request can cross the deadline, so check the clock again
@@ -297,6 +311,14 @@ class ScoreFourfoldService:
         recommendation_date = wall_now.date().isoformat()
         if self.database.has_sent_recommendation_on(recommendation_date):
             return JobOutcome("ok", "今日购买推荐已在截止前发送，无需发送无推荐通知")
+        stop_message = self._sale_stop_message()
+        if stop_message:
+            # Pools closed for a holiday: there is nothing to skip buying today,
+            # so the "no valid recommendation" notice would be misleading.
+            self.database.add_log(
+                "recommend", "官方停售，未发送今日无推荐通知", stop_message
+            )
+            return JobOutcome("idle", f"官方停售（{stop_message}），不发送无推荐通知")
         if not self.settings.send_no_recommendation:
             return JobOutcome("idle", "今日没有已送达推荐，且无推荐通知已关闭")
         reason = "18:00前没有成功送达有效购买推荐（可能因合格比赛不足、数据源异常或邮件过期）"
@@ -316,6 +338,23 @@ class ScoreFourfoldService:
             "created" if created else "duplicate",
             "已生成今日无有效购买推荐通知" if created else "今日无推荐通知已存在",
         )
+
+    def _sale_stop_message(self) -> str | None:
+        """Return the official closure notice, tolerating every failure mode.
+
+        Local JSON providers and test doubles have no such probe, and a network
+        problem must not block the day-end step, so any error falls back to the
+        previous behaviour (send the notice).
+        """
+
+        prober = getattr(self.provider, "sale_stop_message", None)
+        if not callable(prober):
+            return None
+        try:
+            return prober()
+        except Exception:
+            LOGGER.warning("official sale-state probe failed; falling back", exc_info=True)
+            return None
 
     @staticmethod
     def _selected_score(leg) -> tuple[int, int] | None:

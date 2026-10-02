@@ -323,6 +323,44 @@ class ProviderParsingTests(unittest.TestCase):
         self.assertAlmostEqual(float(probability_sum), 1.0, places=10)
         self.assertEqual(matches[0].odds_updated_at, datetime(2026, 7, 14, 12, tzinfo=ZoneInfo("Asia/Shanghai")))
 
+    def test_holiday_closure_returns_zero_matches_without_schema_error(self):
+        provider = SportteryProvider(make_settings(Path("data")))
+        payload = {
+            "success": True,
+            "errorCode": "0",
+            "errorMessage": "处理成功",
+            "value": {
+                "vtoolsConfig": {
+                    "offLineSaleStatus": 1,
+                    "offLineStopMessage": "抱歉，本彩种已停止销售",
+                    "onLineSaleStatus": 1,
+                    "onLineStopMessage": "抱歉，本彩种已停止销售",
+                }
+            },
+        }
+        with patch.object(provider, "_get_json", return_value=payload):
+            matches = provider.get_matches()
+            probed = provider.sale_stop_message()
+        self.assertEqual(matches, [])
+        self.assertEqual(provider.last_sale_stop_message, "抱歉，本彩种已停止销售")
+        self.assertEqual(probed, "抱歉，本彩种已停止销售")
+
+    def test_serving_pool_reports_no_closure(self):
+        provider = SportteryProvider(make_settings(Path("data")))
+        payload = self._complete_official_payload()
+        with patch.object(provider, "_get_json", return_value=payload):
+            self.assertIsNone(provider.sale_stop_message())
+        self.assertIsNone(provider.last_sale_stop_message)
+
+    def test_unknown_odds_payload_still_raises_schema_error(self):
+        provider = SportteryProvider(make_settings(Path("data")))
+        payload = {"success": True, "errorCode": "0", "value": {"unexpected": 1}}
+        with patch.object(provider, "_get_json", return_value=payload):
+            with self.assertRaises(ProviderError) as raised:
+                provider.get_matches()
+            self.assertIsNone(provider.sale_stop_message())
+        self.assertIn("schema changed", str(raised.exception))
+
     def test_parses_supported_three_and_four_by_one_formulas(self):
         payload = self._complete_official_payload()
         payload["value"]["allUpList"]["CRS"] = [
