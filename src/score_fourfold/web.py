@@ -552,8 +552,14 @@ class DashboardApplication:
         image_path = self.ticket_image_dir / safe_name
         image_path.write_bytes(data)
         # Pre-generate the thumbnail so the dashboard list never pays for it on
-        # first render; on-demand generation still covers older images.
-        ensure_thumbnail(image_path, thumb_dir(self.ticket_image_dir) / thumb_name(safe_name))
+        # first render; on-demand generation still covers older images. Force a
+        # rebuild because a re-upload reuses the same file name with new content
+        # and must not keep the stale cached thumbnail.
+        ensure_thumbnail(
+            image_path,
+            thumb_dir(self.ticket_image_dir) / thumb_name(safe_name),
+            force=True,
+        )
         if self.database.set_ticket_image(plan_id, safe_name):
             return ("ok", f"实票图片已上传并标记购买计划 {plan_id}")
         return ("error", f"保存计划 {plan_id} 的实票图片失败")
@@ -587,10 +593,41 @@ class DashboardApplication:
         plan = self.database.get_plan(plan_id)
         if plan is None:
             return ("warn", f"计划 {plan_id} 不存在")
+        ticket_image = plan.ticket_image
         deleted = self.database.delete_plan(plan_id)
         if deleted:
+            if ticket_image:
+                self._remove_ticket_files(ticket_image)
             return ("ok", f"已删除计划 {plan_id}")
         return ("error", f"删除计划 {plan_id} 失败")
+
+    def trigger_delete_ticket(self, plan_id: str) -> tuple[str, str]:
+        """Remove a plan's ticket image: database field, original and thumbnail."""
+        plan = self.database.get_plan(plan_id)
+        if plan is None:
+            return ("warn", f"计划 {plan_id} 不存在")
+        if not plan.ticket_image:
+            return ("warn", f"计划 {plan_id} 没有实票图片")
+        if not self.database.clear_ticket_image(plan_id):
+            return ("error", f"移除计划 {plan_id} 的实票图片失败")
+        self._remove_ticket_files(plan.ticket_image)
+        return ("ok", f"已移除计划 {plan_id} 的实票图片")
+
+    def _remove_ticket_files(self, filename: str) -> None:
+        """Best-effort removal of a ticket image and its cached thumbnail.
+
+        The database field has already been cleared by the caller, so a
+        filesystem failure only leaves orphan files behind; log and move on.
+        """
+        candidates = (
+            self.ticket_image_dir / filename,
+            thumb_dir(self.ticket_image_dir) / thumb_name(filename),
+        )
+        for path in candidates:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("删除实票文件失败: %s", path)
 
     def trigger_delete_leg(self, plan_id: str, match_id: str) -> tuple[str, str]:
         """Delete a single leg from a plan and recalculate stats."""
@@ -1521,7 +1558,7 @@ def build_handler(application: DashboardApplication):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "private, max-age=3600")
+            self.send_header("Cache-Control", "private, no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.end_headers()

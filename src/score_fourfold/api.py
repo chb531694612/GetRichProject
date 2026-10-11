@@ -413,12 +413,5 @@ class DashboardAPI:
         return self.application.trigger_upload_ticket(plan_id, filename, data)
 
     def delete_ticket(self, plan_id: str) -> tuple[str, str]:
-        """Remove a plan's ticket image. Returns (level, detail)."""
-        plan = self.database.get_plan(plan_id)
-        if plan is None:
-            return ("warn", f"计划 {plan_id} 不存在")
-        if not plan.ticket_image:
-            return ("warn", f"计划 {plan_id} 没有实票图片")
-        if self.database.clear_ticket_image(plan_id):
-            return ("ok", f"已移除计划 {plan_id} 的实票图片")
-        return ("error", f"移除计划 {plan_id} 的实票图片失败")
+        """Remove a plan's ticket image (field, original, thumbnail)."""
+        return self.application.trigger_delete_ticket(plan_id)

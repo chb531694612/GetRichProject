@@ -89,6 +89,20 @@ class ThumbnailGenerationTests(unittest.TestCase):
         second = ensure_thumbnail(source, self._target("plan.jpg"))
         self.assertEqual(first, second)
 
+    def test_force_regenerates_the_cached_thumbnail(self):
+        source = self.tmp / "plan.jpg"
+        source.write_bytes(_photo(1200, 900))
+        target = self._target("plan.jpg")
+        first = ensure_thumbnail(source, target)
+        # Re-upload scenario: same file name, different content. Without
+        # force the stale cache is served; with force it must be rebuilt.
+        source.write_bytes(_photo(800, 600))
+        self.assertEqual(ensure_thumbnail(source, target), first)
+        refreshed = ensure_thumbnail(source, target, force=True)
+        self.assertIsNotNone(refreshed)
+        self.assertNotEqual(refreshed, first, "force 必须丢弃旧缓存重新生成缩略图")
+        self.assertEqual(target.read_bytes(), refreshed)
+
     def test_undecodable_source_returns_none_and_writes_nothing(self):
         source = self.tmp / "plan.jpg"
         source.write_bytes(b"\xff\xd8\xff broken payload")

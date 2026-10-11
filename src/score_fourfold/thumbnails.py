@@ -33,14 +33,18 @@ def thumb_name(filename: str) -> str:
     return f"{stem}.jpg"
 
 
-def ensure_thumbnail(source: Path, target: Path) -> bytes | None:
+def ensure_thumbnail(source: Path, target: Path, *, force: bool = False) -> bytes | None:
     """Return thumbnail bytes for ``source``, generating and caching on a miss.
+
+    With ``force`` a readable cached thumbnail is regenerated anyway, which
+    keeps re-uploads (same file name, new content) from serving a stale
+    image.
 
     Returns ``None`` when Pillow is unavailable or the source cannot be
     decoded; callers are expected to fall back to the original image so the
     dashboard never renders a broken thumbnail.
     """
-    if target.is_file():
+    if not force and target.is_file():
         try:
             return target.read_bytes()
         except OSError:

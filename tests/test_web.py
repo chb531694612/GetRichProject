@@ -1172,8 +1172,11 @@ class NewFeatureTests(unittest.TestCase):
     def test_api_delete_ticket_clears_image_keeps_purchase(self):
         from score_fourfold.api import DashboardAPI
         rec = self._create_sent_plan()
-        png_data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
-        self.application.trigger_upload_ticket(rec.plan_id, "ticket.png", png_data)
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg())
+        image = Path(self.settings.ticket_image_dir) / f"{rec.plan_id}.jpg"
+        thumb = Path(self.settings.ticket_image_dir) / "thumbs" / f"{rec.plan_id}.jpg"
+        self.assertTrue(image.is_file())
+        self.assertTrue(thumb.is_file())
         api = DashboardAPI(self.application)
         level, detail = api.delete_ticket(rec.plan_id)
         self.assertEqual(level, "ok")
@@ -1182,6 +1185,8 @@ class NewFeatureTests(unittest.TestCase):
         assert plan is not None
         self.assertEqual(plan.ticket_image, "", "删除实票应清空 ticket_image")
         self.assertTrue(plan.purchased, "删除实票不应取消购买标记")
+        self.assertFalse(image.exists(), "删除实票应同步删除原图文件")
+        self.assertFalse(thumb.exists(), "删除实票应同步删除缩略图文件")
 
     def test_api_delete_ticket_without_image_returns_warn(self):
         from score_fourfold.api import DashboardAPI
@@ -1263,6 +1268,26 @@ class NewFeatureTests(unittest.TestCase):
         self.assertTrue(thumb.is_file(), "上传时应预生成缩略图，避免首次浏览付费")
         self.assertLess(thumb.stat().st_size, len(jpeg) // 4)
 
+    def test_reupload_ticket_replaces_stale_thumbnail(self):
+        """Re-uploading under the same file name must not serve the old thumb."""
+        rec = self._create_sent_plan()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg(1200, 900))
+        _, _, first_thumb = self._get(f"/tickets/thumbs/{rec.plan_id}.jpg")
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg(800, 1400))
+        status, _, second_thumb = self._get(f"/tickets/thumbs/{rec.plan_id}.jpg")
+        self.assertEqual(status, 200)
+        self.assertNotEqual(second_thumb, first_thumb, "重新上传必须刷新缩略图，不能继续用旧缓存")
+
+    def test_delete_plan_removes_ticket_files(self):
+        rec = self._create_sent_plan()
+        self.application.trigger_upload_ticket(rec.plan_id, "ticket.jpg", self._real_jpeg())
+        image = Path(self.settings.ticket_image_dir) / f"{rec.plan_id}.jpg"
+        thumb = Path(self.settings.ticket_image_dir) / "thumbs" / f"{rec.plan_id}.jpg"
+        level, _ = self.application.trigger_delete_plan(rec.plan_id)
+        self.assertEqual(level, "ok")
+        self.assertFalse(image.exists(), "删除计划应同步删除实票原图")
+        self.assertFalse(thumb.exists(), "删除计划应同步删除实票缩略图")
+
     def test_serve_ticket_thumbnail_returns_downscaled_image(self):
         rec = self._create_sent_plan()
         jpeg = self._real_jpeg()
@@ -1280,6 +1305,10 @@ class NewFeatureTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("content-type"), "image/jpeg")
         self.assertEqual(payload, jpeg, "放大查看必须拿到完整原图")
+        self.assertEqual(
+            headers.get("cache-control"), "private, no-cache",
+            "实票文件名固定，必须禁止浏览器长缓存，否则重新上传后仍显示旧图",
+        )
 
     def test_serve_ticket_thumbnail_falls_back_to_original_when_undecodable(self):
         """A broken upload must still render rather than show a broken image."""
